@@ -135,7 +135,9 @@ fn hook_entries(hook_path: &str) -> Vec<(&'static str, &'static str, serde_json:
 /// dropped from. That script is the previous surface and this one replaces it, but it is a file
 /// the repository owns and a person put in that list: removing it without a word would be the one
 /// silent edit in an installer that otherwise touches nothing it did not write.
-pub fn merged_settings(existing: &str, hook_path: &str) -> Result<(String, Vec<String>)> {
+///
+/// Also returns a note for each matcher kept because the repository changed it, naming our default.
+pub fn merged_settings(existing: &str, hook_path: &str) -> Result<(String, Vec<String>, Vec<String>)> {
     let mut root: serde_json::Value = match existing.trim().is_empty() {
         true => serde_json::json!({}),
         false => serde_json::from_str(existing).context("the settings file is not JSON")?,
@@ -144,18 +146,39 @@ pub fn merged_settings(existing: &str, hook_path: &str) -> Result<(String, Vec<S
     let hooks = root.as_object_mut().unwrap().entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() { anyhow::bail!("`hooks` in the settings file is not an object"); }
     let mut retired = Vec::new();
+    let mut custom = Vec::new();
     for (event, matcher, entry) in hook_entries(hook_path) {
         let mut ours = entry;
-        ours.as_object_mut().unwrap().insert("matcher".into(), serde_json::json!(matcher));
         let list = hooks.as_object_mut().unwrap().entry(event).or_insert_with(|| serde_json::json!([]));
         let Some(arr) = list.as_array_mut() else { anyhow::bail!("`hooks.{event}` is not an array") };
         if arr.iter().any(|e| e.to_string().contains("repograph-notice")) { retired.push(event.to_string()); }
+        let existing = arr.iter()
+            .filter(|e| ["zerograph-hook", "repograph-hook"].iter().any(|s| e.to_string().contains(s)))
+            .find_map(|e| e.get("matcher").and_then(|m| m.as_str()).map(str::to_string));
+        let past: Vec<&str> = PAST_MATCHERS.iter().filter(|(e, _)| *e == event).map(|(_, m)| *m).collect();
+        let chosen = kept_matcher(existing.as_deref(), matcher, &past);
+        if chosen != matcher { custom.push(format!("{event}: kept your matcher \"{chosen}\"; the default is \"{matcher}\"")); }
+        ours.as_object_mut().unwrap().insert("matcher".into(), serde_json::json!(chosen));
         // Ours by the script it runs, never by position: a repository's own entries keep theirs.
         // `repograph-hook` is this hook under the name it had before the rename.
         arr.retain(|e| !["zerograph-hook", "repograph-hook", "repograph-notice"].iter().any(|s| e.to_string().contains(s)));
         arr.push(ours);
     }
-    Ok((serde_json::to_string_pretty(&root)? + "\n", retired))
+    Ok((serde_json::to_string_pretty(&root)? + "\n", retired, custom))
+}
+
+/// Every default matcher an earlier release wrote, by event. When a default in `hook_entries`
+/// changes, its old value goes here, so installs still carrying it are upgraded to the new one.
+const PAST_MATCHERS: &[(&str, &str)] = &[];
+
+/// A matcher a release wrote is ours to move to the current default; any other is the repository's
+/// choice (PreToolUse narrowed to keep the hook off Bash, say), and a re-run that reset it would
+/// undo that choice on every upgrade.
+fn kept_matcher(existing: Option<&str>, default: &str, past: &[&str]) -> String {
+    match existing {
+        Some(m) if m != default && !past.contains(&m) => m.to_string(),
+        _ => default.to_string(),
+    }
 }
 
 fn is_symlink(path: &Path) -> bool {
@@ -251,7 +274,8 @@ pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
     if target.hooks_are_repository_scoped() {
         let settings = base.join("settings.json");
         let existing = std::fs::read_to_string(&settings).unwrap_or_default();
-        let (merged, retired) = merged_settings(&existing, &hook_path)?;
+        let (merged, retired, custom) = merged_settings(&existing, &hook_path)?;
+        report.notes.extend(custom);
         if !retired.is_empty() {
             report.notes.push(format!(
                 "removed the retired `repograph-notice` hook from {} — this hook replaces it; \
@@ -1127,6 +1151,36 @@ mod tests {
         assert!(r.notes.iter().any(|n| n.contains("repograph-notice") && n.contains("SessionStart")),
                 "{:?}", r.notes);
         assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("CLAUDE_PROJECT_DIR"));
+    }
+
+    /// A narrowed matcher is a choice someone made, such as keeping the hook off Bash calls; a
+    /// re-run that put the default back would undo it on every upgrade.
+    #[test]
+    fn a_matcher_set_on_our_entry_survives_a_re_run() {
+        let dir = root();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/settings.json"), r#"{"hooks":{"PreToolUse":[
+            {"matcher":"Grep|Glob|Agent","hooks":[{"type":"command","command":"node /old/path/zerograph-hook.mjs"}]}
+        ]}}"#).unwrap();
+        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap()).unwrap();
+        let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["matcher"], "Grep|Glob|Agent");
+        assert!(r.notes.iter().any(|n| n.contains("PreToolUse") && n.contains("Bash|Grep|Glob|Agent")),
+            "a kept matcher names the default it hides: {:?}", r.notes);
+        assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("CLAUDE_PROJECT_DIR"), "the rest of the entry is still ours to update");
+        assert_eq!(v["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact", "a fresh entry gets the default");
+    }
+
+    /// A default changes only when the hook needs it, so an install still on an old one moves with
+    /// it; a matcher no release wrote is the repository's and stays.
+    #[test]
+    fn a_matcher_an_earlier_release_wrote_moves_to_the_new_default() {
+        assert_eq!(kept_matcher(Some("Bash|Grep"), "Bash|Grep|Read", &["Bash|Grep"]), "Bash|Grep|Read");
+        assert_eq!(kept_matcher(Some("Grep"), "Bash|Grep|Read", &["Bash|Grep"]), "Grep");
+        assert_eq!(kept_matcher(None, "Bash|Grep|Read", &[]), "Bash|Grep|Read");
     }
 
     #[test]
