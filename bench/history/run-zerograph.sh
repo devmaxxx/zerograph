@@ -30,7 +30,8 @@ trap 'rm -rf "$OUT"' EXIT
 
 # A run recorded against a fixture that moved is a run whose history rows cannot be compared,
 # and the comparison would silently look like a regression in zerograph.
-PINNED=$(git -C "$FIXTURE" rev-parse --short HEAD)
+# A fixed length: the default abbreviation grows with the object count and stops matching.
+PINNED=$(git -C "$FIXTURE" rev-parse --short=8 HEAD)
 [ "$PINNED" = "502e8a6d" ] || { echo "fixture is at $PINNED, expected 502e8a6d" >&2; exit 1; }
 # `graphify-out/` is tracked in the corpus and rebuilt in place by graphify, so it is dirty by
 # design and says nothing about the sources. Everything else being dirty does.

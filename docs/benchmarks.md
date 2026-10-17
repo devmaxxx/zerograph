@@ -65,9 +65,9 @@ are consulted, are in [the measurements](history.md#the-bench-floors-case-by-cas
 
 ## Measured
 
-The bench fixture is 908 files and about 8.3k nodes. At 0.6.0, under the default embedder, the store
-reads **keyword 40/40, paraphrase 19/30, code 12/12 at 244 p90 tokens**. Under the small model that
-preceded the default it reads 40/40, 9/30, 12/12 at 237 with embeddings and 39/40, 7/30, 12/12 at
+The bench fixture is 908 files and about 8.3k nodes. At 0.6.3, under the default embedder, the store
+reads **keyword 40/40, paraphrase 20/30, code 12/12 at 222 p90 tokens** (19/30 at 244 at 0.6.0). At 0.6.0, under the
+small model that preceded the default, it read 40/40, 9/30, 12/12 at 237 with embeddings and 39/40, 7/30, 12/12 at
 238 with `--no-dense`, per case identical to the binary before the removal on the same store. Zero model tokens
 throughout. What `enrich`'s questions bought before 0.6.0 removed them — one paraphrase case under
 the default embedder, five under the small one — is in [the measurements](history.md).
