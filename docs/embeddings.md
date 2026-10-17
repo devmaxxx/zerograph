@@ -107,6 +107,17 @@ own error and leaves the repository exactly as it was. `zerograph.toml` is then 
 only that one value, comments and everything else kept — and the store re-embedded, which
 `--no-embed` stops if you would rather pay for it later.
 
+A hub id followed by `:<variant>` reads another export from the same repository and commit:
+`onnx-community/embeddinggemma-300m-ONNX:q4` opens `onnx/model_q4.onnx` in place of
+`onnx/model.onnx`, with the model's own prefixes and pooling. Variants follow onnx-community's file
+names, so `quantized`, `fp16`, `q4` and `q4f16` are the usual ones. A variant writes different
+vectors, so the store records it as a model of its own, and switching to or from it re-embeds every
+row once. It is not catalogued, so `zerograph model <hub id>:<variant>` trusts it on the machine
+before `zerograph.toml` may name it. Measured on the default model, every export recalls what fp32
+does and none embeds faster on Apple Silicon. `:q4` is a 197 MB download against 1.2 GB, with 0.91 GB
+of RSS against 1.47 GB, at the same wall time
+([the readings](bench/2026-10-17-gemma-quantized-results.md)).
+
 ### Licence
 
 The default's weights are published under the [Gemma Terms of Use](https://ai.google.dev/gemma/terms),

@@ -190,6 +190,27 @@ fn profile(model: &str) -> Profile {
     }
 }
 
+/// The hub repository a model id names and the export in it the id picks: `<hub id>:<variant>`
+/// reads `onnx/model_<variant>.onnx` where the bare id reads `onnx/model.onnx` — the file names
+/// onnx-community publishes quantised exports under (`q4`, `quantized`, `fp16`, …), and the
+/// `dtype` transformers.js chooses them by. A hub id never holds a colon, so the suffix cannot be
+/// mistaken for part of one. The variant is part of the model's name everywhere else — the store
+/// records it, and a change of variant re-embeds — because its vectors are not fp32's.
+fn hub_and_variant(model: &str) -> (&str, Option<&str>) {
+    match model.rsplit_once(':') {
+        Some((hub, v)) if !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => (hub, Some(v)),
+        _ => (model, None),
+    }
+}
+
+/// The graph file a variant reads, beside the one the profile names.
+fn variant_file(onnx: &str, variant: Option<&str>) -> String {
+    match (variant, onnx.strip_suffix(".onnx")) {
+        (Some(v), Some(stem)) => format!("{stem}_{v}.onnx"),
+        _ => onnx.to_string(),
+    }
+}
+
 /// Whether a model falls through to e5's recipe — its pooling, its `query: `/`passage: ` tags —
 /// because nothing in `profile` recognised the id. True for the e5 models themselves, and for
 /// every id this binary has never heard of: the guess costs recall rather than a crash, and a
@@ -258,7 +279,7 @@ pub fn measured(model: &str) -> Option<&'static Measured> {
 
 /// The commit a catalogued model is fetched at; `None` for a model the reader trusted by name,
 /// which follows the hub's `main` because nobody here has measured a commit of it.
-pub fn revision(model: &str) -> Option<&'static str> { measured(model).map(|m| m.revision) }
+pub fn revision(model: &str) -> Option<&'static str> { measured(hub_and_variant(model).0).map(|m| m.revision) }
 
 /// The row every other row is quoted against. The default is in the list — a test holds it there —
 /// so the fallback is unreachable and is written only because an index is not a proof.
@@ -332,7 +353,8 @@ fn fetch_from(cache: &Path, endpoint: Option<&str>, model: &str) -> Result<Files
     let mut builder = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(cache.to_path_buf()).with_progress(true);
     if let Some(e) = endpoint { builder = builder.with_endpoint(e.to_string()); }
     let api = builder.build()?;
-    let name = model.to_string();
+    let (hub, variant) = hub_and_variant(model);
+    let name = hub.to_string();
     if !cache.join(format!("models--{}", name.replace('/', "--"))).exists() { scan_hint(cache); }
     let repo = match revision(&name) {
         Some(rev) => {
@@ -344,14 +366,15 @@ fn fetch_from(cache: &Path, endpoint: Option<&str>, model: &str) -> Result<Files
     };
     let get = |f: &str| repo.get(f).with_context(|| format!("fetch {name}/{f}"));
     let profile = profile(&name);
-    let model = get(profile.onnx)?;
+    let onnx = variant_file(profile.onnx, variant);
+    let model = get(&onnx)?;
     // The larger models keep their weights beside the graph; the session resolves the file by
     // its relative name, so it has to be fetched into the same snapshot. External data is legal
     // at any graph size and the model is the reader's to choose, so 64 MB is a margin rather
     // than a proof: a file that small cannot be holding 448 MB of weights itself, and the small
     // model's does, so it clears the margin by a factor of seven and never pays the lookup.
     let len = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
-    if keeps_weights_beside(len) { let _ = repo.get(&format!("{}_data", profile.onnx)); }
+    if keeps_weights_beside(len) { let _ = repo.get(&format!("{onnx}_data")); }
     for f in profile.beside { get(f)?; }
     let tokenizer = get("tokenizer.json")?;
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(get("config.json")?)?)?;
@@ -690,6 +713,20 @@ mod tests {
     }
 
     #[test]
+    fn a_variant_suffix_picks_the_export_and_keeps_the_models_recipe_and_pin() {
+        assert_eq!(hub_and_variant("onnx-community/embeddinggemma-300m-ONNX:q4"), ("onnx-community/embeddinggemma-300m-ONNX", Some("q4")));
+        assert_eq!(hub_and_variant(DEFAULT_MODEL), (DEFAULT_MODEL, None));
+        assert_eq!(hub_and_variant("a/b:"), ("a/b:", None), "an empty variant is no variant");
+        assert_eq!(hub_and_variant("a/b:../x"), ("a/b:../x", None), "a variant is a word, never a path");
+        assert_eq!(variant_file("onnx/model.onnx", Some("quantized")), "onnx/model_quantized.onnx");
+        assert_eq!(variant_file("onnx/model.onnx", None), "onnx/model.onnx");
+        let q4 = format!("{DEFAULT_MODEL}:q4");
+        assert_eq!(profile(&q4), profile(DEFAULT_MODEL), "the prefixes and pooling are the model's, not the export's");
+        assert_eq!(revision(&q4), revision(DEFAULT_MODEL), "and so is the commit it is fetched at");
+        assert!(measured(&q4).is_none(), "a variant has figures of its own, or none");
+    }
+
+    #[test]
     fn cls_takes_the_first_position_and_last_token_the_last_attended_one() {
         // One text of three positions, the third padded.
         let hidden = [1.0, 0.0,  0.0, 2.0,  9.0, 9.0];
@@ -975,6 +1012,17 @@ mod fetch_tests {
         assert!(files.model.ends_with("onnx/model.onnx"));
         assert_eq!(files.pad_token, "<pad>");
         assert_eq!(files.pad_id, 1);
+    }
+
+    #[test]
+    fn a_variant_reads_its_own_export_from_the_pinned_commit_of_the_hub_id() {
+        let dir = tempfile::tempdir().unwrap();
+        cache_with_model_of(dir.path(), EXTERNAL_DATA_STUB);
+        let snap = dir.path().join("models--intfloat--multilingual-e5-small/snapshots").join(revision(UNNAMED_MODEL).unwrap());
+        std::fs::File::create(snap.join("onnx/model_q4.onnx")).unwrap().set_len(EXTERNAL_DATA_STUB).unwrap();
+        let files = fetch_from(dir.path(), Some("http://127.0.0.1:9"), "intfloat/multilingual-e5-small:q4").unwrap();
+        assert!(files.model.ends_with("onnx/model_q4.onnx"), "{}", files.model.display());
+        assert!(fetch_from(dir.path(), Some("http://127.0.0.1:9"), "intfloat/multilingual-e5-small:fp16").is_err(), "a variant the cache lacks is fetched, not swapped for fp32");
     }
 
     #[test]
