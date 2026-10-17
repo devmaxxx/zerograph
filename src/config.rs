@@ -1387,10 +1387,6 @@ mod tests {
         });
     }
 
-    /// The key was a setting until 2026-09-09 and is not one now, and it is the one a reader is
-    /// most likely to still have: the README told people to write `threads = 6` for the cores
-    /// back. Refused by name rather than ignored, so nobody is left believing a count they wrote
-    /// is still being read.
     #[test]
     fn embed_skip_is_a_projects_key_its_globs_are_checked_and_a_misspelling_is_refused() {
         let load = |text: &str| with_machine(None, || {
@@ -1412,6 +1408,10 @@ mod tests {
         });
     }
 
+    /// The key was a setting until 2026-09-09 and is not one now, and it is the one a reader is
+    /// most likely to still have: the README told people to write `threads = 6` for the cores
+    /// back. Refused by name rather than ignored, so nobody is left believing a count they wrote
+    /// is still being read.
     #[test]
     fn a_threads_key_left_in_a_file_is_refused_by_name() {
         with_machine(None, || {

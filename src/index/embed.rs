@@ -211,6 +211,12 @@ fn variant_file(onnx: &str, variant: Option<&str>) -> String {
     }
 }
 
+/// The files a model needs beside its graph. A variant's own external data is found by size, as
+/// any graph's is; the fp32 graph's data file (`model.onnx_data`, 2 GB for Qwen3) is not its.
+fn beside_for(profile: &Profile, variant: Option<&str>) -> Vec<&'static str> {
+    profile.beside.iter().copied().filter(|f| variant.is_none() || !f.starts_with(profile.onnx)).collect()
+}
+
 /// Whether a model falls through to e5's recipe — its pooling, its `query: `/`passage: ` tags —
 /// because nothing in `profile` recognised the id. True for the e5 models themselves, and for
 /// every id this binary has never heard of: the guess costs recall rather than a crash, and a
@@ -375,7 +381,7 @@ fn fetch_from(cache: &Path, endpoint: Option<&str>, model: &str) -> Result<Files
     // model's does, so it clears the margin by a factor of seven and never pays the lookup.
     let len = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
     if keeps_weights_beside(len) { let _ = repo.get(&format!("{onnx}_data")); }
-    for f in profile.beside { get(f)?; }
+    for f in beside_for(&profile, variant) { get(f)?; }
     let tokenizer = get("tokenizer.json")?;
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(get("config.json")?)?)?;
     let tok_config: serde_json::Value = serde_json::from_slice(&std::fs::read(get("tokenizer_config.json")?)?)?;
@@ -720,6 +726,9 @@ mod tests {
         assert_eq!(hub_and_variant("a/b:../x"), ("a/b:../x", None), "a variant is a word, never a path");
         assert_eq!(variant_file("onnx/model.onnx", Some("quantized")), "onnx/model_quantized.onnx");
         assert_eq!(variant_file("onnx/model.onnx", None), "onnx/model.onnx");
+        let qwen = Profile { beside: &["onnx/model.onnx_data", "onnx/Constant_7_attr__value"], ..E5 };
+        assert_eq!(beside_for(&qwen, None), ["onnx/model.onnx_data", "onnx/Constant_7_attr__value"]);
+        assert_eq!(beside_for(&qwen, Some("q4")), ["onnx/Constant_7_attr__value"]);
         let q4 = format!("{DEFAULT_MODEL}:q4");
         assert_eq!(profile(&q4), profile(DEFAULT_MODEL), "the prefixes and pooling are the model's, not the export's");
         assert_eq!(revision(&q4), revision(DEFAULT_MODEL), "and so is the commit it is fetched at");
