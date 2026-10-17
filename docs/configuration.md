@@ -18,7 +18,7 @@ in full, not an empty config:
 | `embed_model`        | `onnx-community/embeddinggemma-300m-ONNX`; the model the vectors are written with — nine were measured and `zerograph model` switches it, see [Embeddings](embeddings.md) |
 | `mcp_reranks`        | `25` — rerank commands one MCP server process starts (one that fails or times out counts, an exact id that never asks the model does not) before it answers `rerank: true` from the fused order with a line saying so; `0` turns rerank over MCP off. Machine file only: the agent decides each call and the tokens are the reader's, see [MCP](mcp.md) |
 | `reader_budget`      | `10` — seconds a reader may spend refreshing before it answers from the store as it stands and leaves the rest to a detached `update`; `0` never refreshes inline. The machine file may set it; `ZEROGRAPH_READER_BUDGET` overrides, see [Keeping it fresh](keeping-fresh.md#keeping-it-fresh) |
-| `resources`          | `"balanced"` = 30% of the logical cores; `"low"` a sixth, `"full"` a half — how much of the machine a run may take, see [Resources](configuration.md#resources) |
+| `resources`          | `"balanced"` = 40% of the logical cores; `"low"` a sixth, `"full"` a half — how much of the machine a run may take, see [Resources](configuration.md#resources) |
 
 `ZEROGRAPH_CODE_GLOBS`, whitespace-separated, replaces `code_globs` for one run. It is a measurement's
 switch, as `ZEROGRAPH_EMBED_MODEL` is, so a reading can name other globs without writing a
@@ -222,21 +222,23 @@ machine over is a writer that has to embed a store whole — `build`, `update`, 
 | `resources` | threads | `build` wall | `update` wall | peak CPU (mean), any phase | peak RSS |
 | --- | --- | --- | --- | --- | --- |
 | `"full"` | 6 | 403.4 s | 83.4 s | 580% (539%) | 1.35 GB |
-| `"balanced"` *(the default)* | 3 | 674.3 s | 139.2 s | 301% (296%) | 1.40 GB |
+| `"balanced"` *(the default)* | 4 | 521.1 s | 107.2 s | 396% (390%) | 1.36 GB |
 | `"low"` | 2 | 970.2 s | 198.8 s | 201% (199%) | 1.33 GB |
 
 Measured 2026-10-09 on the bench fixture under the default model on a twelve-core Apple Silicon
 machine: `build` from an empty store embeds all 11,590 rows, `update` re-reads 94 edited files and
-embeds 1,011 ([the results](bench/2026-10-09-bound-build-results.md), per phase). The embed is the
+embeds 1,011 ([the results](bench/2026-10-09-bound-build-results.md), per phase). The `balanced` row
+is that day's four-thread run, the count 40% gives on twelve cores; it was taken under the earlier
+one-third rule, which gave the same four, and has not been re-run on the 40% build. The embed is the
 phase that sets the peak: walk, parse, settle and save run on one thread for about two seconds, and
 the model open's half second stays under the embed's figure at every level.
 
 The rule is fractions of the logical cores with one thread as the floor: `full` a half, `balanced`
-30%, `low` a sixth — so the level follows the machine, and a container gets a fraction of its
+40%, `low` a sixth — so the level follows the machine, and a container gets a fraction of its
 quota rather than of the host. A level's threads are all a run computes on: `n` threads read as
-`n` cores. `balanced` was a third until 2026-10-09; on twelve cores that was four threads and 394%,
-over the 30% it is meant to hold, and three threads cost **about 30% more wall** (521.1 s → 674.3 s
-on `build`, 107.2 s → 139.2 s on `update`) for a peak of 301%. Memory is not per thread: peak RSS is
+`n` cores. `balanced` was a third until 2026-10-09 and 30% until 2026-10-17. At 30% it was three
+threads on twelve cores, 301% at peak and 674.3 s on `build`, 139.2 s on `update` — **about 30% more
+wall** than the four it is again at 40%, which read 396% and 521.1 s, 107.2 s. Memory is not per thread: peak RSS is
 the model's memory-mapped weights, which the system may drop and re-read, plus about 0.35 GB of
 the graph and the rows being written, whatever the level. Set it in `zerograph.toml`, once for the
 machine in `~/.config/zerograph/config.toml`, or `ZEROGRAPH_RESOURCES=full` for one run. A build

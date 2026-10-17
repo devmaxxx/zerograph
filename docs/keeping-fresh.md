@@ -78,7 +78,7 @@ question can be waiting behind its poll, and the poll re-reads only the files th
 | Linux | nice 19 and the idle I/O class, set before any thread starts so every pool inherits them |
 | Windows | `PROCESS_MODE_BACKGROUND_BEGIN` |
 
-The embed under it is still bounded by [`resources`](configuration.md#resources), 30% of the logical
+The embed under it is still bounded by [`resources`](configuration.md#resources), 40% of the logical
 cores by default. A platform that refuses the call costs a line in the run's log and nothing else.
 The price is wall time when the machine is busy: the band waits for the cores nothing else wants,
 which is the point, and a foreground `update` that finds a background one holding the store waits

@@ -413,14 +413,15 @@ pub fn threads(level: Resources) -> usize {
     threads_from(level, std::thread::available_parallelism().map_or(0, |n| n.get()))
 }
 
-/// Halves, sixths and 30% of the logical cores, with one thread as the floor. A level counts
+/// Halves, sixths and 40% of the logical cores, with one thread as the floor. A level counts
 /// threads that are busy for the whole embed, not threads that wait: the ORT session runs the
 /// caller plus `n - 1` intra-op workers, rayon's `n` tokenizer threads run between forwards while
 /// the caller waits on them, and nothing else on a writer's path runs alongside either (no
 /// inter-op pool outside parallel execution, a single-threaded walk and parse). So `n` threads
-/// read as `n` cores: four on twelve measured 394% at peak against the 360% that is 30% of the
-/// machine, and three measured 301% for about 30% more wall
-/// (docs/bench/2026-10-09-bound-build-results.md).
+/// read as `n` cores: four on twelve measured 394% at peak and three 301%, at about 30% more wall
+/// for the three (docs/bench/2026-10-09-bound-build-results.md). `balanced` was 30% from then
+/// until 2026-10-17, which bought that wall back as three threads; at 40% it is the four again,
+/// 480% of the machine's 1,200%.
 /// Turning ORT's spin-wait off gave nothing back at either count — the workers are computing,
 /// not spinning — so the thread count is the only lever.
 ///
@@ -434,12 +435,12 @@ pub fn threads(level: Resources) -> usize {
 /// threads contending for six cores cost more than they add, so `full` takes the shape that is
 /// both faster and cheaper in threads.
 ///
-/// On six logical cores or fewer `balanced` and `low` meet at one thread, which is more than 30%
-/// of a machine of three cores or fewer: a writer cannot run on less than one.
+/// On four logical cores or fewer `balanced` and `low` meet at one thread, which is more than 40%
+/// of a machine of two cores or fewer: a writer cannot run on less than one.
 fn threads_from(level: Resources, cores: usize) -> usize {
     match level {
         Resources::Full => (cores / 2).max(1),
-        Resources::Balanced => (cores * 3 / 10).max(1),
+        Resources::Balanced => (cores * 4 / 10).max(1),
         Resources::Low => (cores / 6).max(1),
     }
 }
@@ -892,9 +893,9 @@ mod tests {
     #[test]
     fn each_level_takes_its_fraction_of_the_cores_and_never_reaches_zero() {
         assert_eq!(threads_from(Resources::Full, 12), 6);
-        assert_eq!(threads_from(Resources::Balanced, 12), 3, "360% is 30% of twelve cores");
+        assert_eq!(threads_from(Resources::Balanced, 12), 4, "480% is 40% of twelve cores");
         assert_eq!(threads_from(Resources::Low, 12), 2);
-        assert_eq!(threads_from(Resources::Balanced, 8), 2);
+        assert_eq!(threads_from(Resources::Balanced, 8), 3);
         assert_eq!(threads_from(Resources::Low, 8), 1);
         assert_eq!(threads_from(Resources::Full, 4), 2);
         assert_eq!(threads_from(Resources::Balanced, 4), 1, "the two named-down levels meet on a small box");
@@ -904,11 +905,11 @@ mod tests {
     }
 
     #[test]
-    fn balanced_is_the_most_threads_that_stay_within_thirty_percent() {
+    fn balanced_is_the_most_threads_that_stay_within_forty_percent() {
         for cores in 1..=256 {
             let n = threads_from(Resources::Balanced, cores);
-            assert!(n * 10 <= cores * 3 || n == 1, "{n} threads on {cores} cores is over 30%");
-            assert!((n + 1) * 10 > cores * 3, "{cores} cores leave room for more than {n} threads under 30%");
+            assert!(n * 10 <= cores * 4 || n == 1, "{n} threads on {cores} cores is over 40%");
+            assert!((n + 1) * 10 > cores * 4, "{cores} cores leave room for more than {n} threads under 40%");
         }
     }
 
@@ -919,7 +920,7 @@ mod tests {
             let balanced = threads_from(Resources::Balanced, cores);
             let full = threads_from(Resources::Full, cores);
             assert!(low <= balanced && balanced <= full, "{cores} cores: low {low}, balanced {balanced}, full {full}");
-            if cores >= 7 {
+            if cores >= 6 {
                 assert!(low < balanced && balanced < full, "{cores} cores leave room for three distinct levels: {low}, {balanced}, {full}");
             }
         }

@@ -61,8 +61,9 @@ pub struct Config {
     /// a CI box and a quiet laptop's spare ones — so the global file may set it, unlike
     /// `embed_model`, whose value is a property of the vectors on disk. It is a straight trade
     /// with no free side: on a whole-store `build` of the bench fixture the three levels read
-    /// 403.4 s at 580% peak CPU, 674.3 s at 301% and 970.2 s at 201%
-    /// (docs/bench/2026-10-09-bound-build-results.md). `ZEROGRAPH_RESOURCES` overrides it for
+    /// 403.4 s at 580% peak CPU, 521.1 s at 396% and 970.2 s at 201%
+    /// (docs/bench/2026-10-09-bound-build-results.md, `balanced`'s four threads read there as
+    /// the "before" row). `ZEROGRAPH_RESOURCES` overrides it for
     /// one run.
     pub resources: crate::index::embed::Resources,
     /// Seconds a reader (`ask`, `impact`, `trace`, `changes`, `explain`) may spend bringing the
