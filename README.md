@@ -10,7 +10,7 @@
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Windows%20x64-lightgrey)
 
 [Get started](#get-started) · [See it in action](#see-it-in-action) · [Features](#features) ·
-[Benchmarks](#benchmarks) · [How it works](#how-it-works) · [Docs](docs/README.md)
+[Benchmarks](docs/benchmarks.md) · [How it works](#how-it-works) · [Docs](docs/README.md)
 
 </div>
 
@@ -82,19 +82,6 @@ zerograph explain FR-PAY-22                # one node and everything attached to
 | Languages | TypeScript and JavaScript, Kotlin, Java, C#, Rust, Python, Dart, Swift, GraphQL, SQL, Bicep, HCL, Shell, Vue, Lua, Go, C, C++, PHP, Ruby, Scala, Elixir, OCaml ([languages](docs/languages.md)) |
 | Optional spend | `ask --rerank`, a model picking seeds from a 200-deep pool per question ([rerank](docs/rerank.md)) |
 | Bench | `zerograph bench` fails the process when a recall floor is missed ([benchmarks](docs/benchmarks.md)) |
-
-## Benchmarks
-
-On the recorded 82 cases with the default embedder, at 244 p90 tokens an answer:
-
-| Suite | Cases | Default | `--no-dense` |
-| --- | --- | --- | --- |
-| Keyword | 40 | 40/40 | 39/40 |
-| Paraphrase | 30 | 19/30 | 7/30 |
-| Code | 12 | 12/12 | 12/12 |
-
-The graph itself costs nothing to build. Floors, exit codes and the full tables:
-[benchmarks](docs/benchmarks.md).
 
 ## Configuration
 

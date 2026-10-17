@@ -59,7 +59,16 @@ fn with_command(template: &str, command: &str) -> String { template.replace("{{c
 const HOOK_COMMAND: &str = "const COMMAND = \"zerograph\";";
 
 fn hook(command: &str) -> String {
-    HOOK.replacen(HOOK_COMMAND, &format!("const COMMAND = {};", serde_json::Value::from(command)), 1)
+    let script = HOOK.replacen(HOOK_COMMAND, &format!("const COMMAND = {};", serde_json::Value::from(command)), 1);
+    let (shebang, rest) = script.split_once('\n').unwrap();
+    format!("{shebang}\n{}{rest}", stamp())
+}
+
+/// The line under the shebang records the matchers this release wrote, so a re-run can tell one it
+/// wrote (moved to the new default) from one a person changed (kept).
+fn stamp() -> String {
+    let wrote: Vec<String> = hook_entries("").iter().map(|(e, m, _)| format!("{e}={m}")).collect();
+    format!("// zerograph {} wrote: {}\n", env!("CARGO_PKG_VERSION"), wrote.join(" "))
 }
 
 const BEGIN: &str = "<!-- zerograph:begin -->";
@@ -138,7 +147,9 @@ fn hook_entries(hook_path: &str) -> Vec<(&'static str, &'static str, serde_json:
 /// dropped from. That script is the previous surface and this one replaces it, but it is a file
 /// the repository owns and a person put in that list: removing it without a word would be the one
 /// silent edit in an installer that otherwise touches nothing it did not write.
-pub fn merged_settings(existing: &str, hook_path: &str) -> Result<(String, Vec<String>)> {
+///
+/// `prior_hook` is the hook script on disk before this run; its stamp says which matchers we wrote.
+pub fn merged_settings(existing: &str, hook_path: &str, prior_hook: &str) -> Result<(String, Vec<String>)> {
     let mut root: serde_json::Value = match existing.trim().is_empty() {
         true => serde_json::json!({}),
         false => serde_json::from_str(existing).context("the settings file is not JSON")?,
@@ -147,12 +158,17 @@ pub fn merged_settings(existing: &str, hook_path: &str) -> Result<(String, Vec<S
     let hooks = root.as_object_mut().unwrap().entry("hooks").or_insert_with(|| serde_json::json!({}));
     if !hooks.is_object() { anyhow::bail!("`hooks` in the settings file is not an object"); }
     let mut retired = Vec::new();
-    for (event, matcher, entry) in hook_entries(hook_path) {
-        let mut ours = entry;
-        ours.as_object_mut().unwrap().insert("matcher".into(), serde_json::json!(matcher));
+    // A hook from before the stamp has none, and its release wrote today's defaults.
+    let stamp = prior_hook.lines().nth(1).unwrap_or_default();
+    for (event, matcher, mut ours) in hook_entries(hook_path) {
         let list = hooks.as_object_mut().unwrap().entry(event).or_insert_with(|| serde_json::json!([]));
         let Some(arr) = list.as_array_mut() else { anyhow::bail!("`hooks.{event}` is not an array") };
         if arr.iter().any(|e| e.to_string().contains("repograph-notice")) { retired.push(event.to_string()); }
+        let theirs = arr.iter()
+            .filter(|e| ["zerograph-hook", "repograph-hook"].iter().any(|s| e.to_string().contains(s)))
+            .find_map(|e| e["matcher"].as_str())
+            .filter(|m| *m != matcher && !stamp.split(' ').any(|t| t == format!("{event}={m}")));
+        ours["matcher"] = serde_json::json!(theirs.unwrap_or(matcher));
         // Ours by the script it runs, never by position: a repository's own entries keep theirs.
         // `repograph-hook` is this hook under the name it had before the rename.
         arr.retain(|e| !["zerograph-hook", "repograph-hook", "repograph-notice"].iter().any(|s| e.to_string().contains(s)));
@@ -293,6 +309,7 @@ pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
     let mut report = Report::default();
     let base: PathBuf = root.join(target.dir());
     let hook_file = base.join("hooks").join("zerograph-hook.mjs");
+    let prior_hook = std::fs::read_to_string(&hook_file).unwrap_or_default();
     write_if_changed(&hook_file, &hook(command), &mut report)?;
     write_if_changed(&base.join("hooks").join("rule.txt"), &with_command(RULE, command), &mut report)?;
     write_skill(&base.join("skills"), command, &mut report)?;
@@ -310,7 +327,7 @@ pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
     if target.hooks_are_repository_scoped() {
         let settings = base.join("settings.json");
         let existing = std::fs::read_to_string(&settings).unwrap_or_default();
-        let (merged, retired) = merged_settings(&existing, &hook_path)?;
+        let (merged, retired) = merged_settings(&existing, &hook_path, &prior_hook)?;
         if !retired.is_empty() {
             report.notes.push(format!(
                 "removed the retired `repograph-notice` hook from {} — this hook replaces it; \
@@ -1232,6 +1249,35 @@ mod tests {
         assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("CLAUDE_PROJECT_DIR"));
     }
 
+    /// A narrowed matcher is a choice someone made, such as keeping the hook off Bash calls; a
+    /// re-run that put the default back would undo it on every upgrade.
+    #[test]
+    fn a_matcher_set_on_our_entry_survives_a_re_run() {
+        let dir = root();
+        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
+        std::fs::write(dir.path().join(".claude/settings.json"), r#"{"hooks":{"PreToolUse":[
+            {"matcher":"Grep|Glob|Agent","hooks":[{"type":"command","command":"node /old/path/zerograph-hook.mjs"}]}
+        ]}}"#).unwrap();
+        install(dir.path(), Target::Claude, "zerograph").unwrap();
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap()).unwrap();
+        let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
+        assert_eq!(arr.len(), 1, "{arr:?}");
+        assert_eq!(arr[0]["matcher"], "Grep|Glob|Agent");
+        assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("CLAUDE_PROJECT_DIR"), "the rest of the entry is still ours to update");
+        assert_eq!(v["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact", "a fresh entry gets the default");
+    }
+
+    /// A matcher the stamp says we wrote is ours to move when the default changes; any other stays.
+    #[test]
+    fn a_matcher_the_stamp_records_moves_to_the_new_default() {
+        let settings = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|Grep","hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#;
+        let ours = merged_settings(settings, "h", "#!/usr/bin/env node\n// zerograph 0.6.4 wrote: PreToolUse=Bash|Grep\n").unwrap().0;
+        assert!(ours.contains("\"Bash|Grep|Glob|Agent\""), "{ours}");
+        let theirs = merged_settings(settings, "h", "#!/usr/bin/env node\n// zerograph 0.6.4 wrote: PreToolUse=Bash\n").unwrap().0;
+        assert!(theirs.contains("\"Bash|Grep\""), "{theirs}");
+    }
+
     #[test]
     fn the_stanza_lands_in_a_root_instructions_file_when_there_is_one_and_replaces_only_itself() {
         let dir = root();
@@ -1312,7 +1358,7 @@ mod tests {
     #[test]
     fn the_hook_takes_the_command_as_one_json_string_and_the_default_as_it_ships() {
         assert_eq!(HOOK.matches(HOOK_COMMAND).count(), 1, "the declaration the installer replaces is in the hook once");
-        assert_eq!(hook("zerograph"), HOOK, "the default installs the template byte for byte");
+        assert_eq!(hook("zerograph").replacen(&stamp(), "", 1), HOOK, "the default installs the template byte for byte, under the stamp");
         let script = hook(r#"pnpm exec "re'po\graph" `x` ${y}"#);
         assert!(script.contains(r#"const COMMAND = "pnpm exec \"re'po\\graph\" `x` ${y}";"#), "the command is one string literal");
         assert_eq!(script.matches("const COMMAND = ").count(), 1);
