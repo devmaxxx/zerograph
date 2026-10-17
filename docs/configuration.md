@@ -16,6 +16,7 @@ in full, not an empty config:
 | `rerank_model`       | `haiku` — whatever goes in `rerank_command`'s `{model}`                                     |
 | `reranker_dir`       | directory of the exported cross-encoder for `--rerank-local`; empty = `~/.cache/zerograph/reranker`. Machine file only: a repository's is ignored, like the commands |
 | `embed_model`        | `onnx-community/embeddinggemma-300m-ONNX`; the model the vectors are written with — nine were measured and `zerograph model` switches it, see [Embeddings](embeddings.md) |
+| `embed_skip`         | `[]` — globs whose files get no vectors but keep their nodes, edges and lexical rows, see [Files without vectors](configuration.md#files-without-vectors) |
 | `mcp_reranks`        | `25` — rerank commands one MCP server process starts (one that fails or times out counts, an exact id that never asks the model does not) before it answers `rerank: true` from the fused order with a line saying so; `0` turns rerank over MCP off. Machine file only: the agent decides each call and the tokens are the reader's, see [MCP](mcp.md) |
 | `reader_budget`      | `10` — seconds a reader may spend refreshing before it answers from the store as it stands and leaves the rest to a detached `update`; `0` never refreshes inline. The machine file may set it; `ZEROGRAPH_READER_BUDGET` overrides, see [Keeping it fresh](keeping-fresh.md#keeping-it-fresh) |
 | `resources`          | `"balanced"` = 40% of the logical cores; `"low"` a sixth, `"full"` a half — how much of the machine a run may take, see [Resources](configuration.md#resources) |
@@ -52,6 +53,28 @@ fixture under the default embedder, `text_globs = ["**/*"]` takes paraphrase que
 of 30 and the dev suite from 36 to 33 of 60 (one shared list cost 18 and 30), while twelve
 config-file questions read 12/12. Turn it on where finding a configuration file matters more than
 finding the requirement; the readings are in [the text-list rule](bench/2026-10-08-text-list-rule.md).
+
+### Files without vectors
+
+`embed_skip` (empty by default) names files the dense index leaves out: generated code, SQL
+migrations, mocks — what is read and changed but never asked about in prose.
+
+```toml
+embed_skip = ["**/generated/**", "**/*.gen.ts", "**/migrations/**", "**/*.mock.ts"]
+```
+
+A matching file keeps its nodes, its edges and its rows in the lexical index, so `impact`, `trace`,
+`changes`, `explain` and an `ask` by name or exact words still find it; a paraphrase does not,
+because nothing of it is embedded. `skip` would take it out of all of those. The globs match the
+path a node is declared in, the way `skip` matches a file, and a requirement a skipped file only
+mentions keeps the rows its own document gives it. Its rows are not counted as owed, so the MCP
+`status` tool does not report them, and the next writer — `update`, `embed`, `build`, `watch`, or a
+reader catching up a moved graph — drops any it already held. Changing the key moves only those
+files' rows: every other row is matched by hash and kept, so adding a glob embeds nothing and
+removing one embeds that file's rows alone. A glob that does not parse is an error naming the file,
+and the machine file refuses the key, since which files get vectors is one repository's choice.
+
+On beauty-crm's 55.8k embedded rows, generated files were 10.5% and SQL migrations 8.2%.
 
 ### Choosing a model, and where the choice lives
 

@@ -342,6 +342,9 @@ impl Context {
             // `ask` an exact id answered after refreshing all leave the same store behind.
             if !req.stale && graph_at.is_some_and(|at| idx.behind(at)) {
                 if let Some(emb) = e.as_mut() {
+                    // `Config::load` refused a glob that does not parse, so only a config built
+                    // in code reaches the default.
+                    let skip = index::dense::EmbedSkip::new(&cfg.embed_skip).unwrap_or_default();
                     // Rows owed and not embedded here: said once, and carried to `--json`. The
                     // refresh that will embed them is started unless one is running already.
                     let owe = |left: usize, start: bool| {
@@ -360,7 +363,7 @@ impl Context {
                     // is a refresh another process is running — the same as a one-shot's.
                     let per_answer = matches!(writer, Writer::PerAnswer).then(|| store.try_lock_writer());
                     if matches!(writer, Writer::Barred) || matches!(per_answer, Some(Ok(None))) || (matches!(per_answer, Some(Err(_))) && store.has_link()) {
-                        let left = idx.owed(graph);
+                        let left = idx.owed(graph, &skip);
                         if left > 0 { owe(left, false); }
                     } else {
                         // A reader appends to the store's own rows and never re-embeds them into
@@ -369,12 +372,12 @@ impl Context {
                         let width = qvec.as_ref().map_or(idx.dim, |v| v.len());
                         idx.written_by(emb.name(), width);
                         let budget = budget.get();
-                        let owed = idx.owed(graph);
+                        let owed = idx.owed(graph, &skip);
                         let started = std::time::Instant::now();
                         // Weighed at an idle machine's rate first, so a pull's worth of rows is
                         // not started at all; past that, each chunk's own rate decides.
                         let synced = match budget.fits(owed, refresh::ROW_COST) {
-                            true => idx.sync_chunked(graph, &mut |texts| emb.embed(texts), READER_CHUNK, &mut |_, p| {
+                            true => idx.sync_chunked(graph, &skip, &mut |texts| emb.embed(texts), READER_CHUNK, &mut |_, p| {
                                 match budget.overrun(p.done, p.total, started.elapsed()) {
                                     true => Err(refresh::OutOfBudget(p.total - p.done).into()),
                                     false => Ok(()),

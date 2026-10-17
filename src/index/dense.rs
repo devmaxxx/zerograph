@@ -59,6 +59,27 @@ fn rows(n: &crate::model::Node) -> Vec<String> {
     }
 }
 
+/// The files `embed_skip` names: their nodes stay in the graph and the lexical index, and have no
+/// rows here. Matched on the node's own `file`, the path a `skip` glob would match it by, so a
+/// requirement a skipped file only mentions keeps the rows its declaring document gives it.
+#[derive(Default)]
+pub struct EmbedSkip(Option<globset::GlobSet>);
+
+impl EmbedSkip {
+    pub fn new(globs: &[String]) -> Result<EmbedSkip> {
+        if globs.is_empty() { return Ok(EmbedSkip(None)); }
+        crate::walk::globs(globs).map(|g| EmbedSkip(Some(g))).context("embed_skip")
+    }
+
+    /// The rows `n` is owed under this skip: none for a node of a skipped file.
+    fn rows(&self, n: &crate::model::Node) -> Vec<String> {
+        match &self.0 {
+            Some(g) if g.is_match(&n.file) => Vec::new(),
+            _ => rows(n),
+        }
+    }
+}
+
 /// Under 256 tokens for the small model in Cyrillic, its densest script (about 2.5 chars a token).
 const TEXT_ROW_CHARS: usize = 600;
 
@@ -280,12 +301,12 @@ impl DenseIndex {
 
     /// How many rows a `sync` against this graph would embed, without embedding any: what a
     /// reader weighs against its budget before it opens the work, and reports when it does not.
-    pub fn owed(&self, graph: &Graph) -> usize {
-        if self.dim == 0 { return graph.nodes.values().map(|n| rows(n).len()).sum(); }
+    pub fn owed(&self, graph: &Graph, skip: &EmbedSkip) -> usize {
+        if self.dim == 0 { return graph.nodes.values().map(|n| skip.rows(n).len()).sum(); }
         let held: std::collections::HashSet<(&str, &str)> =
             self.live.iter().map(|&i| (self.ids[i].as_str(), self.hashes[i].as_str())).collect();
         graph.nodes.values()
-            .map(|n| rows(n).iter().filter(|t| !held.contains(&(n.id.as_str(), blake3::hash(t.as_bytes()).to_hex().as_str()))).count())
+            .map(|n| skip.rows(n).iter().filter(|t| !held.contains(&(n.id.as_str(), blake3::hash(t.as_bytes()).to_hex().as_str()))).count())
             .sum()
     }
 
@@ -296,8 +317,8 @@ impl DenseIndex {
     pub fn checkpointed(&mut self) { self.reindex(); }
 
     #[allow(clippy::type_complexity)]
-    pub fn sync(&mut self, graph: &Graph, embed: &mut dyn FnMut(&[String]) -> Result<Vec<Vec<f32>>>) -> Result<usize> {
-        self.sync_chunked(graph, embed, ChunkBudget::rows(usize::MAX), &mut |_, _| Ok(()))
+    pub fn sync(&mut self, graph: &Graph, skip: &EmbedSkip, embed: &mut dyn FnMut(&[String]) -> Result<Vec<Vec<f32>>>) -> Result<usize> {
+        self.sync_chunked(graph, skip, embed, ChunkBudget::rows(usize::MAX), &mut |_, _| Ok(()))
     }
 
     /// `sync`, embedding a `budget`'s worth of rows at a time and calling `after_chunk` after each with the
@@ -307,11 +328,14 @@ impl DenseIndex {
     /// embeds only what is missing, and retires whatever the edit orphaned, at a cost of one
     /// duplicate row per edited node until then. The holes, the reindex and the compaction wait
     /// for the end for that reason: they are what makes the old rows unreachable, and a run that
-    /// stops halfway must not have done half of it.
+    /// stops halfway must not have done half of it. A node `skip` covers is owed no rows, so the
+    /// rows it held die with the rest of what the graph no longer asks for, and every other row
+    /// is matched by hash and kept.
     #[allow(clippy::type_complexity)]
     pub fn sync_chunked(
         &mut self,
         graph: &Graph,
+        skip: &EmbedSkip,
         embed: &mut dyn FnMut(&[String]) -> Result<Vec<Vec<f32>>>,
         budget: ChunkBudget,
         after_chunk: &mut dyn FnMut(&mut DenseIndex, Progress) -> Result<()>,
@@ -328,7 +352,7 @@ impl DenseIndex {
         let old: std::collections::HashMap<(&str, &str), usize> =
             self.live.iter().map(|&i| ((self.ids[i].as_str(), self.hashes[i].as_str()), i)).collect();
         for n in graph.nodes.values() {
-            for text in rows(n) {
+            for text in skip.rows(n) {
                 let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
                 match old.get(&(n.id.as_str(), hash.as_str())).copied() {
                     Some(i) if self.dim > 0 => alive[i] = true,
@@ -463,7 +487,7 @@ mod tests {
 
     fn synced(g: &Graph) -> DenseIndex {
         let mut idx = DenseIndex::default();
-        idx.sync(g, &mut fake).unwrap();
+        idx.sync(g, &EmbedSkip::default(), &mut fake).unwrap();
         idx
     }
 
@@ -491,7 +515,7 @@ mod tests {
     fn sync_chunked_appends_every_row_and_reports_progress_after_each_chunk() {
         let mut idx = DenseIndex::default();
         let mut seen = Vec::new();
-        let n = idx.sync_chunked(&wide(0), &mut fake, ChunkBudget::rows(4),
+        let n = idx.sync_chunked(&wide(0), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(4),
             &mut |_, p| { seen.push((p.done, p.total)); Ok(()) }).unwrap();
         assert_eq!(n, 10);
         assert_eq!(seen, vec![(4, 10), (8, 10), (10, 10)]);
@@ -505,14 +529,14 @@ mod tests {
         let store = Store::new(d.path());
         let mut idx = DenseIndex::default();
         // A run killed after its first checkpoint: the rows it embedded are on disk.
-        let err = idx.sync_chunked(&wide(0), &mut fake, ChunkBudget::rows(4), &mut |i, _| {
+        let err = idx.sync_chunked(&wide(0), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(4), &mut |i, _| {
             i.save(&store)?;
             anyhow::bail!("interrupted")
         }).unwrap_err().to_string();
         assert!(err.contains("interrupted"), "{err}");
         let mut back = DenseIndex::load(&store).unwrap();
         assert_eq!(back.ids.len(), 4);
-        assert_eq!(back.sync(&wide(0), &mut fake).unwrap(), 6, "only what the checkpoint lacks");
+        assert_eq!(back.sync(&wide(0), &EmbedSkip::default(), &mut fake).unwrap(), 6, "only what the checkpoint lacks");
         let q = fake(&["passage: n7x\nтело".to_string()]).unwrap().remove(0);
         assert_eq!(back.search_scored(&q, 10), synced(&wide(0)).search_scored(&q, 10));
     }
@@ -540,7 +564,7 @@ mod tests {
         idx.synced_against(Some(at));
         // Another model: every row goes, and the graph `at` names is embedded again from nothing.
         idx.written_by("another/model", 3);
-        let err = idx.sync_chunked(&wide(0), &mut fake, ChunkBudget::rows(4), &mut |i, _| {
+        let err = idx.sync_chunked(&wide(0), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(4), &mut |i, _| {
             i.save(&store)?;
             anyhow::bail!("interrupted")
         }).unwrap_err().to_string();
@@ -553,7 +577,7 @@ mod tests {
     #[test]
     fn a_chunked_sync_over_an_edited_store_leaves_the_same_holes_as_a_plain_one() {
         let mut idx = synced(&wide(0));
-        assert_eq!(idx.sync_chunked(&wide(1), &mut fake, ChunkBudget::rows(3), &mut |_, _| Ok(())).unwrap(), 1);
+        assert_eq!(idx.sync_chunked(&wide(1), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(3), &mut |_, _| Ok(())).unwrap(), 1);
         assert_eq!(idx.free, vec![0]);
         assert_eq!(idx.live, (1..11).collect::<Vec<_>>());
     }
@@ -561,10 +585,10 @@ mod tests {
     #[test]
     fn sync_is_sync_chunked_with_one_chunk() {
         let mut plain = DenseIndex::default();
-        let n = plain.sync(&wide(0), &mut fake).unwrap();
+        let n = plain.sync(&wide(0), &EmbedSkip::default(), &mut fake).unwrap();
         let mut chunked = DenseIndex::default();
         let mut seen = Vec::new();
-        let m = chunked.sync_chunked(&wide(0), &mut fake, ChunkBudget::rows(usize::MAX),
+        let m = chunked.sync_chunked(&wide(0), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(usize::MAX),
             &mut |_, p| { seen.push((p.done, p.total)); Ok(()) }).unwrap();
         assert_eq!((m, seen), (n, vec![(n, n)]));
         assert_eq!((chunked.ids, chunked.vectors), (plain.ids, plain.vectors));
@@ -573,24 +597,24 @@ mod tests {
     #[test]
     fn sync_embeds_only_changed_nodes_and_drops_removed_ones() {
         let mut idx = DenseIndex::default();
-        assert_eq!(idx.sync(&graph("политика"), &mut fake).unwrap(), 2);
+        assert_eq!(idx.sync(&graph("политика"), &EmbedSkip::default(), &mut fake).unwrap(), 2);
         assert_eq!(idx.ids.len(), 2);
-        assert_eq!(idx.sync(&graph("политика"), &mut fake).unwrap(), 0);
-        assert_eq!(idx.sync(&graph("другое"), &mut fake).unwrap(), 1);
+        assert_eq!(idx.sync(&graph("политика"), &EmbedSkip::default(), &mut fake).unwrap(), 0);
+        assert_eq!(idx.sync(&graph("другое"), &EmbedSkip::default(), &mut fake).unwrap(), 1);
         let mut g = graph("другое");
         g.remove_file("a.md");
-        assert_eq!(idx.sync(&g, &mut fake).unwrap(), 0);
+        assert_eq!(idx.sync(&g, &EmbedSkip::default(), &mut fake).unwrap(), 0);
         assert!(idx.ids.is_empty() && idx.vectors.is_empty());
     }
 
     #[test]
     fn owed_counts_the_rows_a_sync_would_embed_and_embeds_none() {
         let mut idx = DenseIndex::default();
-        assert_eq!(idx.owed(&wide(0)), 10, "an empty index owes every row");
-        idx.sync(&wide(0), &mut fake).unwrap();
-        assert_eq!(idx.owed(&wide(0)), 0);
-        assert_eq!(idx.owed(&wide(3)), 3);
-        assert_eq!(idx.sync(&wide(3), &mut fake).unwrap(), 3, "the count is the sync's own");
+        assert_eq!(idx.owed(&wide(0), &EmbedSkip::default()), 10, "an empty index owes every row");
+        idx.sync(&wide(0), &EmbedSkip::default(), &mut fake).unwrap();
+        assert_eq!(idx.owed(&wide(0), &EmbedSkip::default()), 0);
+        assert_eq!(idx.owed(&wide(3), &EmbedSkip::default()), 3);
+        assert_eq!(idx.sync(&wide(3), &EmbedSkip::default(), &mut fake).unwrap(), 3, "the count is the sync's own");
     }
 
     /// A reader out of budget stops its sync after a chunk. What it answers from then is the old
@@ -598,14 +622,14 @@ mod tests {
     #[test]
     fn a_stopped_sync_answers_from_old_and_new_rows_and_the_next_embeds_only_the_rest() {
         let mut idx = DenseIndex::default();
-        idx.sync(&wide(0), &mut fake).unwrap();
-        let stopped = idx.sync_chunked(&wide(10), &mut fake, ChunkBudget::rows(4),
+        idx.sync(&wide(0), &EmbedSkip::default(), &mut fake).unwrap();
+        let stopped = idx.sync_chunked(&wide(10), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(4),
             &mut |_, p| if p.done < p.total { anyhow::bail!("out of budget") } else { Ok(()) });
         assert!(stopped.is_err());
         idx.checkpointed();
         assert_eq!(idx.live.len(), 14, "ten old rows and the four the stopped sync appended");
-        assert_eq!(idx.owed(&wide(10)), 6);
-        assert_eq!(idx.sync(&wide(10), &mut fake).unwrap(), 6);
+        assert_eq!(idx.owed(&wide(10), &EmbedSkip::default()), 6);
+        assert_eq!(idx.sync(&wide(10), &EmbedSkip::default(), &mut fake).unwrap(), 6);
         assert_eq!(idx.live.len(), 10, "the replaced rows are retired by the sync that finished");
     }
 
@@ -617,7 +641,7 @@ mod tests {
         idx.written_by("BAAI/bge-m3", 3);
         assert!(idx.ids.is_empty() && idx.vectors.is_empty() && idx.dim == 0, "another model's rows cannot be appended to");
         assert_eq!(idx.model, "BAAI/bge-m3");
-        assert_eq!(idx.sync(&graph("x"), &mut fake).unwrap(), 2);
+        assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap(), 2);
         idx.written_by("BAAI/bge-m3", 3);
         assert_eq!(idx.ids.len(), 2, "the same model keeps its rows");
     }
@@ -626,7 +650,7 @@ mod tests {
     fn a_claim_in_another_case_keeps_the_rows_and_records_its_spelling() {
         let mut idx = synced(&graph("x"));
         idx.written_by("BAAI/BGE-M3", 3);
-        assert_eq!(idx.sync(&graph("x"), &mut fake).unwrap(), 2);
+        assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap(), 2);
         idx.written_by("BAAI/bge-m3", 3);
         assert_eq!(idx.ids.len(), 2, "one model in two cases is not a re-embed");
         assert_eq!(idx.model, "BAAI/bge-m3");
@@ -645,7 +669,7 @@ mod tests {
         idx.written_by(crate::index::embed::UNNAMED_MODEL, 5);
         assert!(idx.ids.is_empty() && idx.vectors.is_empty() && idx.dim == 0,
             "rows of another width cannot be appended to, whatever the name says");
-        assert_eq!(idx.sync(&graph("x"), &mut fake_wide).unwrap(), 2);
+        assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake_wide).unwrap(), 2);
         assert_eq!(idx.dim, 5);
     }
 
@@ -655,7 +679,7 @@ mod tests {
         let store = Store::new(dir.path());
         let mut idx = synced(&graph("x"));
         idx.written_by("BAAI/bge-m3", 3);
-        idx.sync(&graph("x"), &mut fake).unwrap();
+        idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap();
         idx.save(&store).unwrap();
         assert_eq!(DenseIndex::recorded_model(&store).unwrap().as_deref(), Some("BAAI/bge-m3"));
         assert_eq!(DenseIndex::load(&store).unwrap().model, "BAAI/bge-m3");
@@ -668,7 +692,7 @@ mod tests {
         let hostile = "x\n\u{1b}[31mFORGED\u{7}";
         let mut idx = synced(&graph("x"));
         idx.written_by(hostile, 3);
-        idx.sync(&graph("x"), &mut fake).unwrap();
+        idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap();
         idx.save(&store).unwrap();
         let read = DenseIndex::recorded_model(&store).unwrap().unwrap();
         assert!(!read.chars().any(char::is_control), "{read:?}");
@@ -682,7 +706,7 @@ mod tests {
         let store = Store::new(dir.path());
         let mut idx = synced(&graph("x"));
         idx.written_by("BAAI/bge-m3", 3);
-        idx.sync(&graph("x"), &mut fake).unwrap();
+        idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap();
         idx.save(&store).unwrap();
         // A crash between the two writes leaves metadata naming more rows than the file holds.
         // The rows are gone either way; the name must not be, or `ask` reads the store as
@@ -717,7 +741,7 @@ mod tests {
             "an unnamed store holds the small model's rows, so a reader opens the small model");
         let mut idx = synced(&graph("x"));
         idx.written_by("BAAI/bge-m3", 3);
-        idx.sync(&graph("x"), &mut fake).unwrap();
+        idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap();
         idx.save(&store).unwrap();
         assert_eq!(DenseIndex::recorded_model(&store).unwrap().as_deref(), Some("BAAI/bge-m3"));
     }
@@ -733,7 +757,7 @@ mod tests {
     fn an_append_leaves_the_surviving_rows_at_their_offsets() {
         let mut idx = synced(&wide(0));
         let before = idx.vectors.clone();
-        assert_eq!(idx.sync(&wide(1), &mut fake).unwrap(), 1);
+        assert_eq!(idx.sync(&wide(1), &EmbedSkip::default(), &mut fake).unwrap(), 1);
         assert_eq!(idx.free, vec![0]);
         assert_eq!(idx.ids.len(), 11);
         assert_eq!(idx.vectors[idx.dim..before.len()], before[idx.dim..]);
@@ -745,7 +769,7 @@ mod tests {
     fn a_dead_row_is_never_returned() {
         let mut idx = synced(&wide(0));
         let stale = fake(&["passage: n0x\nтело".to_string()]).unwrap().remove(0);
-        idx.sync(&wide(1), &mut fake).unwrap();
+        idx.sync(&wide(1), &EmbedSkip::default(), &mut fake).unwrap();
         let passages = idx.search(&stale, 20);
         assert_eq!(passages.len(), 10, "one row per live node, the hole scanned by nobody");
         assert!(!passages.iter().any(|id| id.is_empty()));
@@ -755,7 +779,7 @@ mod tests {
     fn compaction_fires_past_the_hole_share_and_searches_identically() {
         let mut idx = synced(&wide(0));
         // Three of ten rows die at once: past a quarter of the live rows, so the holes close.
-        idx.sync(&wide(3), &mut fake).unwrap();
+        idx.sync(&wide(3), &EmbedSkip::default(), &mut fake).unwrap();
         assert!(idx.free.is_empty());
         assert_eq!(idx.ids.len(), 10);
         let fresh = synced(&wide(3));
@@ -771,7 +795,7 @@ mod tests {
         idx.save(&store).unwrap();
         let rows = d.path().join(".zerograph/vectors.f32");
         let before = std::fs::read(&rows).unwrap();
-        idx.sync(&wide(1), &mut fake).unwrap();
+        idx.sync(&wide(1), &EmbedSkip::default(), &mut fake).unwrap();
         idx.save(&store).unwrap();
         let after = std::fs::read(&rows).unwrap();
         assert_eq!(after.len(), before.len() + idx.dim * 4, "one row longer, nothing rewritten");
@@ -818,7 +842,7 @@ mod tests {
         assert_eq!(back.vectors.len(), 10 * back.dim);
         let q = fake(&["passage: n4x\nтело".to_string()]).unwrap().remove(0);
         assert_eq!(back.search_scored(&q, 10), idx.search_scored(&q, 10));
-        back.sync(&wide(1), &mut fake).unwrap();
+        back.sync(&wide(1), &EmbedSkip::default(), &mut fake).unwrap();
         back.save(&store).unwrap();
         assert_eq!(std::fs::metadata(&rows).unwrap().len() as usize, good.len() + back.dim * 4);
         assert_eq!(DenseIndex::load(&store).unwrap().ids, back.ids);
@@ -837,7 +861,7 @@ mod tests {
         idx.vectors.extend(&v);
         idx.reindex();
         assert!(idx.search_scored(&v, 5).iter().all(|(_, s)| *s < 1.0 - 1e-6));
-        assert_eq!(idx.sync(&graph("x"), &mut fake).unwrap(), 0, "nothing to embed");
+        assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap(), 0, "nothing to embed");
         assert!(idx.live.iter().all(|&i| !idx.kinds[i]), "the question row is retired");
     }
 

@@ -56,6 +56,12 @@ pub struct Config {
     /// default, priced for a first build nobody has tuned yet, and the only model `bench` holds
     /// floors for; a store under any other model is measured and not graded.
     pub embed_model: String,
+    /// Files whose nodes get no vectors: they keep their nodes, their edges and their place in the
+    /// lexical index, so `impact`, `trace`, `changes` and a lexical `ask` still see them, and a
+    /// paraphrase does not. For what is read but never asked about in prose — generated code,
+    /// migrations, mocks — which `skip` would take out of the graph as well. A row such a file
+    /// already holds is dropped by the next writer, and the rows of every other file are kept.
+    pub embed_skip: Vec<String>,
     /// How much of the machine a run may take: `"low"`, `"balanced"` (the default) or `"full"`.
     /// It describes the machine rather than the corpus — the same repository wants every core on
     /// a CI box and a quiet laptop's spare ones — so the global file may set it, unlike
@@ -165,6 +171,7 @@ impl Default for Config {
             file: PROJECT_FILE,
             reranker_dir: String::new(),
             embed_model: crate::index::embed::DEFAULT_MODEL.into(),
+            embed_skip: Vec::new(),
             resources: crate::index::embed::Resources::default(),
             reader_budget: READER_BUDGET,
             mcp_reranks: MCP_RERANKS,
@@ -343,6 +350,9 @@ impl Config {
         // would join two globs into one that matches nothing and the build would say nothing.
         if let Some(g) = globs_from_env("CODE_GLOBS")? { cfg.code_globs = g; }
         if let Some(g) = globs_from_env("TEXT_GLOBS")? { cfg.text_globs = g; }
+        // Refused here rather than at the first embed: a reader catching up its rows would
+        // otherwise find out mid-answer, and every reader's answer would carry the error.
+        crate::index::dense::EmbedSkip::new(&cfg.embed_skip).with_context(|| format!("parse {}", path.display()))?;
         cfg.resources = crate::index::embed::resources_from_env(cfg.resources, crate::env("RESOURCES").as_deref(), &crate::env_name("RESOURCES"))?;
         if let Some(v) = crate::env("READER_BUDGET").filter(|v| !v.trim().is_empty()) {
             cfg.reader_budget = v.trim().parse().with_context(|| format!("{}={v:?} is not a whole number of seconds", crate::env_name("READER_BUDGET")))?;
@@ -1381,6 +1391,27 @@ mod tests {
     /// most likely to still have: the README told people to write `threads = 6` for the cores
     /// back. Refused by name rather than ignored, so nobody is left believing a count they wrote
     /// is still being read.
+    #[test]
+    fn embed_skip_is_a_projects_key_its_globs_are_checked_and_a_misspelling_is_refused() {
+        let load = |text: &str| with_machine(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("zerograph.toml"), text).unwrap();
+            Config::load(dir.path()).map_err(|e| format!("{e:#}"))
+        });
+        assert!(Config::default().embed_skip.is_empty());
+        assert_eq!(load("embed_skip = [\"**/generated/**\", \"**/*.gen.ts\"]\n").unwrap().embed_skip, ["**/generated/**", "**/*.gen.ts"]);
+        let err = load("embed_skip = [\"src/{a\"]\n").unwrap_err();
+        assert!(err.contains("embed_skip") && err.contains("zerograph.toml"), "{err}");
+        let err = load("embed_skips = []\n").unwrap_err();
+        assert!(err.contains("embed_skips"), "{err}");
+        // It says which files of this repository get vectors, so a machine file may not.
+        with_machine(Some("embed_skip = [\"**/*.sql\"]\n"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+            assert!(err.contains("config.toml") && err.contains("embed_skip"), "{err}");
+        });
+    }
+
     #[test]
     fn a_threads_key_left_in_a_file_is_refused_by_name() {
         with_machine(None, || {
