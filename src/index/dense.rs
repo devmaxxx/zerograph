@@ -45,6 +45,11 @@ pub struct DenseIndex {
     /// file they were counted in: an append may only extend a file no one else has rewritten.
     #[serde(skip)] persisted: usize,
     #[serde(skip)] stamp: Option<Stamp>,
+    /// The worktree whose store these rows were loaded from, whose siblings a sync asks first.
+    #[serde(skip)] home: Option<std::path::PathBuf>,
+    /// The width `written_by` claimed. A cold index has no width until its first chunk is
+    /// embedded, and a borrowed row has to be checked against one before that.
+    #[serde(skip)] claimed_dim: usize,
 }
 
 /// Every text embedded for a node, e5-prefixed. A file has no passage row — its head comment is
@@ -138,6 +143,11 @@ fn printable(name: &str) -> String {
         match c.is_control() { true => out.extend(c.escape_default()), false => out.push(c) }
         out
     })
+}
+
+fn drop_taken<T>(v: &mut Vec<T>, taken: &[bool]) {
+    let mut i = 0;
+    v.retain(|_| { i += 1; !taken[i - 1] });
 }
 
 fn normalise(v: &mut [f32]) {
@@ -242,9 +252,15 @@ impl DenseIndex {
             self.persisted = 0; self.dim = 0;
         }
         self.model = model.to_string();
+        self.claimed_dim = dim;
     }
 
     pub fn load(store: &Store) -> Result<DenseIndex> {
+        let home = store.dir().parent().map(|p| p.to_path_buf());
+        Ok(DenseIndex { home, ..DenseIndex::load_rows(store)? })
+    }
+
+    fn load_rows(store: &Store) -> Result<DenseIndex> {
         let Some(meta) = store.read_bytes("vectors.json")? else { return Ok(DenseIndex::default()) };
         let mut idx: DenseIndex = serde_json::from_slice(&meta).context("vectors.json")?;
         // Stamped before the read, never after: a rewrite racing this read then leaves a stamp
@@ -360,6 +376,28 @@ impl DenseIndex {
                 }
             }
         }
+        let lent = self.borrow(&todo_hashes);
+        if !lent.is_empty() {
+            // A cold index learns its width here rather than from a first chunk; a warm one already
+            // has this width, since `written_by` dropped rows of any other.
+            self.dim = self.claimed_dim;
+            let mut taken = Vec::with_capacity(todo_ids.len());
+            for (i, hash) in todo_hashes.iter().enumerate() {
+                let v = lent.get(hash.as_str());
+                if let Some(v) = v {
+                    self.ids.push(todo_ids[i].clone());
+                    self.hashes.push(hash.clone());
+                    self.kinds.push(false);
+                    self.vectors.extend_from_slice(v);
+                    alive.push(true);
+                }
+                taken.push(v.is_some());
+            }
+            drop_taken(&mut todo_ids, &taken);
+            drop_taken(&mut todo_texts, &taken);
+            drop_taken(&mut todo_hashes, &taken);
+            drop_taken(&mut todo_kinds, &taken);
+        }
         let embedded = todo_ids.len();
         let mut done = 0;
         let plan = chunk_ends(&todo_texts, budget);
@@ -393,6 +431,41 @@ impl DenseIndex {
         self.reindex();
         if self.free.len() * HOLE_SHARE > self.live.len() { self.compact(); }
         Ok(embedded)
+    }
+
+    /// Vectors for as many of the `wanted` text hashes as the sibling worktrees hold, asked in
+    /// git's order until none is missing. Only a sync that claimed a model and a width borrows,
+    /// and only from a sibling whose rows are that model's at that width: a vector is a function
+    /// of the model and the text alone, so such a row is the one this sync would embed — near-
+    /// identical rather than bit-identical, since batch padding moves the last digits.
+    fn borrow(&self, wanted: &[String]) -> std::collections::HashMap<String, Vec<f32>> {
+        let mut lent = std::collections::HashMap::new();
+        let Some(home) = self.home.as_deref().filter(|_| self.claimed_dim > 0 && !wanted.is_empty()) else { return lent };
+        let mut missing: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+        for h in wanted { *missing.entry(h.as_str()).or_default() += 1; }
+        for sibling in super::siblings::worktrees(home) {
+            let Some(rows) = super::siblings::read(&sibling, &self.model) else { continue };
+            if !rows.lends_to(&self.model, self.claimed_dim) { continue; }
+            let mut borrowed = 0;
+            for &i in &rows.live {
+                if rows.kinds[i] { continue; }
+                let Some(n) = missing.remove(rows.hashes[i].as_str()) else { continue };
+                borrowed += n;
+                lent.insert(rows.hashes[i].clone(), rows.vectors[i * rows.dim..(i + 1) * rows.dim].to_vec());
+            }
+            if borrowed > 0 { eprintln!("dense: borrowed {borrowed} rows from {}", sibling.display()); }
+            if missing.is_empty() { break; }
+        }
+        lent
+    }
+
+    /// Whether these rows can stand in for rows `model` would embed at width `dim`. A hub id names
+    /// one model in any case, as in `written_by`, and its variant is part of it. No store records
+    /// a revision: it is the pin of the binary that wrote the rows, and a sibling built by a
+    /// release with another pin for the same id is trusted exactly as `written_by` trusts its own
+    /// store across that upgrade.
+    fn lends_to(&self, model: &str, dim: usize) -> bool {
+        self.dim == dim && self.model_of_rows().is_some_and(|m| m.eq_ignore_ascii_case(model))
     }
 
     /// The live rows closed up. Every offset moves, so the next save rewrites both files whole,
@@ -923,5 +996,124 @@ mod tests {
     #[test]
     fn a_blank_text_file_has_no_row() {
         assert!(text_rows("empty.txt", "\n\n  \n").is_empty());
+    }
+
+    /// One vector for every text, which `fake` gives none of the test graphs' rows, so a row lent
+    /// by a sibling that embedded with it is told apart from one embedded here.
+    fn constant(texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        Ok(texts.iter().map(|_| vec![1.0, 2.0, 5.0]).collect())
+    }
+
+    /// The sibling's store as `update` leaves it: its rows synced under `model` with `embed`, its
+    /// pair saved and its writer lock file in place.
+    fn lender(repo: &std::path::Path, g: &Graph, model: &str, embed: fn(&[String]) -> Result<Vec<Vec<f32>>>) {
+        let store = Store::new(repo);
+        drop(store.try_lock_writer().unwrap());
+        let mut idx = DenseIndex::load(&store).unwrap();
+        idx.written_by(model, embed(&["passage: x".into()]).unwrap()[0].len());
+        idx.sync(g, &EmbedSkip::default(), &mut |t| embed(t)).unwrap();
+        idx.save(&store).unwrap();
+    }
+
+    /// A sync in `repo` claiming `model` at 3-d, with the texts it really embedded.
+    fn borrower(repo: &std::path::Path, g: &Graph, model: &str) -> (DenseIndex, usize, Vec<String>) {
+        let mut idx = DenseIndex::load(&Store::new(repo)).unwrap();
+        idx.written_by(model, 3);
+        let mut seen = Vec::new();
+        let n = idx.sync(g, &EmbedSkip::default(), &mut |t| { seen.extend_from_slice(t); fake(t) }).unwrap();
+        (idx, n, seen)
+    }
+
+    fn listing(repo: &std::path::Path) -> Vec<(String, u64, std::time::SystemTime)> {
+        let mut l: Vec<_> = std::fs::read_dir(repo.join(".zerograph")).unwrap().flatten()
+            .map(|e| { let m = e.metadata().unwrap(); (e.file_name().to_string_lossy().into_owned(), m.len(), m.modified().unwrap()) })
+            .collect();
+        l.sort();
+        l
+    }
+
+    #[test]
+    fn rows_a_sibling_worktree_holds_are_borrowed_not_embedded_and_its_store_is_left_as_it_was() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", constant);
+        let before = listing(&main);
+        let (idx, embedded, seen) = borrower(&other, &graph("отмена другая"), "m");
+        assert_eq!(embedded, 1, "only the row the sibling does not hold is embedded");
+        assert_eq!(seen.len(), 1);
+        assert!(seen[0].contains("отмена другая"));
+        let row = |id: &str| { let i = idx.ids.iter().position(|x| x == id).unwrap(); idx.vectors[i * 3..(i + 1) * 3].to_vec() };
+        let mut lent = vec![1.0, 2.0, 5.0];
+        normalise(&mut lent);
+        assert_eq!(row("FR-PAY-26"), lent, "the sibling's own vector, not a fresh embed");
+        assert_eq!(listing(&main), before, "nothing in the sibling's store is created or touched");
+    }
+
+    #[test]
+    fn a_sibling_of_another_model_or_width_lends_nothing() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "another/model", fake);
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2);
+        lender(&main, &graph("x"), "m", fake_wide);
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2, "the name matches and the width does not");
+        lender(&main, &graph("x"), "M", fake);
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 0, "a hub id names one model in any case");
+    }
+
+    #[test]
+    fn a_sibling_whose_writer_lock_is_held_or_missing_lends_nothing() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", fake);
+        let held = Store::new(&main).try_lock_writer().unwrap().unwrap();
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2, "a sibling mid-refresh is not read");
+        drop(held);
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 0, "and is, once it lets go");
+        std::fs::remove_file(main.join(".zerograph/writer.lock")).unwrap();
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2, "no lock file is created to read under");
+        assert!(!main.join(".zerograph/writer.lock").exists());
+    }
+
+    #[test]
+    fn a_sibling_with_a_torn_pair_lends_nothing_and_is_no_error() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", fake);
+        let rows = main.join(".zerograph/vectors.f32");
+        let age = |by: u64| std::fs::File::options().write(true).open(&rows).unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(by)).unwrap();
+        std::fs::File::options().write(true).open(&rows).unwrap()
+            .set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(60)).unwrap();
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2, "rows newer than their metadata are a save caught halfway");
+        age(3600);
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 0, "and the same pair in order lends");
+        std::fs::write(&rows, [0u8; 4]).unwrap();
+        age(3600);
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2, "rows shorter than their metadata are torn");
+        std::fs::write(main.join(".zerograph/vectors.json"), "{not json").unwrap();
+        assert_eq!(borrower(&other, &graph("x"), "m").1, 2);
+    }
+
+    #[test]
+    fn a_checkpoint_keeps_the_borrowed_rows_beside_the_embedded_ones() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", constant);
+        let store = Store::new(&other);
+        let mut idx = DenseIndex::load(&store).unwrap();
+        idx.written_by("m", 3);
+        let mut saves = 0;
+        let n = idx.sync_chunked(&graph("отмена другая"), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(1), &mut |idx, p| {
+            saves += 1;
+            assert_eq!((p.done, p.total), (1, 1), "progress counts the embeds alone");
+            idx.save(&store)
+        }).unwrap();
+        assert_eq!((n, saves), (1, 1));
+        let saved = DenseIndex::load(&store).unwrap();
+        assert_eq!(saved.owed(&graph("отмена другая"), &EmbedSkip::default()), 0, "the checkpoint holds both rows");
+    }
+
+    #[test]
+    fn a_sync_that_claimed_no_model_never_borrows() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), crate::index::embed::UNNAMED_MODEL, fake);
+        let mut idx = DenseIndex::load(&Store::new(&other)).unwrap();
+        assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap(), 2);
     }
 }
