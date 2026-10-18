@@ -175,16 +175,45 @@ fn implements_names_each_interface_through_its_import_without_type_arguments() {
 
 #[test]
 fn the_methods_and_function_properties_of_an_interface_are_its_members() {
-    let src = "export interface Port {\n  /** Suggests the next visit. */\n  suggest(id: string): Promise<void>;\n  maybe?(): void;\n  notify: (x: number) => void;\n  limit: number;\n  [key: string]: unknown;\n}\n";
+    let src = "export interface Port {\n  /** Suggests the next visit. */\n  suggest(id: string): Promise<void>;\n  maybe?(): void;\n  notify: (x: number) => void;\n  [key: string]: unknown;\n}\n";
     let ex = extract("a.ts", src);
     for s in ["Port.suggest", "Port.maybe", "Port.notify"] {
         let id = format!("sym:a.ts::{s}");
         assert!(ids(&ex).contains(&id.as_str()), "{s} in {:?}", ids(&ex));
         assert!(edges(&ex, EdgeKind::Declares).contains(&("sym:a.ts::Port", id.as_str(), "")), "{s} is declared by its interface");
     }
-    assert!(!ids(&ex).contains(&"sym:a.ts::Port.limit"), "a data property is not called through the interface");
     let m = node(&ex, "sym:a.ts::Port.suggest");
     assert_eq!((m.line, m.body.as_str()), (3, "Suggests the next visit.\nsuggest(id: string): Promise<void>"));
+}
+
+#[test]
+fn the_data_properties_of_an_interface_are_its_members_and_its_index_signature_is_not() {
+    let src = "export interface Range {\n  readonly from: string;\n  to?: string;\n  'quoted-key': number;\n  [key: string]: unknown;\n}\n";
+    let ex = extract("a.ts", src);
+    for (s, line) in [("Range.from", 2), ("Range.to", 3), ("Range.quoted-key", 4)] {
+        let id = format!("sym:a.ts::{s}");
+        assert!(edges(&ex, EdgeKind::Declares).contains(&("sym:a.ts::Range", id.as_str(), "")), "{s} is declared by its interface: {:?}", ids(&ex));
+        assert_eq!(node(&ex, &id).line, line, "{s}");
+    }
+    assert!(!ids(&ex).iter().any(|i| i.contains("key") && !i.contains("quoted")), "an index signature names no member: {:?}", ids(&ex));
+}
+
+#[test]
+fn a_components_props_interface_declares_each_prop() {
+    let src = "interface GridProps {\n  readonly range: Range;\n  readonly loading?: boolean;\n}\nexport function Grid({ range }: GridProps) {\n  return <div>{range.from}</div>;\n}\n";
+    let ex = extract("a.tsx", src);
+    for s in ["GridProps.range", "GridProps.loading"] {
+        let id = format!("sym:a.tsx::{s}");
+        assert!(edges(&ex, EdgeKind::Declares).contains(&("sym:a.tsx::GridProps", id.as_str(), "")), "{s} in {:?}", ids(&ex));
+    }
+}
+
+#[test]
+fn the_data_properties_of_an_ambient_interface_are_its_members() {
+    let ex = extract("sim.d.ts", "export declare interface Batch {\n  readonly ops_sent: number;\n}\ndeclare interface Local {\n  id: string;\n}\n");
+    for s in ["Batch.ops_sent", "Local.id"] {
+        assert!(ids(&ex).contains(&format!("sym:sim.d.ts::{s}").as_str()), "{s} in {:?}", ids(&ex));
+    }
 }
 
 #[test]
