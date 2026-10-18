@@ -604,6 +604,19 @@ fn wait_for_writer(store: &store::Store, who: &str) -> anyhow::Result<store::Wri
     }
 }
 
+/// A graphify `graph.json`'s edges merged into the store, under the writer lock every writer
+/// takes, and never into a store a newer release wrote.
+fn import_legacy(repo: &std::path::Path, graph_json: &std::path::Path) -> anyhow::Result<legacy::Report> {
+    let store = store::Store::new(repo);
+    let _lock = wait_for_writer(&store, "import-legacy")?;
+    if let Some(line) = store.newer_store_line() { anyhow::bail!("{line}"); }
+    let (mut graph, manifest) = store.load()?;
+    let text = std::fs::read_to_string(graph_json)?;
+    let r = legacy::import(&mut graph, &text)?;
+    store.save(&graph, &manifest)?;
+    Ok(r)
+}
+
 pub(crate) fn extractors(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<Extractors> {
     let resolver = code::imports::Resolver::new(repo, cfg)?;
     Ok(Extractors {
@@ -928,7 +941,9 @@ fn json_out(text: String, stale: &Option<refresh::Stale>) -> String {
 /// partial one. A worktree is a checkout of its own and gets its own root. Outside git, the nearest
 /// directory up that already holds a store is the one that was built; failing both, `cwd`.
 /// Answered plain: git states the top level without the verbatim prefix and `cwd` arrives with it.
+/// Asked plain too: git is never handed a `\\?\` path as its working directory.
 fn repo_root(cwd: &std::path::Path) -> PathBuf {
+    let cwd = &plain(cwd.to_path_buf());
     plain(git_toplevel(cwd)
         .or_else(|| cwd.ancestors().find(|d| [store::DIR, store::LEGACY_DIR].iter().any(|n| d.join(n).is_dir())).map(PathBuf::from))
         .unwrap_or_else(|| cwd.to_path_buf()))
@@ -946,7 +961,15 @@ pub(crate) fn git_command() -> std::process::Command {
     cmd
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Every directory `git_toplevel` ran git in, so a test can see what git was handed.
+    static GIT_CWDS: std::cell::RefCell<Vec<PathBuf>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 fn git_toplevel(cwd: &std::path::Path) -> Option<PathBuf> {
+    #[cfg(test)]
+    GIT_CWDS.with(|c| c.borrow_mut().push(cwd.to_path_buf()));
     let out = git_command().args(["rev-parse", "--show-toplevel"]).current_dir(cwd)
         .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
     if !out.status.success() { return None; }
@@ -1298,11 +1321,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Cmd::Mcp => mcp::run(&repo, cli.no_dense),
         Cmd::Dump { queries, out, depth } => dump::run(&repo, &queries, &out, depth, cli.no_dense),
         Cmd::ImportLegacy { graph_json } => {
-            let store = store::Store::new(&repo);
-            let (mut graph, manifest) = store.load()?;
-            let text = std::fs::read_to_string(&graph_json)?;
-            let r = legacy::import(&mut graph, &text)?;
-            store.save(&graph, &manifest)?;
+            let r = import_legacy(&repo, &graph_json)?;
             println!(
                 "legacy: {} edges, {} both endpoints resolved, {} one, {} concepts created, {} self-loops dropped",
                 r.edges_seen, r.resolved_both, r.resolved_one, r.concepts_created, r.self_loops
@@ -1654,6 +1673,70 @@ mod tests {
         }
     }
 
+    /// The same race, where the stamp cannot see it or the lock is not there to take: a save of the
+    /// same length inside the file system's mtime granularity, and a store whose lock cannot be
+    /// opened at all, which still writes as it always did.
+    #[test]
+    fn an_ask_rechecks_the_store_before_it_writes_whatever_the_stamp_or_the_lock_say() {
+        for (same_stamp, unlocked) in [(true, false), (false, true), (true, true)] {
+            let dir = doc_repo(ONE);
+            let (repo, cfg) = (dir.path().to_path_buf(), config::Config::default());
+            built(&repo, &cfg);
+            std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
+            let newer = repo.clone();
+            ask::BEFORE_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+                let store = store::Store::new(&newer);
+                let path = newer.join(".zerograph/manifest.json");
+                let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+                let (graph, manifest) = store.load().unwrap();
+                // One digit either way, so the length is what it was.
+                let grammar = if walk::GRAMMAR % 10 == 9 { walk::GRAMMAR + 10 } else { walk::GRAMMAR + 1 };
+                store.save(&graph, &walk::Manifest { grammar, ..manifest }).unwrap();
+                if same_stamp {
+                    std::fs::File::options().write(true).open(&path).unwrap().set_modified(before).unwrap();
+                }
+                if unlocked {
+                    let lock = newer.join(".zerograph/writer.lock");
+                    let _ = std::fs::remove_file(&lock);
+                    std::fs::create_dir(&lock).unwrap();
+                }
+            })));
+            let store = store::Store::new(&repo);
+            let read = ask::graph_for_ask(&repo, &cfg, &store, false, &ask::Timing::new(), &refresh::Budget::unlimited()).unwrap();
+            let case = format!("same_stamp={same_stamp} unlocked={unlocked}");
+            assert!(store.load_manifest().unwrap().grammar > walk::GRAMMAR, "{case}: the newer store was stamped over");
+            assert!(read.refreshed.is_none() && matches!(read.writer, ask::Writer::Barred), "{case}");
+            assert!(read.note.is_some(), "{case}: one line says why");
+        }
+    }
+
+    /// `import-legacy` writes the store like any writer: never over a newer release's, and never
+    /// while another writer holds it.
+    #[test]
+    fn import_legacy_refuses_a_newer_store_and_waits_for_the_writer_lock() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path().to_path_buf(), config::Config::default());
+        built(&repo, &cfg);
+        let legacy = repo.join("legacy.json");
+        std::fs::write(&legacy, r#"{"nodes": [], "links": []}"#).unwrap();
+        let store = store::Store::new(&repo);
+
+        let lock = store.lock_writer().unwrap();
+        let (r, l) = (repo.clone(), legacy.clone());
+        let import = std::thread::spawn(move || import_legacy(&r, &l));
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(!import.is_finished(), "it wrote while another writer held the lock");
+        drop(lock);
+        import.join().unwrap().unwrap();
+
+        let (graph, manifest) = store.load().unwrap();
+        store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, ..manifest }).unwrap();
+        let bytes = std::fs::read(repo.join(".zerograph/manifest.json")).unwrap();
+        let err = import_legacy(&repo, &legacy).unwrap_err();
+        assert!(err.to_string().contains(&format!("generation {}", walk::GRAMMAR + 1)), "{err}");
+        assert_eq!(std::fs::read(repo.join(".zerograph/manifest.json")).unwrap(), bytes, "the newer store was rewritten");
+    }
+
     /// `status` sends a reader with an unreadable manifest to `build`, so `build` must not be the
     /// command that refuses to parse it.
     #[test]
@@ -1697,6 +1780,19 @@ mod tests {
         git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
         std::fs::create_dir_all(wt.join("sub")).unwrap();
         assert_eq!(repo_root(&wt.join("sub")), wt);
+    }
+
+    /// The CLI without `--repo` hands `repo_root` the canonical cwd, which on Windows carries the
+    /// `\\?\` prefix; git must be run in the plain spelling of it.
+    #[test]
+    fn git_is_asked_about_the_plain_path_when_the_cwd_arrives_canonical() {
+        let dir = tempfile::tempdir().unwrap();
+        let canonical = dir.path().canonicalize().unwrap();
+        GIT_CWDS.with(|c| c.borrow_mut().clear());
+        repo_root(&canonical);
+        let asked = GIT_CWDS.with(|c| c.borrow().clone());
+        assert_eq!(asked, vec![plain(canonical)]);
+        assert!(asked.iter().all(|p| !p.to_string_lossy().starts_with(r"\\?\")), "{asked:?}");
     }
 
     const HOOK_ROOT: &str = "ZEROGRAPH_TEST_HOOK_ROOT";

@@ -207,11 +207,28 @@ fn socket_name(repo: &Path) -> String {
 /// directory's `zerograph-<hash>.sock` once that name would not fit in `sun_path`. A server of that
 /// release left running across the upgrade listens where no client of this one looks, and goes on
 /// polling and writing without the writer lock until its idle timeout. Windows served there too.
-fn legacy_socket_path(repo: &Path) -> PathBuf {
+///
+/// The temp directory was that server's own `$TMPDIR`, which a shell running `stop` need not
+/// share, so a deep checkout's name is looked for under `/tmp` too: the default when the variable
+/// is unset, and where most machines leave it.
+fn legacy_socket_paths(repo: &Path) -> Vec<PathBuf> {
     let in_repo = crate::store::dir_of(repo).join("serve.sock");
-    if in_repo.as_os_str().len() <= 100 { return in_repo; }
-    fallback_dir().join(format!("zerograph-{}.sock", socket_name(repo)))
+    if in_repo.as_os_str().len() <= 100 { return vec![in_repo]; }
+    let name = format!("zerograph-{}.sock", socket_name(repo));
+    let mut paths: Vec<PathBuf> = legacy_dirs().into_iter().map(|d| d.join(&name)).collect();
+    paths.dedup();
+    paths
 }
+
+#[cfg(unix)]
+fn legacy_dirs() -> Vec<PathBuf> {
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let uid = unsafe { libc::geteuid() };
+    vec![fallback_dir(), Path::new("/tmp").join(format!("zerograph-{uid}"))]
+}
+
+#[cfg(not(unix))]
+fn legacy_dirs() -> Vec<PathBuf> { vec![fallback_dir()] }
 
 /// Where a socket goes when home cannot hold one. `/tmp` is shared, and a name there that anyone
 /// can predict is a name another user can bind first and answer under, so on unix the socket sits
@@ -413,13 +430,51 @@ pub fn stop(repo: &Path) -> Result<bool> {
     Ok(current? | legacy?)
 }
 
-/// The two names coincide only when both fell back to the temp directory. That server is the one
-/// at the current name, already asked by `stop` and refused by `serve`'s own probe, and a server
-/// listening there may be this release's.
+/// The names coincide with the current one only when both fell back to the temp directory. That
+/// server is the one at the current name, already asked by `stop` and refused by `serve`'s own
+/// probe, and a server listening there may be this release's. Every name is asked before an
+/// error is raised, for the reason `stop` gives.
 fn stop_legacy(repo: &Path) -> Result<bool> {
-    let legacy = legacy_socket_path(repo);
-    if legacy == socket_path(repo) { return Ok(false); }
-    stop_at(&legacy)
+    let current = socket_path(repo);
+    let mut stopped = false;
+    let mut first_error = None;
+    for legacy in legacy_socket_paths(repo).into_iter().filter(|p| *p != current) {
+        match stop_at(&legacy) {
+            Ok(true) => { eprintln!("serve: stopped a 0.6.4 server at {}", legacy.display()); stopped = true; }
+            Ok(false) => {}
+            Err(e) => { first_error.get_or_insert(e); }
+        }
+    }
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(stopped),
+    }
+}
+
+/// A 0.6.4 server being stopped on a thread of its own. One busy with a rerank reads the stop only
+/// when the rerank is done — up to `RERANK_TIMEOUT` and `STOP_WAIT` on top — and every question
+/// asked meanwhile would wait that long behind it. Answers go on; it is the watcher's writes, which
+/// that server would race without the lock, that wait for it to be gone.
+struct Legacy(Option<std::thread::JoinHandle<Result<bool>>>);
+
+impl Legacy {
+    fn spawn(stop: impl FnOnce() -> Result<bool> + Send + 'static) -> Legacy {
+        Legacy(Some(std::thread::spawn(stop)))
+    }
+
+    /// Whether the old server is gone, never waiting to find out. A stop that failed is reported
+    /// once and counts as gone: refusing to write would leave the checkout to that server alone.
+    fn gone(&mut self) -> bool {
+        if self.0.as_ref().is_some_and(|h| !h.is_finished()) { return false; }
+        if let Some(h) = self.0.take() {
+            match h.join() {
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => eprintln!("serve: {e:#}"),
+                Err(_) => eprintln!("serve: stopping the 0.6.4 server panicked"),
+            }
+        }
+        true
+    }
 }
 
 fn stop_at(path: &Path) -> Result<bool> {
@@ -506,14 +561,9 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     catch_termination();
     // The old server takes no writer lock, so it has to be gone before the watcher below writes.
     // After the bind, because a busy one reads the stop line only once its rerank is done, and
-    // `--detach` gives up on a socket that has not answered within `DETACH_WAIT`. One that will
-    // not leave is reported rather than fatal: refusing to start would leave the checkout with
-    // only that server.
-    match stop_legacy(repo) {
-        Ok(true) => eprintln!("serve: stopped a 0.6.4 server at {}", legacy_socket_path(repo).display()),
-        Ok(false) => {}
-        Err(e) => eprintln!("serve: {e:#}"),
-    }
+    // `--detach` gives up on a socket that has not answered within `DETACH_WAIT`.
+    let owned = repo.to_path_buf();
+    let mut legacy = Legacy::spawn(move || stop_legacy(&owned));
     // The accept blocks on a thread of its own and hands each connection over, one at a time —
     // the answer still happens here, on the one thread that holds the context. A rendezvous
     // channel is what keeps it to one: the next connection is accepted but not delivered until
@@ -548,7 +598,7 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     // within seconds: waiting `--every` for the first poll handed that question everything a pull
     // changed — 1469 vectors, 17 s on beauty-crm. Catching up now spends the same time before
     // anyone has asked.
-    adopt_if_moved(&mut watcher, &mut ctx, batch)?;
+    if legacy.gone() { adopt_if_moved(&mut watcher, &mut ctx, batch)?; }
     log(&mut ctx);
     eprintln!("serve: {} every {every}s, batch {batch}, idle {idle}s, model idle {idle_model}s; Ctrl-C stops", path.display());
     let (mut last_poll, mut last_request) = (Instant::now(), Instant::now());
@@ -558,7 +608,7 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
             // a liveness probe — another `serve` deciding whether to bind, a client that gave
             // up — and treating one as a request keeps this process resident, holding 1.3 GB,
             // for as long as anything at all polls the socket.
-            Ok(stream) => match answer(stream, &mut watcher, &mut ctx, build) {
+            Ok(stream) => match answer(stream, &mut watcher, &mut ctx, build, &mut legacy) {
                 Ok(asked) => if asked { last_request = Instant::now(); },
                 Err(e) => { last_request = Instant::now(); eprintln!("serve: {e:#}"); }
             },
@@ -578,7 +628,7 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
                 eprintln!("serve: {} changed, exiting — start serve again to answer under it", config::project_file_name(repo));
                 return Ok(());
             }
-            adopt_if_moved(&mut watcher, &mut ctx, batch)?;
+            if legacy.gone() { adopt_if_moved(&mut watcher, &mut ctx, batch)?; }
             // A poll between requests answers nobody: its notices are the server's own.
             log(&mut ctx);
         }
@@ -700,7 +750,7 @@ fn hello_line_within(stream: &sys::Stream, total: Duration) -> Option<String> {
 
 /// Whether a question was asked, which is what `--idle` counts — a peer that vanished before
 /// its hello asked nothing.
-fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::Context, build: Option<crate::walk::Stamp>) -> Result<bool> {
+fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::Context, build: Option<crate::walk::Stamp>, legacy: &mut Legacy) -> Result<bool> {
     let Some(line) = hello_line(&stream) else { return Ok(false) };
     // Through the same flag a SIGTERM sets, so the exit is the one every other path takes.
     if serde_json::from_str::<Stop>(&line).is_ok_and(|s| s.stop) {
@@ -721,7 +771,8 @@ fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::
     // an error. A client is told what its own answer did and nothing else.
     log(ctx);
     ctx.begin();
-    if hello.req.stale {
+    // Until a 0.6.4 server is gone this one writes nothing, and answers as `--stale` does.
+    if hello.req.stale || !legacy.gone() {
         // `--stale` skips the walk, not the store. A one-shot answers from whatever is on disk
         // at this instant, so a resident one reads the store back when another process has
         // written it — the stat and a load, and none of the walk that was asked to be skipped.
@@ -847,11 +898,43 @@ mod tests {
     #[test]
     fn the_socket_a_0_6_4_server_bound_is_where_that_release_put_it() {
         let shallow = std::path::Path::new("/tmp/r");
-        assert_eq!(super::legacy_socket_path(shallow), std::path::Path::new("/tmp/r/.zerograph/serve.sock"));
+        assert_eq!(super::legacy_socket_paths(shallow), [std::path::Path::new("/tmp/r/.zerograph/serve.sock")]);
         let deep = std::path::Path::new("/tmp").join("a".repeat(120));
-        let p = super::legacy_socket_path(&deep);
+        let p = super::legacy_socket_paths(&deep)[0].clone();
         assert_eq!(p.parent().unwrap(), super::fallback_dir(), "{}", p.display());
         assert_eq!(p.file_name().unwrap().to_string_lossy(), format!("zerograph-{}.sock", super::socket_name(&deep)));
+    }
+
+    /// A deep checkout's 0.6.4 socket sat in whichever temp directory that server's `$TMPDIR`
+    /// named, so a `stop` run from a shell with another one still has to find it.
+    #[cfg(unix)]
+    #[test]
+    fn a_deep_0_6_4_socket_is_looked_for_under_tmp_as_well_as_this_process_tmpdir() {
+        let deep = std::path::Path::new("/tmp").join("a".repeat(120));
+        let paths = super::legacy_socket_paths(&deep);
+        let name = format!("zerograph-{}.sock", super::socket_name(&deep));
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let uid = unsafe { libc::geteuid() };
+        assert!(paths.contains(&super::fallback_dir().join(&name)), "{paths:?}");
+        assert!(paths.contains(&std::path::Path::new("/tmp").join(format!("zerograph-{uid}")).join(&name)), "{paths:?}");
+        let mut unique = paths.clone();
+        unique.dedup();
+        assert_eq!(unique, paths, "one directory is asked once");
+    }
+
+    /// The old server is stopped on a thread of its own, and nothing waits for it: a busy one
+    /// reads the stop only after its rerank. The watcher writes once it is gone.
+    #[test]
+    fn the_watcher_writes_only_once_the_0_6_4_server_is_gone() {
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let mut legacy = super::Legacy::spawn(move || { let _ = rx.recv(); Ok(true) });
+        let started = std::time::Instant::now();
+        assert!(!legacy.gone(), "a server still stopping was taken for gone");
+        assert!(started.elapsed() < std::time::Duration::from_secs(1), "the check waited for the stop");
+        tx.send(()).unwrap();
+        let until = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !legacy.gone() { assert!(std::time::Instant::now() < until, "never gone"); std::thread::sleep(std::time::Duration::from_millis(10)); }
+        assert!(legacy.gone(), "and gone stays gone");
     }
 
     /// Through the platform's idea of home, as the model cache is: a Windows console sets no `$HOME`.
