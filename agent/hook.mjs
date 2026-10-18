@@ -17,7 +17,7 @@
  * ZEROGRAPH_HOOK_DEBUG. Every call it waits on is --no-dense, and every one but `changes` is --stale;
  * what it starts and leaves running — a `serve`, an `update --detach` — is neither.
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
 import { join, dirname, relative, delimiter, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -88,23 +88,44 @@ function debug(...args) {
 }
 
 /**
- * Whether a `zerograph` the machine's own PATH resolves exists. A relative entry (`.`,
- * `node_modules/.bin`) resolves against the repository the hook runs in, so it is the repository's
- * file and not the machine's.
+ * The `zerograph` the machine's own PATH resolves, as an absolute path, or null. A relative entry
+ * (`.`, `node_modules/.bin`) resolves against the repository the hook runs in, so it is the
+ * repository's file and not the machine's. Resolved here rather than by the spawn: `execvp` walks
+ * those relative entries too, and Windows looks in the working directory before PATH at all. An
+ * absolute entry inside the checkout, the kind an `.envrc` adds, is the checkout's file as well.
  */
-function onPath() {
+function onPath(root) {
   const names = process.platform === 'win32' ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph'];
-  return (process.env.PATH || '').split(delimiter).some((d) => d && isAbsolute(d) && names.some((n) => existsSync(join(d, n))));
+  for (const d of (process.env.PATH || '').split(delimiter)) {
+    if (!d || !isAbsolute(d) || inside(root, d)) continue;
+    for (const n of names) {
+      const p = join(d, n);
+      try { const s = statSync(p); if (s.isFile() && (process.platform === 'win32' || (s.mode & 0o111))) return p; } catch {}
+    }
+  }
+  return null;
 }
 
 /**
- * `ZEROGRAPH_BIN`, then PATH, and nothing else. The checkout is never asked: the hook runs
- * machine-wide in every repository a session opens, and one that commits a `zerograph.toml` and an
- * executable `node_modules/.bin/zerograph` would have that file started the moment a session began.
- * A project-local install names its binary through `ZEROGRAPH_BIN`.
+ * `ZEROGRAPH_BIN`, then PATH, and nothing else; null when neither names one, and then nothing is
+ * spawned. The checkout is never asked: the hook runs machine-wide in every repository a session
+ * opens, and one that commits a `zerograph.toml` and an executable `node_modules/.bin/zerograph`
+ * would have that file started the moment a session began. A project-local install names its
+ * binary through `ZEROGRAPH_BIN`, by an absolute path.
  */
-function binary() {
-  return env('BIN') || 'zerograph';
+function binary(root) {
+  const named = env('BIN');
+  // A relative name resolves against whatever checkout the session opened, which makes it that
+  // checkout's file.
+  if (named && !isAbsolute(named)) { debug('ZEROGRAPH_BIN is not an absolute path; ignored'); return null; }
+  return named || onPath(root);
+}
+
+/** Whether `dir` is `root` or below it. */
+function inside(root, dir) {
+  if (!root) return false;
+  const rel = relative(root, dir);
+  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
 }
 
 /**
@@ -144,8 +165,13 @@ function readerBudget(root) {
 }
 
 function run(root, args) {
-  const { file, args: argv, opts } = spawnable(binary(), ['--repo', root, '--no-dense', ...args]);
+  const bin = binary(root);
+  if (!bin) return '';
+  const { file, args: argv, opts } = spawnable(bin, ['--repo', root, '--no-dense', ...args]);
   const r = spawnSync(file, argv, {
+    // Never the checkout: npm's Windows `.cmd` shim runs a bare `node` through `cmd`, which looks
+    // in the working directory first. The binary is told its repository by `--repo`.
+    cwd: dirname(bin),
     encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
     env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget(root) }, ...opts,
   });
@@ -212,8 +238,8 @@ function mainCheckout(checkout) {
 }
 
 /** Whether `binary` names something that will start: an explicit one, or PATH's. */
-function binaryFound() {
-  return binary() !== 'zerograph' || onPath();
+function binaryFound(checkout) {
+  return binary(checkout) !== null;
 }
 
 /**
@@ -453,9 +479,11 @@ function autostartServe(root) {
  * is not whether the binary was found: that failure arrives later, as an event.
  */
 function detached(root, args) {
+  const bin = binary(root);
+  if (!bin) return false;
   try {
-    const { file, args: argv, opts } = spawnable(binary(), args);
-    const child = spawn(file, argv, { detached: true, stdio: 'ignore', windowsHide: true, ...opts });
+    const { file, args: argv, opts } = spawnable(bin, args);
+    const child = spawn(file, argv, { cwd: dirname(bin), detached: true, stdio: 'ignore', windowsHide: true, ...opts });
     // A spawn that fails reports it as an event, not as a throw, and an unheard `error` event ends
     // this process — which would turn "no binary on PATH" into a hook that dies on stderr at every
     // session start. The listener is what keeps the contract: exit 0, and say nothing.
@@ -482,7 +510,7 @@ function bootstrap(cwd) {
   const checkout = cwd && checkoutRoot(cwd);
   // A spawn reports a missing binary only later, as an event, so the notice would claim a build
   // that never started.
-  if (!checkout || !optedIn(checkout) || !binaryFound()) return null;
+  if (!checkout || !optedIn(checkout) || !binaryFound(checkout)) return null;
   return startUpdate(checkout) ? BUILDING_NOTICE : null;
 }
 
@@ -504,7 +532,7 @@ const handlers = {
       if (!isWatchedCall(p.tool_name, p.tool_input) || !once(key, 'build', 'once')) return null;
       // SessionStart already started the build there; a `build` on top of it would embed twice.
       const checkout = p.cwd && checkoutRoot(p.cwd);
-      return checkout && optedIn(checkout) && binaryFound() ? BUILDING_NOTICE : BUILD_NOTICE;
+      return checkout && optedIn(checkout) && binaryFound(checkout) ? BUILDING_NOTICE : BUILD_NOTICE;
     }
     return intercept(p, root, key) ?? reminder(p, key);
   },

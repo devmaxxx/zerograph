@@ -113,8 +113,10 @@ The hook runs the binary `ZEROGRAPH_BIN` names, else the `zerograph` on `PATH`, 
 inside the checkout: a cloned repository that commits a `zerograph.toml` and an executable
 `node_modules/.bin/zerograph` would otherwise have that file started as soon as a session opened
 in it. A project-local install (`pnpm add -D zerograph`) puts no `zerograph` on `PATH`, so set
-`ZEROGRAPH_BIN` to its absolute path in the environment the agent starts from, or install
-globally; without either the hook stays silent.
+`ZEROGRAPH_BIN` to its absolute path, written out, in the environment the agent starts from, or
+install globally; without either the hook stays silent. A relative `ZEROGRAPH_BIN`, and a `PATH`
+entry that is relative or lies inside the checkout, are skipped, since each names the checkout's
+own file. The binary is started from its own directory, never the checkout's.
 
 The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
 smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached

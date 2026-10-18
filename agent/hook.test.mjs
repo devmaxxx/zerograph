@@ -3,7 +3,7 @@
 // Run: `node --test agent/hook.test.mjs`, on every platform the hook is installed on.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, symlinkSync, statSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, symlinkSync, statSync, realpathSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -30,15 +30,18 @@ function world({ store = true, answer = '', status = 0 } = {}) {
     mkdirSync(join(root, '.zerograph'), { recursive: true });
     writeFileSync(join(root, '.zerograph', 'manifest.json'), '{}');
   }
-  const bin = join(root, 'bin');
+  // Outside the root: a binary inside the checkout is one the hook refuses to run.
+  const bin = mkdtempSync(join(tmpdir(), 'zerograph-hook-bin-'));
   mkdirSync(bin, { recursive: true });
   const argvLog = join(root, 'argv.txt');
   const budgetLog = join(root, 'budget.txt');
+  const cwdLog = join(root, 'cwd.txt');
   const fake = join(bin, 'fake.mjs');
   writeFileSync(fake, [
     "import { appendFileSync, writeSync } from 'node:fs';",
     `appendFileSync(${JSON.stringify(argvLog)}, process.argv.slice(2).join(' ') + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(budgetLog)}, process.argv[2] + ' ' + (process.env.ZEROGRAPH_READER_BUDGET ?? '-') + '\\n', 'utf8');`,
+    `appendFileSync(${JSON.stringify(cwdLog)}, process.cwd() + '\\n', 'utf8');`,
     `writeSync(1, ${JSON.stringify(answer + '\n')});`,
     `process.exit(${status});`,
   ].join('\n'), 'utf8');
@@ -50,7 +53,7 @@ function world({ store = true, answer = '', status = 0 } = {}) {
     ? `@echo off\r\n"${process.execPath}" "${fake}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`);
   if (!WIN) chmodSync(launcher, 0o755);
-  return { root, bin, launcher, argvLog, budgetLog };
+  return { root, bin, launcher, argvLog, budgetLog, cwdLog };
 }
 
 function fire(w, payload, env = {}, hook = HOOK) {
@@ -232,10 +235,26 @@ test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH
   const path = process.env.PATH;
   delete process.env.ZEROGRAPH_BIN;
   delete process.env.REPOGRAPH_BIN;
-  // A relative entry resolves against the checkout, so it is the checkout's file too.
-  process.env.PATH = ['node_modules/.bin', '.', join(w.root, 'empty-path')].join(delimiter);
+  for (const dir of shipped) for (const name of ['zerograph']) chmodSync(join(w.root, ...dir, name), 0o755);
+  const machine = mkdtempSync(join(tmpdir(), 'zerograph-machine-bin-'));
+  mkdirSync(machine, { recursive: true });
+  const installed = join(machine, WIN ? 'zerograph.exe' : 'zerograph');
+  writeFileSync(installed, '');
+  chmodSync(installed, 0o755);
+  // A relative entry resolves against the checkout, so it is the checkout's file too, however
+  // early PATH names it; and a bare name handed to the spawn would let it, and on Windows the
+  // working directory, win.
+  const relative = ['node_modules/.bin', '.', join('target', 'release')];
+  process.env.PATH = [...relative, join(w.root, 'empty-path')].join(delimiter);
   try {
-    assert.equal(binary(w.root), 'zerograph', 'the bare name, which PATH alone resolves');
+    assert.equal(binary(w.root), null, 'nothing on PATH but the checkout\'s own: nothing to run');
+    process.env.PATH = [...relative, machine].join(delimiter);
+    assert.equal(binary(w.root), installed, 'the machine\'s binary, by its absolute path');
+    process.env.PATH = [join(w.root, 'node_modules', '.bin'), machine].join(delimiter);
+    assert.equal(binary(w.root), installed, 'an absolute entry inside the checkout, as an .envrc adds, is the checkout\'s too');
+    process.env.ZEROGRAPH_BIN = join('node_modules', '.bin', 'zerograph');
+    assert.equal(binary(w.root), null, 'a relative ZEROGRAPH_BIN names the checkout\'s file, so it names nothing');
+    delete process.env.ZEROGRAPH_BIN;
     process.env.REPOGRAPH_BIN = '/opt/repograph';
     assert.equal(binary(w.root), '/opt/repograph', 'a profile written before the rename still names the binary');
     process.env.ZEROGRAPH_BIN = '/opt/zerograph';
@@ -245,6 +264,16 @@ test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH
     if (old === undefined) delete process.env.REPOGRAPH_BIN; else process.env.REPOGRAPH_BIN = old;
     process.env.PATH = path;
   }
+});
+
+test('the binary is started outside the checkout, so nothing a shim looks up resolves to the repository\'s files', async () => {
+  const w = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } });
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup' });
+  await waitFor(w, / serve /);
+  const cwds = readFileSync(w.cwdLog, 'utf8').trim().split('\n');
+  assert.ok(cwds.length >= 2, cwds.join(' | '));
+  assert.ok(cwds.every((d) => realpathSync(d) === realpathSync(w.bin)), cwds.join(' | '));
 });
 
 test('a cloned repository that ships an executable node_modules/.bin/zerograph never gets it started', { skip: WIN }, async () => {
