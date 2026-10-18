@@ -119,6 +119,7 @@ thread_local! {
 /// extractors are built only when there is something to re-read. A refresh over budget is left
 /// to a detached `update`, and the stored graph answers.
 pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::Store, stale: bool, timing: &Timing, budget: &refresh::Budget) -> anyhow::Result<Read> {
+    let graph_seen = store.stamp("graph.json");
     let (mut graph, mut manifest, mut source) = store.load_traced()?;
     timing.stage("graph loaded");
     // Before the lock: taking it writes into the store, and this build may write nothing into a
@@ -145,12 +146,14 @@ pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::St
     // build's grammar would be stamped over that store by the refresh or the stamps below. The
     // manifest is read again rather than its stamp compared: a save of the same length inside the
     // file system's mtime granularity leaves the stamp as it was. An unlocked writer writes too.
+    // The graph's stamp is checked as well: `import-legacy` saves a new graph under the manifest
+    // it loaded, and a refresh from the graph in hand would save over its edges.
     if matches!(writer, Writer::Held(_) | Writer::Unlocked) {
         let fresh = store.load_manifest()?;
         if fresh.newer_grammar() {
             return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::Barred, note: Some(fresh.newer_store_line()) });
         }
-        if fresh != manifest {
+        if fresh != manifest || store.stamp("graph.json") != graph_seen {
             (graph, manifest, source) = store.load_traced()?;
             if manifest.newer_grammar() {
                 return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::Barred, note: Some(manifest.newer_store_line()) });

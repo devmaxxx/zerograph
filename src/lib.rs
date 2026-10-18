@@ -1710,6 +1710,26 @@ mod tests {
         }
     }
 
+    /// `import-legacy` saves a new graph beside the manifest it loaded, so the manifest alone does
+    /// not say the store moved; an `ask` that loaded before it must not save over its edges.
+    #[test]
+    fn an_ask_keeps_a_graph_saved_between_its_load_and_its_lock_under_an_unchanged_manifest() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path().to_path_buf(), config::Config::default());
+        built(&repo, &cfg);
+        std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
+        let legacy = repo.join("legacy.json");
+        std::fs::write(&legacy, r#"{"nodes": [{"id": "x1", "label": "totally unrelated one", "source_file": "z1.md"},
+            {"id": "x2", "label": "totally unrelated two", "source_file": "z2.md"}],
+            "links": [{"source": "x1", "target": "x2", "relation": "cites"}]}"#).unwrap();
+        let (r, l) = (repo.clone(), legacy.clone());
+        ask::BEFORE_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(move || { import_legacy(&r, &l).unwrap(); })));
+        let store = store::Store::new(&repo);
+        let read = ask::graph_for_ask(&repo, &cfg, &store, false, &ask::Timing::new(), &refresh::Budget::unlimited()).unwrap();
+        assert!(read.refreshed.is_some(), "the edit was refreshed");
+        assert!(store.load().unwrap().0.nodes.contains_key("legacy:x1"), "the imported edges were saved over");
+    }
+
     /// `import-legacy` writes the store like any writer: never over a newer release's, and never
     /// while another writer holds it.
     #[test]

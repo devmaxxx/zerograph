@@ -36,12 +36,14 @@ function world({ store = true, answer = '', status = 0 } = {}) {
   const argvLog = join(root, 'argv.txt');
   const budgetLog = join(root, 'budget.txt');
   const cwdLog = join(root, 'cwd.txt');
+  const pathLog = join(root, 'path.txt');
   const fake = join(bin, 'fake.mjs');
   writeFileSync(fake, [
     "import { appendFileSync, writeSync } from 'node:fs';",
     `appendFileSync(${JSON.stringify(argvLog)}, process.argv.slice(2).join(' ') + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(budgetLog)}, process.argv[2] + ' ' + (process.env.ZEROGRAPH_READER_BUDGET ?? '-') + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(cwdLog)}, process.cwd() + '\\n', 'utf8');`,
+    `appendFileSync(${JSON.stringify(pathLog)}, (process.env.PATH ?? '') + '\\n', 'utf8');`,
     `writeSync(1, ${JSON.stringify(answer + '\n')});`,
     `process.exit(${status});`,
   ].join('\n'), 'utf8');
@@ -53,7 +55,7 @@ function world({ store = true, answer = '', status = 0 } = {}) {
     ? `@echo off\r\n"${process.execPath}" "${fake}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`);
   if (!WIN) chmodSync(launcher, 0o755);
-  return { root, bin, launcher, argvLog, budgetLog, cwdLog };
+  return { root, bin, launcher, argvLog, budgetLog, cwdLog, pathLog };
 }
 
 function fire(w, payload, env = {}, hook = HOOK) {
@@ -389,6 +391,20 @@ test('a PATH entry anywhere in the checkout is refused, even from a package with
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
+});
+
+test('the binary inherits no PATH entry inside the checkout, so the `node` an npm launcher asks for is never the checkout\'s', async () => {
+  const w = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  mkdirSync(join(w.root, '.git'));
+  const planted = join(w.root, 'bin');
+  const env = { PATH: [w.bin, planted, dirname(process.execPath)].join(delimiter), ZEROGRAPH_HOOK_SERVE: '0' };
+  fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } }, env);
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env);
+  await waitFor(w, / update /);
+  const paths = readFileSync(w.pathLog, 'utf8').trim().split('\n');
+  assert.ok(paths.length >= 2, paths.join(' | '));
+  assert.ok(paths.every((p) => !p.split(delimiter).includes(planted)), paths.join(' | '));
+  assert.ok(paths.every((p) => p.split(delimiter).includes(w.bin)), 'the machine\'s entries stay');
 });
 
 test('on Windows a zerograph.exe anywhere on PATH wins over an earlier npm .cmd shim', () => {

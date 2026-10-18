@@ -43,11 +43,10 @@ async function checkoutOf($: Api, root: string): Promise<string> {
 // moment a session opened in it. A relative path would let a relative PATH entry, or Windows'
 // search of the working directory first, pick that file; so would an absolute entry inside the
 // checkout. A bare name is what 0.6.4 took for a PATH lookup, so it still means one.
-async function binaryOf($: Api, configured: string, root: string): Promise<string | undefined> {
+async function binaryOf($: Api, configured: string, root: string, checkout: string): Promise<string | undefined> {
   if (configured && /[\\/]/.test(configured)) return isAbsolute(configured) ? configured : undefined
   const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
   const win = path.includes(';') || /^[A-Za-z]:/.test(root)
-  const checkout = await checkoutOf($, root)
   const dirs = path.split(win ? ';' : ':').filter(dir => dir && isAbsolute(dir) && !inside(checkout, dir, win))
   // Every `.exe` before any `.cmd`: npm's global shim is a `.cmd`, which only `cmd` can start, and
   // `cmd` expands `%NAME%` in what it runs and outlives nothing it is killed for.
@@ -74,11 +73,14 @@ async function launch($: Api, bin: string): Promise<string[]> {
 // `undefined` when no zerograph is found, it has no `status`, or it failed.
 async function runStatus($: Api, configured: string, json: boolean): Promise<string | undefined> {
   const root = await $.session.root()
-  const bin = await binaryOf($, configured, root)
+  const checkout = await checkoutOf($, root)
+  const bin = await binaryOf($, configured, root, checkout)
   if (!bin) return undefined
-  const argv = [...(await launch($, bin)), 'status', ...(json ? ['--json'] : [])]
-  // `status` finds its store from the working directory; the binary was resolved without it.
-  const ran = await $.process.run(argv, { cwd: root, timeoutMs: 20_000 }).catch(() => undefined)
+  const argv = [...(await launch($, bin)), '--repo', checkout, 'status', ...(json ? ['--json'] : [])]
+  // Never from the checkout: npm's `.cmd` shim starts a bare `node`, and `cmd` looks for that in
+  // the working directory before PATH. The binary is told its repository by `--repo`.
+  const home = bin.replace(/[\\/][^\\/]*$/, '') || '/'
+  const ran = await $.process.run(argv, { cwd: home, timeoutMs: 20_000 }).catch(() => undefined)
   return ran?.exitCode === 0 && ran.stdout.trim() ? ran.stdout : undefined
 }
 

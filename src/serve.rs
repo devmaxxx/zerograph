@@ -758,7 +758,7 @@ fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::
         writeln!(stream, "{}", serde_json::to_string(&Stopped { stopped: VERSION.into() })?)?;
         return Ok(true);
     }
-    let hello: Hello = serde_json::from_str(&line).context("hello")?;
+    let mut hello: Hello = serde_json::from_str(&line).context("hello")?;
     // The refusals, all three under one reply: the build and the arm on it name which of them
     // sent the question back, and the version on it matches no client, present or past, so none
     // can take a refusal for an answer. Answering first and refusing after would spend a fused
@@ -771,8 +771,10 @@ fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::
     // an error. A client is told what its own answer did and nothing else.
     log(ctx);
     ctx.begin();
-    // Until a 0.6.4 server is gone this one writes nothing, and answers as `--stale` does.
-    if hello.req.stale || !legacy.gone() {
+    // Until a 0.6.4 server is gone this one writes nothing: the answer is a `--stale` one, which
+    // skips the dense sync and the detached refresh it may start, as well as the walk.
+    if !legacy.gone() { hello.req.stale = true; }
+    if hello.req.stale {
         // `--stale` skips the walk, not the store. A one-shot answers from whatever is on disk
         // at this instant, so a resident one reads the store back when another process has
         // written it — the stat and a load, and none of the walk that was asked to be skipped.

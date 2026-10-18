@@ -61,7 +61,7 @@ test('a bare configured name is a PATH lookup, as it was before absolute paths w
 
 // A Windows machine: `files` are the paths that exist, matched as Windows matches them. The engine
 // under test resolves a drive path against this machine's working directory, so a match is a suffix.
-function windows(on: On, root: string, path: string, files: string[], checkout = root): string[][] {
+function windows(on: On, root: string, path: string, files: string[], checkout = root, cwds: (string | undefined)[] = []): string[][] {
   const ran: string[][] = []
   const at = (path: string, file: string) => path.toLowerCase().endsWith(file.toLowerCase())
   on('session.root', async () => ({ value: root }))
@@ -73,10 +73,21 @@ function windows(on: On, root: string, path: string, files: string[], checkout =
   })
   on('process.run', async ($, e) => {
     ran.push([...e.argv])
+    cwds.push(e.init?.cwd)
     return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false } }
   })
   return ran
 }
+
+test('on Windows the shim runs from its own directory, so the bare `node` it starts is never the checkout\'s', async ($, on) => {
+  const cwds: (string | undefined)[] = []
+  const npm = 'C:\\Users\\Max\\AppData\\Roaming\\npm'
+  const ran = windows(on, 'C:\\work\\cloned\\packages\\x', npm, [`${npm}\\zerograph.cmd`], 'C:\\work\\cloned', cwds)
+  await $.command.run({ command: 'zerograph', args: '' })
+  expect(ran.length).toBeGreaterThan(0)
+  expect(cwds.filter(cwd => cwd !== npm)).toEqual([])
+  expect(ran.filter(argv => argv.slice(5, 8).join('|') !== '--repo|C:\\work\\cloned|status')).toEqual([])
+})
 
 test('on Windows a zerograph.exe anywhere on PATH is asked before an npm .cmd shim', async ($, on) => {
   const ran = windows(on, 'C:\\work\\cloned', 'C:\\npm;C:\\cargo\\bin', ['C:\\npm\\zerograph.cmd', 'C:\\cargo\\bin\\zerograph.exe'])

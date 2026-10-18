@@ -100,8 +100,7 @@ function debug(...args) {
  */
 function onPath(root, platform = process.platform) {
   const win = platform === 'win32';
-  const checkout = root && (checkoutRoot(root) ?? root);
-  const dirs = (process.env.PATH || '').split(delimiter).filter((d) => d && isAbsolute(d) && !inside(checkout, d));
+  const dirs = machineDirs(root);
   for (const n of win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph']) {
     for (const d of dirs) {
       const p = join(d, n);
@@ -109,6 +108,22 @@ function onPath(root, platform = process.platform) {
     }
   }
   return null;
+}
+
+/** PATH's absolute entries outside the checkout `root` is in: the machine's, not the repository's. */
+function machineDirs(root) {
+  const checkout = root && (checkoutRoot(root) ?? root);
+  return (process.env.PATH || '').split(delimiter).filter((d) => d && isAbsolute(d) && !inside(checkout, d));
+}
+
+/**
+ * The environment the binary starts in, with PATH cut to the machine's entries. npm's launcher
+ * finds `node` through PATH — `#!/usr/bin/env node`, or the `.cmd` shim's bare `node` — so an
+ * entry an `.envrc` put inside the checkout would start the checkout's `node` one step on.
+ */
+function childEnv(root, extra = {}) {
+  const key = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
+  return { ...process.env, [key]: machineDirs(root).join(delimiter), ...extra };
 }
 
 /**
@@ -203,7 +218,7 @@ function run(root, args) {
     // in the working directory first. The binary is told its repository by `--repo`.
     cwd: dirname(bin),
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
-    env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget(root) },
+    env: childEnv(root, { ZEROGRAPH_READER_BUDGET: readerBudget(root) }),
   };
   const r = opts.shell ? bounded(file, argv, options, treeKill()) : spawnSync(file, argv, { ...options, timeout: TIMEOUT_MS });
   if (r.status !== 0) debug('exit', r.status, args.join(' '), (r.stderr || '').slice(0, 200));
@@ -518,7 +533,7 @@ function detached(root, args) {
   if (!bin) return false;
   try {
     const { file, args: argv, opts } = spawnable(bin, args);
-    const child = spawn(file, argv, { cwd: dirname(bin), detached: true, stdio: 'ignore', windowsHide: true, ...opts });
+    const child = spawn(file, argv, { cwd: dirname(bin), detached: true, stdio: 'ignore', windowsHide: true, env: childEnv(root), ...opts });
     // A spawn that fails reports it as an event, not as a throw, and an unheard `error` event ends
     // this process — which would turn "no binary on PATH" into a hook that dies on stderr at every
     // session start. The listener is what keeps the contract: exit 0, and say nothing.
