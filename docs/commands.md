@@ -50,6 +50,13 @@ zerograph status --follow                   # print the refresh line as it moves
 zerograph status --json                     # the same facts as one object, each state tagged by `state`
 ```
 
+The machine's vector cache, which every checkout reads before it embeds, reports and trims itself:
+
+```bash
+zerograph cache status                      # where it is, its cap, rows and bytes per model
+zerograph cache prune                       # trim to 80% of vector_cache_max, least recently used first; empty it when the cap is 0
+```
+
 Under the refresh line come the lines the current run wrote besides its progress meters — its result
 and any warning on the way — and under the serve line the last lines of `.zerograph/serve.log` since
 that server started. `status` reads the store and its logs and writes nothing.

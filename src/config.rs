@@ -82,6 +82,45 @@ pub struct Config {
     /// order. The agent, not the reader, decides each call, and every one spends tokens; `0` turns
     /// rerank over MCP off. Read from the machine file only: the tokens are the reader's.
     pub mcp_reranks: u32,
+    /// Bytes the machine's vector cache may hold before the least recently used rows are pruned:
+    /// a whole number of bytes, or a string such as `"4G"` or `"512M"`. `0` turns the cache off.
+    /// Read from the machine file only: the cache is every checkout's, and a cloned repository
+    /// must not be able to empty it or grow it past what the reader chose.
+    #[serde(deserialize_with = "byte_size")]
+    pub vector_cache_max: u64,
+}
+
+/// A size as a whole number of bytes or a string of digits with a binary unit — `K`, `M`, `G` or
+/// `T`, with or without a trailing `B` or `iB`.
+pub(crate) fn parse_size(text: &str) -> Result<u64> {
+    let t = text.trim();
+    let digits = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (n, unit) = t.split_at(digits);
+    let n: u64 = n.parse().with_context(|| format!("{text:?} is not a size"))?;
+    let shift = match unit.trim().to_ascii_uppercase().trim_end_matches("IB").trim_end_matches('B') {
+        "" => 0,
+        "K" => 10,
+        "M" => 20,
+        "G" => 30,
+        "T" => 40,
+        _ => anyhow::bail!("{text:?} is not a size: the units are K, M, G and T"),
+    };
+    n.checked_mul(1 << shift).with_context(|| format!("{text:?} is too large"))
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum Size { Bytes(u64), Text(String) }
+
+fn byte_size<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<u64, D::Error> {
+    match Size::deserialize(d)? {
+        Size::Bytes(n) => Ok(n),
+        Size::Text(t) => parse_size(&t).map_err(|e| serde::de::Error::custom(format!("{e:#}"))),
+    }
+}
+
+fn opt_byte_size<'de, D: serde::Deserializer<'de>>(d: D) -> std::result::Result<Option<u64>, D::Error> {
+    byte_size(d).map(Some)
 }
 
 // Headless Claude Code with thinking off: the same answers, 4-5× faster and cheaper. `{model}`
@@ -175,6 +214,7 @@ impl Default for Config {
             resources: crate::index::embed::Resources::default(),
             reader_budget: READER_BUDGET,
             mcp_reranks: MCP_RERANKS,
+            vector_cache_max: crate::index::cache::DEFAULT_MAX,
         }
     }
 }
@@ -204,6 +244,8 @@ struct Machine {
     resources: Option<crate::index::embed::Resources>,
     reader_budget: Option<u64>,
     mcp_reranks: Option<u32>,
+    #[serde(deserialize_with = "opt_byte_size")]
+    vector_cache_max: Option<u64>,
 }
 
 /// `$ZEROGRAPH_CONFIG`, else `$XDG_CONFIG_HOME/zerograph/config.toml`, else
@@ -315,6 +357,10 @@ impl Config {
         if named.contains_key("mcp_reranks") {
             let _ = writeln!(std::io::stderr(), "{file}: mcp_reranks is not read from a repository — set it in {} to change what an agent may spend", machine_display());
         }
+        cfg.vector_cache_max = machine.vector_cache_max.unwrap_or(crate::index::cache::DEFAULT_MAX);
+        if named.contains_key("vector_cache_max") {
+            let _ = writeln!(std::io::stderr(), "{file}: vector_cache_max is not read from a repository — set it in {} to size this machine's vector cache", machine_display());
+        }
         layer(&named, "rerank_model", machine.rerank_model, &mut cfg.rerank_model);
         layer(&named, "resources", machine.resources, &mut cfg.resources);
         layer(&named, "reader_budget", machine.reader_budget, &mut cfg.reader_budget);
@@ -399,6 +445,11 @@ impl Config {
                 let _ = writeln!(w, "{}: {} is no longer read — enrich was removed in 0.6.0", self.file, key.0);
             }
         }
+    }
+
+    /// `vector_cache_max` as the machine file sets it, for `cache`, which reads no repository.
+    pub fn machine_cache_max() -> Result<u64> {
+        Ok(Self::machine()?.vector_cache_max.unwrap_or(crate::index::cache::DEFAULT_MAX))
     }
 
     /// The global file, or an empty layer when there is none. A malformed or unknown-key global
@@ -767,6 +818,31 @@ mod tests {
             std::fs::write(dir.path().join("zerograph.toml"), "reranker_dir = \"./m\"\n").unwrap();
             assert_eq!(Config::load(dir.path()).unwrap().reranker_dir, "");
         });
+    }
+
+    #[test]
+    fn the_vector_cache_cap_is_the_machines_to_say_and_reads_as_a_size() {
+        with_machine(Some("vector_cache_max = \"512M\"\n"), || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("zerograph.toml"), "vector_cache_max = 1\n").unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().vector_cache_max, 512 << 20, "a repository cannot shrink it");
+        });
+        with_machine(Some("vector_cache_max = 0\n"), || {
+            assert_eq!(Config::load(tempfile::tempdir().unwrap().path()).unwrap().vector_cache_max, 0, "0 turns it off");
+        });
+        with_machine(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("zerograph.toml"), "vector_cache_max = \"1T\"\n").unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().vector_cache_max, crate::index::cache::DEFAULT_MAX);
+        });
+        with_machine(Some("vector_cache_max = \"lots\"\n"), || {
+            assert!(Config::load(tempfile::tempdir().unwrap().path()).is_err(), "a size that does not parse is refused, not guessed");
+        });
+        assert_eq!(parse_size("4G").unwrap(), 4 << 30);
+        assert_eq!(parse_size(" 3 GiB ").unwrap(), 3 << 30);
+        assert_eq!(parse_size("100kb").unwrap(), 100 << 10);
+        assert_eq!(parse_size("123").unwrap(), 123);
+        assert!(parse_size("4X").is_err() && parse_size("").is_err() && parse_size("-1G").is_err() && parse_size("99999999999T").is_err());
     }
 
     #[test]

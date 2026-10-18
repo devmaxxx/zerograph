@@ -122,6 +122,11 @@ Measured on gemma, every export recalls what fp32 does and none embeds faster on
 time, which is why it is the default
 ([the readings](bench/2026-10-17-gemma-quantized-results.md)).
 
+Every row a model embeds on this machine is kept in the [vector cache](keeping-fresh.md#the-vector-cache),
+keyed by the model id with its variant, the width and the row's text. Switching back to a model
+this machine has used before, or building another checkout of the same code under it, reads those
+rows instead of embedding them again; a row never crosses to another model, variant or width.
+
 ### Licence
 
 The default's weights are published under the [Gemma Terms of Use](https://ai.google.dev/gemma/terms),

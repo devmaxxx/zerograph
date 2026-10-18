@@ -69,26 +69,39 @@ seconds:
 embedded 400/1683 (14.2 rows/s, ~90 s left)
 ```
 
-### Borrowing from sibling worktrees
+### The vector cache
 
-A new `git worktree` of a repository that already has a built checkout does not embed the rows that
-checkout already holds. Each worktree builds its own graph, and a cold build is almost all
-embedding, so before a sync embeds a missing row it looks the row's text hash up in the stores of
-the other worktrees `git worktree list` names. A sibling lends only when its rows are the same
-model, variant and dimension as the ones being written; only the rows no sibling holds are embedded:
+A vector is a function of the model, its width and the row's text, and a cold build is almost all
+embedding. So every row this machine embeds is also written to a cache shared by every checkout —
+`~/.cache/zerograph/vectors` (`%LOCALAPPDATA%\zerograph\vectors` on Windows) — and every sync
+looks a row up there before it embeds it. A new worktree, a second clone or a fork of a repository
+this machine has already built embeds only the rows no checkout here has embedded before:
 
 ```
-dense: borrowed 5119 rows from /work/zerograph
+dense: 4512 rows from the vector cache
 ```
 
-A sibling is read under its writer lock and left untouched: one that is refreshing, has no lock
-file, or holds a torn pair is skipped. Its `vectors.json` is read first, and its rows only when
-that names one of the rows wanted; a sibling that held none is remembered against its rows' stamp
-for the life of the process, so the rows of a fresh edit, which no sibling has, cost no further
-read on each answer after it. A borrowed vector is the one this checkout would have
-embedded up to the last digits — batch padding makes two embeds of the same text near-identical,
-not bit-identical — so answers do not move. There is no switch: a repository with one checkout, or
-siblings on another model, simply embeds everything.
+A row is keyed by the blake3 hash of its text plus the model id and dimension, so a row of another
+model, variant or width never crosses. A cached vector is the one this checkout would have embedded
+up to the last digits — batch padding makes two embeds of the same text near-identical, not
+bit-identical — so answers do not move.
+
+Only rows this user embedded on this machine enter the cache: a store's own `vectors.f32` is never
+copied into it, so a `.zerograph` a branch committed cannot seed it. The directory is private to
+the user and is refused otherwise: on Unix 0700, owned by them and not a link; on Windows not a
+link. Readers take no lock; writers
+append under a short lock per shard and never touch a store's writer lock. A torn or corrupt record
+is skipped, never returned.
+
+The cache holds `vector_cache_max` bytes (machine file only, default `4G`), least recently used
+rows going first. A write that takes it over the cap starts `zerograph cache prune` in a background
+process, which trims it to 80% of the cap, so the answer that wrote the row never waits on the
+prune. `zerograph cache status` shows what it holds per model. `0` turns the cache off: nothing
+reads or writes it from then on, and `zerograph cache prune` empties what it already holds.
+
+`ZEROGRAPH_VECTOR_CACHE` points one run at another directory, which must be absolute. On Windows it
+must also sit under `%LOCALAPPDATA%`, because Windows does not check who owns the directory. An
+override that breaks either rule turns the cache off for that run and says so once on stderr.
 
 ### The session hook
 
@@ -134,8 +147,8 @@ Each worktree keeps its own store, its own `vectors.f32` included. Copying a sto
 metadata are rewritten whole through a temporary file and a rename, so the copy's first refresh
 gives them blocks of their own. `vectors.f32` grows in place and keeps its shared blocks only until
 it is rewritten whole — after a compaction, a model switch, or another process rewriting it. There
-is no delta format. The vectors a new worktree needs come instead from a sibling worktree's store,
-borrowed when its index is built rather than embedded again.
+is no delta format. The vectors a new worktree needs come instead from the
+[vector cache](#the-vector-cache), read when its index is built rather than embedded again.
 
 ### Background priority
 

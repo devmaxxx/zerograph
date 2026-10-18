@@ -246,35 +246,10 @@ fn fallback_dir() -> PathBuf { std::env::temp_dir() }
 /// Makes the directory a socket will be bound in, refusing one that is not ours alone: another
 /// user may have created the name first, or planted a symlink at it, and a socket bound there is
 /// theirs to read and replace. The home cache is held to the same rule as the temp directory —
-/// a shared or mis-permissioned home would otherwise hand the socket over just the same. Only the
-/// leaf is made private: the directories above it are the user's own to arrange.
-#[cfg(unix)]
-fn prepare_socket_dir(path: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let Some(dir) = path.parent() else { return Ok(()) };
-    if let Some(above) = dir.parent() {
-        std::fs::create_dir_all(above).with_context(|| format!("create {}", above.display()))?;
-    }
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
-        Ok(()) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
-    }
-    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
-    // SAFETY: geteuid has no preconditions and cannot fail.
-    let mine = meta.uid() == unsafe { libc::geteuid() };
-    if !meta.is_dir() || !mine || meta.permissions().mode() & 0o077 != 0 {
-        anyhow::bail!("{} is not a directory private to this user; remove it and start serve again", dir.display());
-    }
-    Ok(())
-}
-
-/// The profile directory's own ACL is what keeps others out on Windows; all a first `serve` there
-/// owes the socket is a directory to be bound in.
-#[cfg(not(unix))]
+/// a shared or mis-permissioned home would otherwise hand the socket over just the same.
 fn prepare_socket_dir(path: &Path) -> Result<()> {
     let Some(dir) = path.parent() else { return Ok(()) };
-    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))
+    crate::store::prepare_private_dir(dir).map_err(|e| anyhow::anyhow!("{e:#}; remove it and start serve again"))
 }
 
 /// What a `stat` says about `zerograph.toml`, or None where there is none — the configuration a

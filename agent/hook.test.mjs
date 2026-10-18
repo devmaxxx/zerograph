@@ -668,7 +668,7 @@ test('a repository with no store gets one build notice and then silence', () => 
   const payload = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } };
   const notice = context(fire(w, payload));
   assert.match(notice, /zerograph build/);
-  assert.match(notice, /worktree.*already built.*borrows/, 'a large repository is not told it costs a whole embed');
+  assert.match(notice, /already embedded.*vector cache/, 'a large repository is not told it costs a whole embed');
   assert.doesNotMatch(notice, /couple of minutes/, 'a large repository takes far longer than that');
   assert.equal(fire(w, { ...payload, tool_input: { command: 'rg "another question here"' } }), null, 'once a session');
 });

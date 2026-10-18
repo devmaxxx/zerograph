@@ -1,9 +1,9 @@
+pub mod cache;
 pub mod cross;
 pub mod dense;
 pub mod embed;
 pub mod fuse;
 pub mod lexical;
-mod siblings;
 
 use anyhow::Context as _;
 

@@ -416,11 +416,13 @@ impl Context {
                         // the width this very query just measured.
                         let width = qvec.as_ref().map_or(idx.dim, |v| v.len());
                         idx.written_by(emb.name(), width);
+                        idx.use_cache(index::cache::VectorCache::machine(cfg.vector_cache_max));
                         let budget = budget.get();
-                        // Borrowed first, so the budget weighs only the rows that must be embedded. The
-                        // deadline was set when the request began, so the borrow's time is already
-                        // spent from it; `started` times the embeds alone, whose rate is projected.
-                        let lent = idx.borrow_owed(graph, &skip);
+                        // Taken from the cache first, so the budget weighs only the rows that must
+                        // be embedded. The deadline was set when the request began, so the lookup's
+                        // time is already spent from it; `started` times the embeds alone, whose
+                        // rate is projected.
+                        let lent = idx.take_cached(graph, &skip);
                         let owed = idx.owed(graph, &skip);
                         let started = std::time::Instant::now();
                         // Weighed at an idle machine's rate first, so a pull's worth of rows is
@@ -444,7 +446,7 @@ impl Context {
                             }
                             Err(err) => match err.downcast_ref::<refresh::OutOfBudget>() {
                                 Some(&refresh::OutOfBudget(left)) => {
-                                    // What was embedded or borrowed before the stop is kept: the
+                                    // What was embedded or cached before the stop is kept: the
                                     // refresh that finishes matches those rows by hash and embeds
                                     // the rest.
                                     if left < owed || lent > 0 {
