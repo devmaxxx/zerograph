@@ -663,6 +663,8 @@ fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense
     let (graph, _) = store.load()?;
     let mut dense = index::dense::DenseIndex::load(&store)?;
     dense.written_by(model, dim);
+    // Borrowed before the count, so the meter's total is the rows this run embeds.
+    dense.borrow_owed(&graph, skip);
     let mut meter = Meter::new(dense.owed(&graph, skip));
     let n = dense.sync_chunked(&graph, skip, &mut |texts| embed(texts, &mut |k| meter.add(k)), SYNC_CHUNK, &mut |idx, _| idx.save(&store))?;
     dense.synced_against(graph_at);

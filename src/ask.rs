@@ -389,6 +389,8 @@ impl Context {
                         let width = qvec.as_ref().map_or(idx.dim, |v| v.len());
                         idx.written_by(emb.name(), width);
                         let budget = budget.get();
+                        // Borrowed first, so the budget weighs only the rows that must be embedded.
+                        let lent = idx.borrow_owed(graph, &skip);
                         let owed = idx.owed(graph, &skip);
                         let started = std::time::Instant::now();
                         // Weighed at an idle machine's rate first, so a pull's worth of rows is
@@ -412,9 +414,10 @@ impl Context {
                             }
                             Err(err) => match err.downcast_ref::<refresh::OutOfBudget>() {
                                 Some(&refresh::OutOfBudget(left)) => {
-                                    // What was embedded before the stop is kept: the refresh that
-                                    // finishes matches those rows by hash and embeds the rest.
-                                    if left < owed {
+                                    // What was embedded or borrowed before the stop is kept: the
+                                    // refresh that finishes matches those rows by hash and embeds
+                                    // the rest.
+                                    if left < owed || lent > 0 {
                                         idx.checkpointed();
                                         if let Err(err) = idx.save(store) { notices.borrow_mut().push(format!("refresh: vectors not saved ({err:#})")); }
                                     }
