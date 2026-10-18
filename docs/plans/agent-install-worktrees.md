@@ -35,8 +35,8 @@ server or a refresh started without `--repo` find the checkout it runs in.
 ## Implementation steps
 1. #212: delete the git-hook installer, add the retirement of an old block, the SessionStart
    bootstrap, the docs.
-2. #214: register per worktree, prune entries whose path is gone, docs.
-3. #218: `ZEROGRAPH_READER_BUDGET` from the hook.
+2. #218: `ZEROGRAPH_READER_BUDGET` from the hook.
+3. #214: register per worktree, prune entries whose path is gone, docs.
 4. #219: the Codex hook in the main worktree.
 
 ## Tests

@@ -1247,16 +1247,16 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 // Codex reads its hooks from `~/.codex/hooks.json`, which is the machine's and not
                 // this repository's. Printed for a person to paste; see `agent/codex.md`.
                 if target == install_agent::Target::Codex {
-                    let hook = repo.join(".codex/hooks/zerograph-hook.mjs");
-                    let abs = hook.canonicalize().unwrap_or(hook);
+                    let (hook, r) = install_agent::codex_hook(&repo, &command)?;
+                    for note in &r.notes { println!("Codex: {note}"); }
                     println!("\nTo run the hook on this machine, add to ~/.codex/hooks.json \
                               (merging with what is already there):\n{}\n\
                               Codex trusts a hook by hash: the first session after this is added \
-                              asks once, and editing the script later asks again. The hook reads \
-                              each session's own working directory and stays silent where there is \
-                              no index, so one copy serves every repository — move it to \
-                              ~/.codex/hooks/ and adjust the path if this checkout may go away.",
-                             install_agent::codex_hooks_block(&abs.display().to_string()));
+                              asks once, and editing the script later asks again. The path is the \
+                              main worktree's copy, which stays when a linked worktree is removed. \
+                              The hook reads each session's own working directory and stays silent \
+                              where no index was asked for, so one copy serves every repository.",
+                             install_agent::codex_hooks_block(&hook.display().to_string()));
                 }
             }
             // Once whatever the harnesses: an earlier release wrote these, and nothing writes them now.

@@ -221,6 +221,31 @@ pub fn codex_hooks_block(hook_abs: &str) -> String {
     })).unwrap_or_default()
 }
 
+/// The hook `~/.codex/hooks.json` should run, for an install in `root`. Codex's hooks are per user,
+/// so the path has to outlive the checkout it was printed from: it is the main worktree's copy,
+/// which stays while linked worktrees come and go. When the install runs in a linked worktree and
+/// the main one has no hook yet, the hook and its rule are written there; one already there is
+/// left as it is. A bare clone, or no git, is `root`'s own copy.
+pub fn codex_hook(root: &Path, command: &str) -> Result<(PathBuf, Report)> {
+    let mut report = Report::default();
+    let here = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let home = main_worktree(root).unwrap_or_else(|| here.clone());
+    let hooks = home.join(Target::Codex.dir()).join("hooks");
+    let path = hooks.join("zerograph-hook.mjs");
+    if home != here {
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&path).is_err() => {
+                write_if_changed(&path, &hook(command), &mut report)?;
+                write_if_changed(&hooks.join("rule.txt"), &with_command(RULE, command), &mut report)?;
+                report.notes.push(format!("wrote the hook into the main worktree, {}, which outlives this one", home.display()));
+            }
+            Ok(text) if text == hook(command) => {}
+            _ => report.notes.push(format!("{} is left as it is; `install-agent --codex` run there updates it", path.display())),
+        }
+    }
+    Ok((path, report))
+}
+
 /// Removes the script an install made before the rename, which nothing runs once the settings
 /// name the new one. Only a regular file that still carries the hook's debug tag, which every
 /// release of it printed, is ours to remove: a link, or a file someone rewrote into something
@@ -604,6 +629,14 @@ pub fn worktrees(root: &Path) -> Vec<PathBuf> {
     let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
     if !all.contains(&root) { all.insert(0, root); }
     all
+}
+
+/// The main worktree of the clone `root` belongs to: the one that stays while linked worktrees
+/// come and go. `None` for a bare clone, or where git cannot say.
+pub fn main_worktree(root: &Path) -> Option<PathBuf> {
+    let (path, bare) = listed_worktrees(root).into_iter().next()?;
+    if bare { return None; }
+    path.canonicalize().ok()
 }
 
 /// The file Claude Code keeps its local-scope servers in: `.claude.json` in `CLAUDE_CONFIG_DIR`
@@ -1072,7 +1105,7 @@ mod tests {
     }
 
     #[test]
-    fn every_checkout_of_the_clone_is_found_from_any_of_them() {
+    fn every_checkout_of_the_clone_is_found_from_any_of_them_and_the_main_one_named() {
         let dir = git_repo();
         let main = dir.path().join("main");
         std::fs::create_dir(&main).unwrap();
@@ -1081,9 +1114,12 @@ mod tests {
         let wt = dir.path().join("wt");
         git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
         let (main, wt) = (main.canonicalize().unwrap(), wt.canonicalize().unwrap());
-        assert_eq!(worktrees(&wt), [main, wt]);
+        assert_eq!(worktrees(&wt), [main.clone(), wt.clone()]);
+        assert_eq!(main_worktree(&wt), Some(main.clone()));
+        assert_eq!(main_worktree(&main), Some(main));
         let lone = root();
         assert_eq!(worktrees(lone.path()), [lone.path().canonicalize().unwrap()], "outside git, the checkout itself");
+        assert_eq!(main_worktree(lone.path()), None);
     }
 
     #[test]
@@ -1127,6 +1163,36 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(prune_stale_mcp(&config).written, 1);
         assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[test]
+    fn the_codex_hook_from_a_linked_worktree_is_the_main_worktrees_and_one_already_there_is_kept() {
+        let dir = git_repo();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        let main = main.canonicalize().unwrap();
+        let (path, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
+        assert_eq!(path, main.join(".codex/hooks/zerograph-hook.mjs"));
+        assert_eq!(r.written, 2, "{r:?}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("const COMMAND = \"pnpm exec zerograph\";"));
+        assert!(main.join(".codex/hooks/rule.txt").exists());
+        assert_eq!(codex_hook(&wt, "pnpm exec zerograph").unwrap().1.written, 0, "a second run writes nothing");
+
+        std::fs::write(&path, "// the main checkout's own\n").unwrap();
+        let (_, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
+        assert_eq!(r.written, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// the main checkout's own\n");
+        assert!(r.notes.iter().any(|n| n.contains("left as it is")), "{r:?}");
+
+        let (from_main, r) = codex_hook(&main, "zerograph").unwrap();
+        assert_eq!(from_main, path, "the main worktree names its own copy");
+        assert_eq!(r.written, 0);
+        let lone = root();
+        assert_eq!(codex_hook(lone.path(), "zerograph").unwrap().0, lone.path().canonicalize().unwrap().join(".codex/hooks/zerograph-hook.mjs"));
     }
 
     /// The block as the last release that wrote one spelled it.
