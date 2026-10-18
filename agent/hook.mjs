@@ -110,10 +110,21 @@ function onPath(root, platform = process.platform) {
   return null;
 }
 
-/** PATH's absolute entries outside the checkout `root` is in: the machine's, not the repository's. */
+/**
+ * PATH's absolute entries outside the checkout `root` is in: the machine's, not the repository's.
+ * Compared as spelled and with every link followed, so neither a symlinked alias of the checkout
+ * on PATH nor a session opened through one lets the checkout's file through.
+ */
 function machineDirs(root) {
   const checkout = root && (checkoutRoot(root) ?? root);
-  return (process.env.PATH || '').split(delimiter).filter((d) => d && isAbsolute(d) && !inside(checkout, d));
+  const resolved = checkout && real(checkout);
+  return (process.env.PATH || '').split(delimiter)
+    .filter((d) => d && isAbsolute(d) && !inside(checkout, d) && !inside(resolved, real(d)));
+}
+
+/** `p` with every link followed, or as given when it does not resolve. */
+function real(p) {
+  try { return realpathSync.native(p); } catch { return p; }
 }
 
 /**

@@ -254,6 +254,12 @@ test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH
     assert.equal(binary(w.root), installed, 'the machine\'s binary, by its absolute path');
     process.env.PATH = [join(w.root, 'node_modules', '.bin'), machine].join(delimiter);
     assert.equal(binary(w.root), installed, 'an absolute entry inside the checkout, as an .envrc adds, is the checkout\'s too');
+    const alias = join(mkdtempSync(join(tmpdir(), 'zerograph-alias-')), 'checkout');
+    symlinkSync(w.root, alias, 'junction');
+    process.env.PATH = [join(alias, 'node_modules', '.bin'), machine].join(delimiter);
+    assert.equal(binary(w.root), installed, 'the checkout reached through a symlinked alias is still the checkout');
+    process.env.PATH = [join(w.root, 'node_modules', '.bin'), machine].join(delimiter);
+    assert.equal(binary(alias), installed, 'and so is a session opened through the alias');
     process.env.ZEROGRAPH_BIN = join('node_modules', '.bin', 'zerograph');
     assert.equal(binary(w.root), null, 'a relative ZEROGRAPH_BIN names the checkout\'s file, so it names nothing');
     delete process.env.ZEROGRAPH_BIN;

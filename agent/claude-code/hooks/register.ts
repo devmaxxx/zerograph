@@ -27,6 +27,12 @@ function inside(root: string, dir: string, win: boolean): boolean {
   return d === r || d.startsWith(`${r}/`)
 }
 
+// `path` with every link followed, or as given when it does not resolve.
+async function realOf($: Api, path: string): Promise<string> {
+  const stat = await $.fs.stat(path, { resolve: true }).catch(() => undefined)
+  return stat?.realPath ?? path
+}
+
 // The checkout the session's root is in: a session opened in a package of a monorepo has the
 // whole checkout around it, and a PATH entry anywhere in that is still the checkout's file.
 async function checkoutOf($: Api, root: string): Promise<string> {
@@ -47,7 +53,14 @@ async function binaryOf($: Api, configured: string, root: string, checkout: stri
   if (configured && /[\\/]/.test(configured)) return isAbsolute(configured) ? configured : undefined
   const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
   const win = path.includes(';') || /^[A-Za-z]:/.test(root)
-  const dirs = path.split(win ? ';' : ':').filter(dir => dir && isAbsolute(dir) && !inside(checkout, dir, win))
+  // Compared as spelled and with every link followed, so a symlinked alias of the checkout on
+  // PATH, or a session opened through one, still reads as the checkout.
+  const resolved = await realOf($, checkout)
+  const dirs: string[] = []
+  for (const dir of path.split(win ? ';' : ':')) {
+    if (!dir || !isAbsolute(dir) || inside(checkout, dir, win)) continue
+    if (!inside(resolved, await realOf($, dir), win)) dirs.push(dir)
+  }
   // Every `.exe` before any `.cmd`: npm's global shim is a `.cmd`, which only `cmd` can start, and
   // `cmd` expands `%NAME%` in what it runs and outlives nothing it is killed for.
   const names = win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph']
@@ -61,13 +74,23 @@ async function binaryOf($: Api, configured: string, root: string, checkout: stri
   return undefined
 }
 
-// How to start `bin`. `$.process.run` takes no shell, and Node has refused to start a batch file
-// without one since CVE-2024-27980, so a `.cmd` goes through `cmd` by hand. `call` keeps the
-// command line from opening on a quote, which `cmd /c` would strip along with the last one.
-async function launch($: Api, bin: string): Promise<string[]> {
-  if (!/\.(cmd|bat)$/i.test(bin)) return [bin]
+// What `cmd` acts on outside quotes (`&|<>^` run or redirect, `"` toggles quoting) or expands
+// even inside them (`%`, and `!` where delayed expansion is on).
+const CMD_SPECIAL = /[&|<>^"%!]/
+
+// How to start `bin` with `args`, or `undefined` when it cannot be started safely. `$.process.run`
+// takes no shell, and Node has refused to start a batch file without one since CVE-2024-27980, so a
+// `.cmd` goes through `cmd` by hand. `call` keeps the command line from opening on a quote, which
+// `cmd /c` would strip along with the last one. `cmd` parses the line the run builds, and the run
+// quotes an argument only when it holds a space or a quote, so a checkout like `C:\src\a&calc`
+// reaches it bare and its `&` starts a second command. A quote added here does not help: the run
+// escapes it as `\"`, which `cmd` reads as a quote that closes. An argument `cmd` would act on is
+// therefore refused, and the line falls back to what the logs say.
+async function launch($: Api, bin: string, args: string[]): Promise<string[] | undefined> {
+  if (!/\.(cmd|bat)$/i.test(bin)) return [bin, ...args]
+  if ([bin, ...args].some(a => CMD_SPECIAL.test(a))) return undefined
   const comspec = (await $.env.get('ComSpec').catch(() => undefined)) ?? 'C:\\Windows\\System32\\cmd.exe'
-  return [comspec, '/d', '/c', 'call', bin]
+  return [comspec, '/d', '/c', 'call', bin, ...args]
 }
 
 // `undefined` when no zerograph is found, it has no `status`, or it failed.
@@ -76,7 +99,8 @@ async function runStatus($: Api, configured: string, json: boolean): Promise<str
   const checkout = await checkoutOf($, root)
   const bin = await binaryOf($, configured, root, checkout)
   if (!bin) return undefined
-  const argv = [...(await launch($, bin)), '--repo', checkout, 'status', ...(json ? ['--json'] : [])]
+  const argv = await launch($, bin, ['--repo', checkout, 'status', ...(json ? ['--json'] : [])])
+  if (!argv) return undefined
   // Never from the checkout: npm's `.cmd` shim starts a bare `node`, and `cmd` looks for that in
   // the working directory before PATH. The binary is told its repository by `--repo`.
   const home = bin.replace(/[\\/][^\\/]*$/, '') || '/'
