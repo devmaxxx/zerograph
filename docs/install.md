@@ -90,6 +90,22 @@ What zerograph reads from the old install:
   removes the `repo-query` directory beside it when it holds only the `SKILL.md` 0.6.0–0.6.3 wrote;
   an edited one, a link or one with files of its own is left and named.
 
+## Claude Code status mod
+
+`agent/claude-code/` is a Claude Code mod that puts the index's state at the end of the line under
+the prompt, read from `zerograph status --json` every ten seconds: `◇ zerograph · in sync`, a bar
+and the time left while a refresh runs, the files behind, vectors still to embed, a warning count
+and whether `serve` answers. `/zerograph` prints the full `zerograph status` report. Install it at
+a Claude Code prompt:
+
+```
+/plugin install zerograph-status --marketplace devmaxxx/zerograph
+```
+
+It asks `zerograph` on `PATH`, then the project's `node_modules/.bin`, then `target/release` and
+`target/debug`; the `binary` option in `/config` names another one. A zerograph without `status`
+shows nothing on the line, and `/zerograph` falls back to the tail of `background.log`.
+
 ## Windows notes
 
 Install through npm; nothing else is required. What can still trip a Windows user:

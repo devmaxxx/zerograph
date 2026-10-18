@@ -1,0 +1,13 @@
+{
+  "name": "zerograph",
+  "description": "zerograph's Claude Code mods",
+  "owner": {
+    "name": "devmaxxx"
+  },
+  "plugins": [
+    {
+      "name": "zerograph-status",
+      "source": "./agent/claude-code"
+    }
+  ]
+}

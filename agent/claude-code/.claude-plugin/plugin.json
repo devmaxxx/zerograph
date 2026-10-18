@@ -1,0 +1,17 @@
+{
+  "name": "zerograph-status",
+  "version": "0.1.0",
+  "description": "zerograph's state at the end of the prompt's hint line: refresh progress, files behind, serve and warnings",
+  "author": {
+    "name": "devmaxxx"
+  },
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "binary": {
+      "type": "string",
+      "title": "zerograph binary",
+      "description": "Command or absolute path of the zerograph to ask. Empty tries zerograph on PATH, then node_modules/.bin, then target/release and target/debug of the project.",
+      "default": ""
+    }
+  }
+}
