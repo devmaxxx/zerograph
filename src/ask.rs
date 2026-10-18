@@ -407,12 +407,12 @@ impl Context {
                         let width = qvec.as_ref().map_or(idx.dim, |v| v.len());
                         idx.written_by(emb.name(), width);
                         let budget = budget.get();
-                        // Started before the borrow, which reads sibling stores and is spent from
-                        // the same budget as the embeds after it.
-                        let started = std::time::Instant::now();
-                        // Borrowed first, so the budget weighs only the rows that must be embedded.
+                        // Borrowed first, so the budget weighs only the rows that must be embedded. The
+                        // deadline was set when the request began, so the borrow's time is already
+                        // spent from it; `started` times the embeds alone, whose rate is projected.
                         let lent = idx.borrow_owed(graph, &skip);
                         let owed = idx.owed(graph, &skip);
+                        let started = std::time::Instant::now();
                         // Weighed at an idle machine's rate first, so a pull's worth of rows is
                         // not started at all; past that, each chunk's own rate decides.
                         let synced = match budget.fits(owed, refresh::ROW_COST) {

@@ -1679,7 +1679,7 @@ mod tests {
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git").args(args).current_dir(dir)
+        let ok = git_command().args(args).current_dir(dir)
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success();
         assert!(ok, "git {args:?}");
     }

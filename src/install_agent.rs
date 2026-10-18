@@ -562,6 +562,7 @@ pub fn register_mcp(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> 
         report.notes.push(format!("`claude` is not on PATH, so the MCP server was not registered; run `{by_hand}` where it is"));
         return report;
     };
+    let mut beside = false;
     if existing.status.success() {
         let shown = String::from_utf8_lossy(&existing.stdout);
         if said_in_order(&shown, program.as_str(), &tail) {
@@ -573,9 +574,7 @@ pub fn register_mcp(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> 
         // holds the name, so a user-level entry would go machine-wide and a tracked `.mcp.json`
         // entry would go in every worktree, leaving each one dirty. A local entry added beside
         // one in another scope wins in this project, and the other stays as its owner left it.
-        if !run(root, &["mcp", "remove", MCP_NAME, "-s", "local"]).is_some_and(|o| o.status.success()) {
-            report.notes.push(format!("a `{MCP_NAME}` MCP server registered in another scope differs from this one and was left alone; the local one added beside it answers in this project, and `claude mcp remove {MCP_NAME} -s user` (or `-s project`) takes the other out if it is stale"));
-        }
+        beside = !run(root, &["mcp", "remove", MCP_NAME, "-s", "local"]).is_some_and(|o| o.status.success());
     }
     let mut args = vec!["mcp", "add", MCP_NAME, "--", program.as_str()];
     args.extend(&tail);
@@ -583,6 +582,9 @@ pub fn register_mcp(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> 
         Some(added) if added.status.success() => {
             report.written = 1;
             report.paths.push(by_hand);
+            if beside {
+                report.notes.push(format!("a `{MCP_NAME}` MCP server registered in another scope differs from this one and was left alone; the local one added beside it answers in this project, and `claude mcp remove {MCP_NAME} -s user` (or `-s project`) takes the other out if it is stale"));
+            }
             retire_legacy_mcp(root, run, &mut report);
         }
         Some(failed) => report.notes.push(format!("`claude mcp add` failed, the MCP server was not registered: {}", String::from_utf8_lossy(&failed.stderr).trim())),
