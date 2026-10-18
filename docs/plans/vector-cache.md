@@ -18,8 +18,8 @@ dims — and holds the normalised f32 row a sync stored.
 ## On-disk format
 
 ```
-<root>/<model-slug>-<8 hex of model id>@<dims>/<xx>.rows   # xx = first key byte, 256 shards
-<root>/<model-slug>-<8 hex of model id>@<dims>/<xx>.lock   # the shard's writer lock
+<root>/<model-slug>-<8 hex of model id>@<dims>/<xxx>.rows   # xxx = first 12 key bits, 4096 shards
+<root>/<model-slug>-<8 hex of model id>@<dims>/<xxx>.lock   # the shard's writer lock
 <root>/prune.lock
 ```
 
@@ -36,7 +36,7 @@ a reader walks the key column of the one shard a hash falls in, with no second f
 - Readers take no lock. They count whole records only and verify each record's check, so a
   record being appended, cut short by a crash, or rewritten under them is skipped, never
   returned. A row is returned only when its width is the directory's and every float is finite.
-- Writers lock `<xx>.lock` (a short blocking lock held for one `write_all`), cut a torn tail back
+- Writers lock `<xxx>.lock` (a short blocking lock held for one `write_all`), cut a torn tail back
   to the last whole record, and append. A shard whose header does not parse or names another
   model or width is started over.
 - No store's writer lock is taken or consulted.
@@ -60,8 +60,10 @@ disables the cache for the run with one line on stderr; nothing fails because of
 
 `vector_cache_max` in the machine config (`~/.config/zerograph/config.toml`), default `4G`; `0`
 turns the cache off. A repository's `zerograph.toml` cannot set it — a clone must not be able to
-empty or bloat a machine-wide cache. After a write that takes the cache over the cap, the writer
-prunes to 80 % of it, least recently used first. A hit bumps its record's `used` in place when it
+empty or bloat a machine-wide cache. A writer weighs the cache only when a shard it appended to
+crosses a 64 KiB boundary. Once the cache is over the cap, the writer starts `zerograph cache prune`
+as a detached background process, once per process, and the prune trims to 80 % of the cap, least
+recently used first. The write may be a reader's, and a prune rewrites gigabytes. A hit bumps its record's `used` in place when it
 is over an hour old, which is the only write a reader makes and needs no lock: `used` is outside
 the check, so any value it holds is valid.
 

@@ -241,7 +241,8 @@ enum Cmd {
 enum CacheAction {
     /// Where the cache is, its cap, and the rows and bytes it holds per model.
     Status,
-    /// Trims the cache to `vector_cache_max`, least recently used first, and drops torn records.
+    /// Trims the cache to 80% of `vector_cache_max` (to nothing when it is 0), least recently
+    /// used first, and drops torn records.
     Prune,
 }
 
@@ -739,13 +740,12 @@ impl Meter {
 
 fn cache_command(action: CacheAction) -> anyhow::Result<String> {
     let max = config::Config::machine_cache_max()?;
-    let Some(root) = index::cache::default_root() else { anyhow::bail!("no vector cache: this environment names no home directory") };
-    if max == 0 { return Ok(format!("cache: off (vector_cache_max = 0); {} is not read or written\n", root.display())); }
-    let cache = index::cache::VectorCache::at(root, max)?;
+    let cache = index::cache::VectorCache::at(index::cache::default_root()?, max)?;
     Ok(match action {
+        CacheAction::Status if max == 0 => format!("{}cache: off (vector_cache_max = 0): not read or written; `zerograph cache prune` empties it\n", cache_status(&cache)),
         CacheAction::Status => cache_status(&cache),
         CacheAction::Prune => {
-            let p = cache.prune(max)?;
+            let p = cache.prune(cache.prune_target())?;
             format!("cache: pruned {} rows, {} -> {}\n", p.rows, size(p.before), size(p.after))
         }
     })

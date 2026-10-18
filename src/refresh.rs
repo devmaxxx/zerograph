@@ -171,6 +171,18 @@ pub(crate) fn spawn_detached_logging(repo: &Path, no_dense: bool, background: bo
     Ok(reap(detach(&mut cmd)?))
 }
 
+/// `zerograph --background <args>` with no repository and no output anyone reads: housekeeping
+/// that is the machine's, not a checkout's, so it has no store to log into.
+pub(crate) fn spawn_quiet(args: &[&str]) -> anyhow::Result<()> {
+    let mut cmd = std::process::Command::new(std::env::current_exe()?);
+    cmd.arg("--background").args(args)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    reap(detach(&mut cmd)?);
+    Ok(())
+}
+
 /// The child's command line: the global flags first, then the command.
 fn child_args(repo: &Path, no_dense: bool, background: bool, args: &[&str]) -> Vec<std::ffi::OsString> {
     let mut out: Vec<std::ffi::OsString> = vec!["--repo".into(), repo.into()];

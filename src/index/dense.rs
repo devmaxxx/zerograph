@@ -1081,6 +1081,8 @@ mod tests {
         let mut cached = vec![1.0, 2.0, 5.0];
         normalise(&mut cached);
         assert_eq!(row(&idx, "FR-PAY-26"), cached, "the first checkout's vector, not a fresh embed");
+        let held: u64 = cache.status().iter().map(|u| u.rows).sum();
+        assert_eq!(held, 3, "a row read back from the cache is not written to it again");
     }
 
     #[test]

@@ -54,7 +54,7 @@ The machine's vector cache, which every checkout reads before it embeds, reports
 
 ```bash
 zerograph cache status                      # where it is, its cap, rows and bytes per model
-zerograph cache prune                       # trim to vector_cache_max, least recently used first
+zerograph cache prune                       # trim to 80% of vector_cache_max, least recently used first; empty it when the cap is 0
 ```
 
 Under the refresh line come the lines the current run wrote besides its progress meters — its result

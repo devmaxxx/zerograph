@@ -88,14 +88,20 @@ bit-identical — so answers do not move.
 
 Only rows this user embedded on this machine enter the cache: a store's own `vectors.f32` is never
 copied into it, so a `.zerograph` a branch committed cannot seed it. The directory is private to
-the user (0700, owned by them, not a link) and is refused otherwise. Readers take no lock; writers
+the user and is refused otherwise: on Unix 0700, owned by them and not a link; on Windows not a
+link. Readers take no lock; writers
 append under a short lock per shard and never touch a store's writer lock. A torn or corrupt record
 is skipped, never returned.
 
-The cache holds `vector_cache_max` bytes (machine file only, default `4G`; `0` turns it off), least
-recently used rows going first. `zerograph cache status` shows what it holds per model, and
-`zerograph cache prune` trims it to the cap. `ZEROGRAPH_VECTOR_CACHE` points one run at another
-directory.
+The cache holds `vector_cache_max` bytes (machine file only, default `4G`), least recently used
+rows going first. A write that takes it over the cap starts `zerograph cache prune` in a background
+process, which trims it to 80% of the cap, so the answer that wrote the row never waits on the
+prune. `zerograph cache status` shows what it holds per model. `0` turns the cache off: nothing
+reads or writes it from then on, and `zerograph cache prune` empties what it already holds.
+
+`ZEROGRAPH_VECTOR_CACHE` points one run at another directory, which must be absolute. On Windows it
+must also sit under `%LOCALAPPDATA%`, because Windows does not check who owns the directory. An
+override that breaks either rule turns the cache off for that run and says so once on stderr.
 
 ### The session hook
 

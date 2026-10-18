@@ -3,8 +3,10 @@
 //! checkout of the same code — a worktree, a clone, a fork — embeds the same texts again, so a row
 //! any of them embedded once is a read for the rest.
 //!
-//! One directory per model and width, 256 append-only shard files in each, picked by the first
-//! byte of the row's hash. A shard is a header naming its model and width, then fixed-width
+//! One directory per model and width, 4096 append-only shard files in each, picked by the first
+//! twelve bits of the row's hash. A reader reads every shard a wanted row falls in whole, so the
+//! count keeps a shard near a megabyte at the default cap: an edit owing a few rows reads a few
+//! megabytes, not a sixteenth of the cache. A shard is a header naming its model and width, then fixed-width
 //! records, so the stride is the index and there is no second file to tear. Readers take no
 //! lock: they count whole records and check each one, so a record mid-append, cut short by a
 //! crash, or corrupted on disk is skipped, never returned. Writers append under a lock of the
@@ -36,8 +38,14 @@ const TOUCH_AFTER: u32 = 60;
 /// Over the cap, a writer prunes to this share of it, so the next few writes do not prune again.
 const PRUNE_TO_PERCENT: u64 = 80;
 
+/// A writer weighs the whole cache against its cap only when a shard it appended to crosses a
+/// multiple of this. Weighing means a stat of every shard of every model, which a reader paying
+/// a few rows after an edit would otherwise add to every answer; the cap is overrun by at most
+/// this much per shard in between.
+const WEIGH_EVERY: u64 = 64 << 10;
+
 #[derive(Debug, Clone)]
-pub struct VectorCache { root: PathBuf, max: u64 }
+pub struct VectorCache { root: PathBuf, max: u64, detached: bool }
 
 /// One model's directory as `status` reads it.
 #[derive(Debug, PartialEq)]
@@ -47,21 +55,40 @@ pub struct Usage { pub model: String, pub dims: usize, pub rows: u64, pub bytes:
 pub struct Pruned { pub rows: u64, pub before: u64, pub after: u64 }
 
 /// `$ZEROGRAPH_VECTOR_CACHE`, else `%LOCALAPPDATA%\zerograph\vectors` on Windows and
-/// `~/.cache/zerograph/vectors` elsewhere. A relative path is no answer: it would put the cache
+/// `~/.cache/zerograph/vectors` elsewhere. A relative override is refused: it would put the cache
 /// wherever each process happens to stand.
-pub fn default_root() -> Option<PathBuf> {
+pub fn default_root() -> Result<PathBuf> {
     #[cfg(windows)]
-    let platform = std::env::var_os("LOCALAPPDATA").map(|p| PathBuf::from(p).join("zerograph").join("vectors"));
+    {
+        let local = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+        let platform = local.as_ref().map(|p| p.join("zerograph").join("vectors"));
+        // Only Unix checks the root's owner and mode. On Windows an override elsewhere could be
+        // a folder another account made first and can write, so it must sit in the user's own
+        // profile.
+        root_from(crate::env_os("VECTOR_CACHE"), platform, local.as_deref())
+    }
     #[cfg(not(windows))]
-    let platform = std::env::home_dir().map(|h| h.join(".cache").join("zerograph").join("vectors"));
-    root_from(crate::env_os("VECTOR_CACHE"), platform)
+    {
+        let platform = std::env::home_dir().map(|h| h.join(".cache").join("zerograph").join("vectors"));
+        root_from(crate::env_os("VECTOR_CACHE"), platform, None)
+    }
 }
 
-fn root_from(named: Option<std::ffi::OsString>, platform: Option<PathBuf>) -> Option<PathBuf> {
-    match named.filter(|v| !v.is_empty()) {
-        Some(p) => Some(PathBuf::from(p)),
-        None => platform,
-    }.filter(|p| p.is_absolute())
+fn root_from(named: Option<std::ffi::OsString>, platform: Option<PathBuf>, within: Option<&Path>) -> Result<PathBuf> {
+    let Some(named) = named.filter(|v| !v.is_empty()).map(PathBuf::from) else {
+        return platform.filter(|p| p.is_absolute())
+            .context("no vector cache directory: this environment names no home directory");
+    };
+    if !named.is_absolute() {
+        anyhow::bail!("ZEROGRAPH_VECTOR_CACHE must be an absolute path, not {}", named.display());
+    }
+    if let Some(base) = within {
+        let climbs = named.components().any(|c| matches!(c, std::path::Component::ParentDir));
+        if climbs || !named.starts_with(base) {
+            anyhow::bail!("ZEROGRAPH_VECTOR_CACHE must sit under {}, not {}", base.display(), named.display());
+        }
+    }
+    Ok(named)
 }
 
 /// Said once per process: a cache that cannot be used costs embeds, not answers, and a resident
@@ -169,7 +196,7 @@ fn read_header(bytes: &[u8]) -> Option<Layout> {
     (dims > 0).then(|| Layout::new(model, dims))
 }
 
-fn shard_of(key: &[u8; KEY]) -> String { format!("{:02x}", key[0]) }
+fn shard_of(key: &[u8; KEY]) -> String { format!("{:02x}{:x}", key[0], key[1] >> 4) }
 
 fn open(path: &Path, write: bool, create: bool) -> std::io::Result<std::fs::File> {
     let mut o = std::fs::OpenOptions::new();
@@ -211,20 +238,26 @@ impl VectorCache {
     /// The cache at `default_root`, or `None` when `max` turns it off, no root can be named, or
     /// the root is not private to this user — each of which costs embeds and nothing else. Unit
     /// tests never reach the machine's cache: they make their own with `at`.
+    /// Its prunes run in a process of their own: the write that takes the cache over its cap can
+    /// be a reader's, and a prune rewrites gigabytes.
     pub fn machine(max: u64) -> Option<VectorCache> {
         if max == 0 || cfg!(test) { return None; }
-        let root = default_root()?;
-        match VectorCache::at(root, max) {
-            Ok(c) => Some(c),
+        match default_root().and_then(|root| VectorCache::at(root, max)) {
+            Ok(c) => Some(VectorCache { detached: true, ..c }),
             Err(err) => { warn_once("not used", &err); None }
         }
     }
 
-    /// The cache at `root`, which is made private to this user or refused.
+    /// The cache at `root`, which is made private to this user or refused. Its writes prune in
+    /// place.
     pub fn at(root: PathBuf, max: u64) -> Result<VectorCache> {
         crate::store::prepare_private_dir(&root)?;
-        Ok(VectorCache { root, max })
+        Ok(VectorCache { root, max, detached: false })
     }
+
+    /// What a prune trims to: under the cap by enough that the next few writes do not prune again,
+    /// and to nothing when the cap is 0.
+    pub fn prune_target(&self) -> u64 { self.max / 100 * PRUNE_TO_PERCENT }
 
     pub fn root(&self) -> &Path { &self.root }
     pub fn max(&self) -> u64 { self.max }
@@ -263,8 +296,8 @@ impl VectorCache {
         found
     }
 
-    /// Appends `rows` — hex text hash and vector — under `model` at `dims`, then prunes when the
-    /// cache is over its cap. A row of another width or with a non-finite float is not stored.
+    /// Appends `rows` — hex text hash and vector — under `model` at `dims`, then prunes, or starts
+    /// a prune, when the cache is over its cap. A row of another width or with a non-finite float is not stored.
     pub fn put(&self, model: &str, dims: usize, rows: &[(&str, &[f32])]) -> Result<()> {
         self.put_at(model, dims, rows, now_minutes())
     }
@@ -281,9 +314,16 @@ impl VectorCache {
         if by_shard.is_empty() { return Ok(()); }
         let dir = self.root.join(layout.dir_name());
         make_dir(&dir)?;
-        for (shard, records) in by_shard { append(&dir, &shard, &layout, &records)?; }
-        if self.max > 0 && self.bytes() > self.max {
-            self.prune(self.max / 100 * PRUNE_TO_PERCENT)?;
+        let mut crossed = false;
+        for (shard, records) in by_shard {
+            let (from, to) = append(&dir, &shard, &layout, &records)?;
+            crossed |= from / WEIGH_EVERY != to / WEIGH_EVERY;
+        }
+        if crossed && self.max > 0 && self.bytes() > self.max {
+            match self.detached {
+                true => prune_detached(),
+                false => { self.prune(self.prune_target())?; }
+            }
         }
         Ok(())
     }
@@ -313,21 +353,22 @@ impl VectorCache {
             .filter_map(|p| std::fs::symlink_metadata(p).ok()).map(|m| m.len()).sum()
     }
 
-    /// Rows and bytes per model, read from each shard's header and length.
+    /// Rows a reader would return and bytes on disk, per model. Every shard is read whole, so a
+    /// torn, corrupt or repeated record is not counted as a row; its bytes still are.
     pub fn status(&self) -> Vec<Usage> {
         let mut out = Vec::new();
         for dir in self.model_dirs() {
             let mut usage: Option<Usage> = None;
             for shard in Self::shards(&dir) {
-                let Ok(mut f) = open(&shard, false, false) else { continue };
-                let len = f.metadata().map_or(0, |m| m.len());
-                let mut head = vec![0u8; 20 + 256];
-                let n = f.read(&mut head).unwrap_or(0);
-                let Some(layout) = read_header(&head[..n]) else { continue };
-                let rows = len.saturating_sub(layout.header().len() as u64) / layout.record_len() as u64;
+                let Ok(bytes) = open(&shard, false, false).and_then(|mut f| read_all(&mut f)) else { continue };
+                let Some(layout) = read_header(&bytes) else { continue };
+                let mut keys = HashSet::new();
+                let rows = layout.records(&bytes)
+                    .filter(|(_, rec)| layout.row_of(rec).is_some() && keys.insert(&rec[..KEY]))
+                    .count() as u64;
                 let u = usage.get_or_insert_with(|| Usage { model: layout.model.clone(), dims: layout.dims, rows: 0, bytes: 0 });
                 u.rows += rows;
-                u.bytes += len;
+                u.bytes += bytes.len() as u64;
             }
             out.extend(usage);
         }
@@ -423,6 +464,16 @@ impl Cut {
 }
 
 /// A model's directory under the root, made private and never a link.
+/// `zerograph cache prune` in a background process, once per process: a resident reader over the
+/// cap would otherwise start one on every write until the first had finished.
+fn prune_detached() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::Relaxed) { return; }
+    if let Err(err) = crate::refresh::spawn_quiet(&["cache", "prune"]) {
+        warn_once("over its cap and not pruned", &err);
+    }
+}
+
 fn make_dir(dir: &Path) -> Result<()> {
     #[cfg(unix)]
     let made = { use std::os::unix::fs::DirBuilderExt; std::fs::DirBuilder::new().mode(0o700).create(dir) };
@@ -441,7 +492,8 @@ fn make_dir(dir: &Path) -> Result<()> {
 /// `records` appended to one shard under its lock. A shard that does not start with this layout's
 /// header — new, garbage, or another format — is started over; a torn tail a crash left is cut
 /// back to the last whole record first, or every record after it would be read out of step.
-fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<()> {
+/// Returns the shard's length before and after.
+fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<(u64, u64)> {
     let _guard = lock_shard(dir, shard)?;
     let path = dir.join(format!("{shard}.rows"));
     let mut f = open(&path, true, true).with_context(|| format!("open {}", path.display()))?;
@@ -460,7 +512,8 @@ fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<()
         }
     };
     if at != len { f.set_len(at).with_context(|| format!("truncate {}", path.display()))?; }
-    write_at(&f, at, records).with_context(|| format!("write {}", path.display()))
+    write_at(&f, at, records).with_context(|| format!("write {}", path.display()))?;
+    Ok((len, at + records.len() as u64))
 }
 
 #[cfg(test)]
@@ -477,11 +530,12 @@ mod tests {
     fn hash(shard: u8, n: u32) -> String {
         let mut k = *blake3::hash(&n.to_le_bytes()).as_bytes();
         k[0] = shard;
+        k[1] &= 0x0f;
         hex_of(&k)
     }
 
     fn shard_file(c: &VectorCache, model: &str, dims: usize, shard: u8) -> PathBuf {
-        c.root.join(Layout::new(model, dims).dir_name()).join(format!("{shard:02x}.rows"))
+        c.root.join(Layout::new(model, dims).dir_name()).join(format!("{shard:02x}0.rows"))
     }
 
     #[test]
@@ -602,13 +656,16 @@ mod tests {
     #[test]
     fn a_write_over_the_cap_prunes_below_it() {
         let dir = tempfile::tempdir().unwrap();
-        let rec = Layout::new("m", 2).record_len() as u64;
-        let header = Layout::new("m", 2).header().len() as u64;
+        // Rows wide enough that every put crosses `WEIGH_EVERY`, so every put weighs the cache.
+        let dims = (WEIGH_EVERY / 4) as usize;
+        let l = Layout::new("m", dims);
+        let (rec, header) = (l.record_len() as u64, l.header().len() as u64);
         let c = VectorCache::at(dir.path().join("v"), 10 * (rec + header)).unwrap();
-        for i in 0..40u32 { c.put_at("m", 2, &[(&hash(i as u8, i), &[1.0, 0.0])], i).unwrap(); }
+        let row = vec![0.5f32; dims];
+        for i in 0..40u32 { c.put_at("m", dims, &[(&hash(i as u8, i), &row)], i).unwrap(); }
         assert!(c.bytes() <= c.max(), "{} > {}", c.bytes(), c.max());
-        assert_eq!(c.get("m", 2, &[&hash(39, 39)]).len(), 1, "the newest row is kept");
-        assert!(c.get("m", 2, &[&hash(0, 0)]).is_empty(), "the oldest went first");
+        assert_eq!(c.get("m", dims, &[&hash(39, 39)]).len(), 1, "the newest row is kept");
+        assert!(c.get("m", dims, &[&hash(0, 0)]).is_empty(), "the oldest went first");
     }
 
     #[test]
@@ -642,11 +699,20 @@ mod tests {
     }
 
     #[test]
-    fn a_relative_root_is_no_root() {
+    fn a_relative_or_unconfined_override_is_refused_not_replaced() {
         let abs = std::env::temp_dir().join("v");
-        assert_eq!(root_from(Some("relative/dir".into()), Some(abs.clone())), None);
-        assert_eq!(root_from(Some(abs.clone().into()), None), Some(abs.clone()));
-        assert_eq!(root_from(Some("".into()), Some(abs.clone())), Some(abs), "an empty variable is unset");
-        assert_eq!(root_from(None, Some("rel".into())), None);
+        let ok = |named: Option<&std::path::Path>, platform: Option<&std::path::Path>, within: Option<&std::path::Path>| {
+            root_from(named.map(|p| p.as_os_str().to_owned()), platform.map(PathBuf::from), within).ok()
+        };
+        assert_eq!(ok(Some("relative/dir".as_ref()), Some(&abs), None), None, "refused, not the platform root");
+        assert_eq!(ok(Some(&abs), None, None), Some(abs.clone()));
+        assert_eq!(ok(Some("".as_ref()), Some(&abs), None), Some(abs.clone()), "an empty variable is unset");
+        assert_eq!(ok(None, Some("rel".as_ref()), None), None);
+        assert!(format!("{:#}", root_from(None, None, None).unwrap_err()).contains("home directory"));
+        let base = abs.parent().unwrap();
+        assert_eq!(ok(Some(&base.join("zg")), None, Some(base)), Some(base.join("zg")));
+        let outside = std::env::temp_dir().join("elsewhere");
+        assert_eq!(ok(Some(&outside), Some(&abs), Some(&abs)), None, "outside the confining base");
+        assert_eq!(ok(Some(&abs.join("..").join("..").join("x")), None, Some(&abs)), None, "`..` cannot climb out");
     }
 }

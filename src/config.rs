@@ -447,14 +447,14 @@ impl Config {
         }
     }
 
-    /// The global file, or an empty layer when there is none. A malformed or unknown-key global
-    /// file is an error naming the file: a setting silently ignored on every repository at once is
-    /// worse than a refusal.
     /// `vector_cache_max` as the machine file sets it, for `cache`, which reads no repository.
     pub fn machine_cache_max() -> Result<u64> {
         Ok(Self::machine()?.vector_cache_max.unwrap_or(crate::index::cache::DEFAULT_MAX))
     }
 
+    /// The global file, or an empty layer when there is none. A malformed or unknown-key global
+    /// file is an error naming the file: a setting silently ignored on every repository at once is
+    /// worse than a refusal.
     fn machine() -> Result<Machine> {
         let Some(path) = machine_read_path() else { return Ok(Machine::default()) };
         if !path.exists() {
