@@ -79,7 +79,7 @@ zerograph explain FR-PAY-22                # one node and everything attached to
 
 | | |
 | --- | --- |
-| Build and refresh | `build`, `update`, `watch`, and a self-healing `ask` that re-reads what changed ([keeping fresh](docs/keeping-fresh.md)) |
+| Build and refresh | `build`, `update`, and a self-healing `ask` that re-reads what changed ([keeping fresh](docs/keeping-fresh.md)) |
 | Ask | `ask`, `explain`, `impact`, `trace`, `changes`, `verify`, `families`, all with `--json` ([commands](docs/commands.md)) |
 | Resident process | `serve` answers a fused question in 66 ms instead of 326 ms ([serve](docs/serve.md)) |
 | Agents | `zerograph mcp`, `install-agent`, `prime` ([MCP](docs/mcp.md)) |

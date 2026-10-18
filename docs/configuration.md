@@ -73,7 +73,7 @@ A matching file keeps its nodes, its edges and its rows in the lexical index, so
 because nothing of it is embedded. `skip` would take it out of all of those. The globs match the
 path a node is declared in, the way `skip` matches a file, and a requirement a skipped file only
 mentions keeps the rows its own document gives it. Its rows are not counted as owed, so the MCP
-`status` tool does not report them, and the next writer — `update`, `embed`, `build`, `watch`, or a
+`status` tool does not report them, and the next writer — `update`, `embed`, `build`, or a
 reader catching up a moved graph — drops any it already held. Changing the key moves only those
 files' rows: every other row is matched by hash and kept, so adding a glob embeds nothing and
 removing one embeds that file's rows alone. A glob that does not parse is an error naming the file,
@@ -236,7 +236,7 @@ store is behind. Nothing is written to the repository.
 
 An `update` whose documents gained or lost a family says so — `families: +REQ`, `families: -AC` —
 and re-reads nothing else: the one file that changed is read, and the citations the graph was
-holding for the new family are released where they lie. A resident `serve` or `watch` says the same
+holding for the new family are released where they lie. A resident `serve` says the same
 on the poll that applies it, and `ask`'s own refresh never costs a pass over the whole corpus. A
 `zerograph.toml` still naming `id_families` parses, gets one line on stderr, and is otherwise
 unaffected.
@@ -244,8 +244,8 @@ unaffected.
 ## Resources
 
 Every reader costs a fraction of a second and the model it opened. The one command that can take a
-machine over is a writer that has to embed a store whole — `build`, `update`, `embed` or
-`watch` on rows another model wrote. One word bounds it:
+machine over is a writer that has to embed a store whole — `build`, `update` or `embed`
+on rows another model wrote. One word bounds it:
 
 | `resources` | threads | `build` wall | `update` wall | peak CPU (mean), any phase | peak RSS |
 | --- | --- | --- | --- | --- | --- |

@@ -40,9 +40,9 @@ pub(crate) fn read(sibling: &Path, model: &str) -> Option<DenseIndex> {
 }
 
 fn read_locked(dir: &Path, store: &Store, model: &str) -> Option<DenseIndex> {
-    // `embed` and `watch` save without the writer lock, and a save renames the rows in before the
-    // metadata: rows newer than their metadata are a save caught halfway, whose offsets the
-    // metadata may no longer describe.
+    // A sibling built by an older release may have saved without the writer lock, and a save
+    // renames the rows in before the metadata: rows newer than their metadata are a save caught
+    // halfway, whose offsets the metadata may no longer describe.
     let written = || -> Option<_> {
         let at = |name: &str| std::fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok();
         Some((at("vectors.f32")?, at("vectors.json")?))

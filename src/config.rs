@@ -49,8 +49,8 @@ pub struct Config {
     /// Directory holding `model.onnx` and `tokenizer.json` for `ask --rerank-local`; empty
     /// means `~/.cache/zerograph/reranker`.
     pub reranker_dir: String,
-    /// Hub id of the model the vectors are written with. `build`, `update`, `embed`
-    /// and `watch` embed with it and rewrite the index whole when the store holds another
+    /// Hub id of the model the vectors are written with. `build`, `update` and
+    /// `embed` embed with it and rewrite the index whole when the store holds another
     /// model's rows; `ask`, `bench` and `dump` open the model the store records instead, so a
     /// store keeps answering with what wrote it whatever this says today. The small model is the
     /// default, priced for a first build nobody has tuned yet, and the only model `bench` holds

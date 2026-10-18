@@ -50,6 +50,9 @@ pub struct DenseIndex {
     /// The width `written_by` claimed. A cold index has no width until its first chunk is
     /// embedded, and a borrowed row has to be checked against one before that.
     #[serde(skip)] claimed_dim: usize,
+    /// Set by `borrow_owed`, so the sync that follows it does not read the siblings a second
+    /// time for rows they were just asked for and did not hold.
+    #[serde(skip)] borrowed: bool,
 }
 
 /// Every text embedded for a node, e5-prefixed. A file has no passage row — its head comment is
@@ -173,6 +176,7 @@ pub struct ChunkBudget { pub chars: usize, pub max_rows: usize, pub ramp: usize 
 
 impl ChunkBudget {
     /// A fixed number of rows and no ramp: what a test or a one-chunk sync asks for.
+    #[cfg(test)]
     pub const fn rows(n: usize) -> Self { ChunkBudget { chars: usize::MAX, max_rows: n, ramp: 1 } }
 }
 
@@ -204,8 +208,8 @@ impl DenseIndex {
     }
 
     /// The model a store's rows belong to, read from `vectors.json` without loading the rows —
-    /// what a reader opens. The configured model takes effect at the next `build`, `update`,
-    /// `embed` or `watch`, which rewrites the index whole.
+    /// what a reader opens. The configured model takes effect at the next `build`, `update`
+    /// or `embed`, which rewrites the index whole.
     pub fn recorded_model(store: &Store) -> Result<Option<String>> {
         #[derive(serde::Deserialize)]
         struct Written { #[serde(default)] model: String }
@@ -311,6 +315,8 @@ impl DenseIndex {
             store.write_atomic("vectors.f32", &le_bytes(&self.vectors))?;
         }
         self.persisted = self.ids.len();
+        // What was borrowed is saved now; a later sync asks the siblings again.
+        self.borrowed = false;
         self.stamp = store.stamp("vectors.f32");
         store.write_atomic("vectors.json", &serde_json::to_vec(self)?)
     }
@@ -326,12 +332,52 @@ impl DenseIndex {
             .sum()
     }
 
+    /// The rows the sibling worktrees can lend this graph, taken in before anything counts what is
+    /// owed: a borrowed row costs a read, not an embed, and counted as owed it would send a reader
+    /// over its budget to a detached refresh, or put a meter's total above the work. The rows
+    /// join the index as live rows, which the sync after this matches by hash and keeps. Returns
+    /// how many were taken.
+    pub fn borrow_owed(&mut self, graph: &Graph, skip: &EmbedSkip) -> usize {
+        let held: std::collections::HashSet<(String, String)> = match self.dim {
+            0 => Default::default(),
+            _ => self.live.iter().map(|&i| (self.ids[i].clone(), self.hashes[i].clone())).collect(),
+        };
+        // Once per pair: the sync after this keeps one row per (id, hash) and would leave a
+        // second copy as a hole.
+        let mut todo = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for n in graph.nodes.values() {
+            for text in skip.rows(n) {
+                let pair = (n.id.clone(), blake3::hash(text.as_bytes()).to_hex().to_string());
+                if !held.contains(&pair) && seen.insert(pair.clone()) { todo.push(pair); }
+            }
+        }
+        let hashes: Vec<String> = todo.iter().map(|(_, h)| h.clone()).collect();
+        let lent = self.borrow(&hashes);
+        self.borrowed = true;
+        if lent.is_empty() { return 0; }
+        if self.dim == 0 { self.ids.clear(); self.hashes.clear(); self.kinds.clear(); self.vectors.clear(); self.free.clear(); self.persisted = 0; }
+        self.dim = self.claimed_dim;
+        let mut taken = 0;
+        for (id, hash) in todo {
+            let Some(v) = lent.get(hash.as_str()) else { continue };
+            self.ids.push(id);
+            self.hashes.push(hash);
+            self.kinds.push(false);
+            self.vectors.extend_from_slice(v);
+            taken += 1;
+        }
+        self.reindex();
+        taken
+    }
+
     /// The index in hand made searchable again after a sync its callback stopped: the rows that
     /// sync appended join the scan beside the ones they will replace, which is the state a
     /// checkpoint saved to disk loads into. Without it a resident reader would scan only the old
     /// rows, and its next sync, matching against those alone, would embed the new ones twice.
-    pub fn checkpointed(&mut self) { self.reindex(); }
+    pub fn checkpointed(&mut self) { self.borrowed = false; self.reindex(); }
 
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub fn sync(&mut self, graph: &Graph, skip: &EmbedSkip, embed: &mut dyn FnMut(&[String]) -> Result<Vec<Vec<f32>>>) -> Result<usize> {
         self.sync_chunked(graph, skip, embed, ChunkBudget::rows(usize::MAX), &mut |_, _| Ok(()))
@@ -376,7 +422,10 @@ impl DenseIndex {
                 }
             }
         }
-        let lent = self.borrow(&todo_hashes);
+        let lent = match std::mem::take(&mut self.borrowed) {
+            true => Default::default(),
+            false => self.borrow(&todo_hashes),
+        };
         if !lent.is_empty() {
             // A cold index learns its width here rather than from a first chunk; a warm one already
             // has this width, since `written_by` dropped rows of any other.
@@ -1046,6 +1095,23 @@ mod tests {
         normalise(&mut lent);
         assert_eq!(row("FR-PAY-26"), lent, "the sibling's own vector, not a fresh embed");
         assert_eq!(listing(&main), before, "nothing in the sibling's store is created or touched");
+    }
+
+    #[test]
+    fn rows_a_sibling_can_lend_are_not_counted_as_owed_once_borrowed() {
+        let (_root, main, other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", constant);
+        let g = graph("отмена другая");
+        let mut idx = DenseIndex::load(&Store::new(&other)).unwrap();
+        idx.written_by("m", 3);
+        assert_eq!(idx.owed(&g, &EmbedSkip::default()), 2, "before the borrow every row is owed");
+        assert_eq!(idx.borrow_owed(&g, &EmbedSkip::default()), 1);
+        assert_eq!(idx.owed(&g, &EmbedSkip::default()), 1, "only the row no sibling holds");
+        let mut seen = Vec::new();
+        let n = idx.sync(&g, &EmbedSkip::default(), &mut |t| { seen.extend_from_slice(t); fake(t) }).unwrap();
+        assert_eq!((n, seen.len()), (1, 1), "the sync embeds exactly what the count said");
+        assert_eq!(idx.owed(&g, &EmbedSkip::default()), 0);
+        assert_eq!(idx.live.len(), 2, "the borrowed row is kept, not duplicated");
     }
 
     #[test]

@@ -3,7 +3,6 @@
 # A store built under the old name, which stays until a write moves it to .zerograph.
 /.repograph
 /.superpowers
-/.fastembed_cache
 /dist
 /npm/zerograph/bin/*/
 # Cut from the root README by scripts/npm-pack.sh.

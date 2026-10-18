@@ -102,7 +102,7 @@ enum Cmd {
     },
     /// Answers `ask` from a resident process over a socket in `~/.cache/zerograph/sock`: the
     /// model, the vectors and the indexes open once. Refreshes before every answer the way `ask`
-    /// does, polls between them like `watch`, exits after `--idle` seconds without a question.
+    /// does, polls the tree between them, exits after `--idle` seconds without a question.
     Serve {
         #[arg(long, default_value_t = 30)] every: u64,
         #[arg(long, default_value_t = 1)] batch: usize,
@@ -123,17 +123,6 @@ enum Cmd {
         /// Prints the refresh line each time it moves until the running refresh ends, then its
         /// last line; fails when that line is an error.
         #[arg(long)] follow: bool,
-    },
-    /// Keeps the store in step with the tree for readers that do not refresh themselves —
-    /// editors, MCP servers. Polls, applies the same incremental update `ask` does, and embeds
-    /// what changed, at background priority. Ctrl-C stops it; every write is a rename, so there is
-    /// nothing to clean up.
-    Watch {
-        /// Seconds between polls.
-        #[arg(long, default_value_t = 30)] every: u64,
-        /// Files that have to be waiting before a poll refreshes; a smaller number of them is
-        /// carried to the next poll instead, at most three times in a row.
-        #[arg(long, default_value_t = 1)] batch: usize,
     },
     Explain {
         node: String,
@@ -250,7 +239,7 @@ impl Cmd {
             | Cmd::Prime { json, .. } | Cmd::Status { json, .. } | Cmd::Families { json, .. } | Cmd::Model { json, .. } => *json,
             // Listed rather than `_`, so a command that gains `--json` fails to compile here
             // until its errors are given the JSON form too.
-            Cmd::Build | Cmd::Update { .. } | Cmd::Serve { .. } | Cmd::Stop | Cmd::Watch { .. }
+            Cmd::Build | Cmd::Update { .. } | Cmd::Serve { .. } | Cmd::Stop
             | Cmd::InstallAgent { .. } | Cmd::Embed | Cmd::Bench { .. } | Cmd::Dump { .. }
             | Cmd::ImportLegacy { .. } | Cmd::Mcp => false,
         }
@@ -484,7 +473,7 @@ fn refresh_now(pending: usize, batch: usize, deferred: u32) -> bool {
     pending > 0 && (pending >= batch || deferred >= MAX_DEFERRALS)
 }
 
-pub(crate) enum Polled { Quiet, Deferred { pending: usize }, Refreshed(UpdateReport) }
+pub(crate) enum Polled { Quiet, Deferred, Busy { pending: usize }, Refreshed(UpdateReport) }
 
 impl<'a> Watcher<'a> {
     fn open(repo: &'a std::path::Path, cfg: &'a config::Config) -> anyhow::Result<Watcher<'a>> {
@@ -514,10 +503,38 @@ impl<'a> Watcher<'a> {
         Ok(true)
     }
 
+    /// A cycle another refresh holds the lock for: the store read back as the holder last saved
+    /// it and the files the tree is ahead of that counted, with nothing written — what a one-shot
+    /// `ask` that finds the lock held answers from, and says.
+    fn behind_holder(&mut self) -> anyhow::Result<Polled> {
+        self.reloaded = self.reload_if_moved()?;
+        if self.manifest.newer_grammar() { return Ok(Polled::Quiet); }
+        let entries = walk::walk(self.repo, self.cfg, &self.manifest)?;
+        let diff = self.manifest.diff(&entries);
+        Ok(Polled::Busy { pending: diff.changed.len() + diff.removed.len() })
+    }
+
     /// Whatever the tree has moved since the last poll, applied and saved once `batch` files are
     /// waiting. An `ask` or an `update` writing the store meanwhile is picked up rather than
     /// overwritten, which is why the manifest stamp is checked before the graph in hand is used.
+    ///
+    /// A poll is a writer, so it holds the writer lock from before the reload to its end. A poll
+    /// that finds the lock held writes nothing that cycle: the holder is a refresh writing this
+    /// store, and the poll only reads back what it has saved so far.
     fn poll(&mut self, batch: usize) -> anyhow::Result<Polled> {
+        self.reloaded = false;
+        // The last poll's manifest, so a newer release that wrote since is caught only by the
+        // check after the reload; this one keeps a store already known to be newer free of even
+        // the lock file.
+        if self.manifest.newer_grammar() { return Ok(Polled::Quiet); }
+        let _lock = match self.store.try_lock_writer() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => return self.behind_holder(),
+            Err(_) if self.store.has_link() => return Ok(Polled::Quiet),
+            // A store that cannot be locked at all — a read-only checkout — is polled as it
+            // always was, and a write that fails says so.
+            Err(_) => None,
+        };
         self.reloaded = self.reload_if_moved()?;
         // Read-only for as long as a newer release's store stands here: nothing to walk for.
         if self.manifest.newer_grammar() { return Ok(Polled::Quiet); }
@@ -534,7 +551,7 @@ impl<'a> Watcher<'a> {
                 self.manifest = walk::Manifest::from_entries(&entries);
                 self.seen = self.store.stamp("manifest.json");
             }
-            return Ok(if pending > 0 { Polled::Deferred { pending } } else { Polled::Quiet });
+            return Ok(if pending > 0 { Polled::Deferred } else { Polled::Quiet });
         }
         self.deferred = 0;
         // The resolver learns a family's files in its walk, so one built at `open` cannot resolve to
@@ -575,44 +592,15 @@ impl<'a> Watcher<'a> {
     }
 }
 
-/// Keeps the store in step with the tree for readers that do not refresh themselves.
-fn run_watch(repo: &std::path::Path, cfg: &config::Config, every: u64, batch: usize, no_dense: bool) -> anyhow::Result<()> {
-    let mut w = Watcher::open(repo, cfg)?;
-    let model = index::embed::writer_model(&cfg.embed_model);
-    let threads = index::embed::threads(cfg.resources);
-    let skip = index::dense::EmbedSkip::new(&cfg.embed_skip)?;
-    let verbose = ask::timing_on();
-    eprintln!("watch: {} every {every}s, batch {batch}; Ctrl-C to stop", repo.display());
-    if w.manifest.newer_grammar() { eprintln!("{}", w.manifest.newer_store_line()); }
-    loop {
-        let t = std::time::Instant::now();
-        match w.poll(batch)? {
-            Polled::Quiet => {}
-            Polled::Deferred { pending } => {
-                if verbose { eprintln!("watch: {pending} of {batch} pending, deferred {} of {MAX_DEFERRALS}", w.deferred); }
-            }
-            Polled::Refreshed(r) => {
-                let mut embedded = 0;
-                // Opened for this refresh and dropped with it. A watcher is idle between polls and
-                // nobody is waiting on one, so the half-second the model takes to open is not a
-                // cost anyone can see — while the 1.4 GB it holds is the whole of what `watch`
-                // takes from a person on a 16 GB laptop, and it used to hold it until exit.
-                if let Some(mut e) = ask::open_embedder(no_dense, &model, threads, index::embed::Weights::Mapped) {
-                    let mut idx = index::dense::DenseIndex::load(&w.store)?;
-                    idx.written_by(&model, e.dim()?);
-                    embedded = idx.sync(&w.graph, &skip, &mut |texts| e.embed(texts))?;
-                    idx.synced_against(w.graph_at);
-                    // Saved with nothing embedded as well: the refresh moved the graph, and the
-                    // claim is what tells the next reader it owes no rows.
-                    idx.save(&w.store)?;
-                }
-                println!("refresh: {} changed, {} removed, {} nodes, {} edges, {embedded} vectors in {:.1}s",
-                    r.changed, r.removed, r.nodes, r.edges, t.elapsed().as_secs_f32());
-                use std::io::Write;
-                std::io::stdout().flush()?;
-            }
+/// The writer lock for a command someone is waiting on: taken at once when it is free, else
+/// waited for, with a line saying why nothing is happening yet.
+fn wait_for_writer(store: &store::Store, who: &str) -> anyhow::Result<store::WriterLock> {
+    match store.try_lock_writer()? {
+        Some(lock) => Ok(lock),
+        None => {
+            eprintln!("{who}: waiting for the refresh already running");
+            store.lock_writer()
         }
-        std::thread::sleep(std::time::Duration::from_secs(every));
     }
 }
 
@@ -687,6 +675,8 @@ fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense
     let (graph, _) = store.load()?;
     let mut dense = index::dense::DenseIndex::load(&store)?;
     dense.written_by(model, dim);
+    // Borrowed before the count, so the meter's total is the rows this run embeds.
+    dense.borrow_owed(&graph, skip);
     let mut meter = Meter::new(dense.owed(&graph, skip));
     let n = dense.sync_chunked(&graph, skip, &mut |texts| embed(texts, &mut |k| meter.add(k)), SYNC_CHUNK, &mut |idx, _| idx.save(&store))?;
     dense.synced_against(graph_at);
@@ -748,8 +738,8 @@ fn model_report(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<
         out.push_str(&format!("\nThe store names a model this machine has not trusted, so readers answer lexical-only\nuntil it is trusted or the store is re-embedded with {} — {}.\n", cfg.embed_model, config::trust_hint(m)));
     } else if recorded.as_deref().is_some_and(|m| !m.eq_ignore_ascii_case(&cfg.embed_model)) {
         out.push_str(&format!("\nThe two disagree. The store keeps answering with the model that wrote it; the\n\
-            configured one takes effect at the next `build`, `update`, `embed` or\n\
-            `watch` (an `ask` starts one when {} names the model), which drops\n\
+            configured one takes effect at the next `build`, `update` or `embed`\n\
+            (an `ask` starts one when {} names the model), which drops\n\
             every row the other model wrote and rewrites the index whole.\n", config::project_file_name(repo)));
     }
     out.push('\n');
@@ -1013,7 +1003,7 @@ pub fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     // First of all, before anything here starts a thread that would keep the old priority.
-    if cli.background || matches!(cli.cmd, Cmd::Watch { .. }) { priority::background_process(); }
+    if cli.background { priority::background_process(); }
     let repo = match &cli.repo {
         Some(repo) => plain(repo.canonicalize()?),
         None => repo_root(&std::env::current_dir()?.canonicalize()?),
@@ -1034,14 +1024,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cap_pools(index::embed::threads(cfg.resources));
             // Held to the end of the embed: a reader that finds it held answers from the store as
             // it stands rather than racing this process to the same rows.
-            let store = store::Store::new(&repo);
-            let _lock = match store.try_lock_writer()? {
-                Some(lock) => lock,
-                None => {
-                    eprintln!("update: waiting for the refresh already running");
-                    store.lock_writer()?
-                }
-            };
+            let _lock = wait_for_writer(&store::Store::new(&repo), "update")?;
             eprintln!("{}", refresh::RUN_MARKER);
             let r = run_update(&repo, &cfg, wipe)?;
             println!("changed {} removed {} nodes {} edges {}", r.changed, r.removed, r.nodes, r.edges);
@@ -1059,14 +1042,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // `build` it writes a `vectors.*` pair that makes `DenseIndex::present` true over
             // no rows. `build` and `update` over a tree that yields nothing keep
             // writing their empty graph and exiting 0.
-            let (graph, _) = store::Store::new(&repo).load()?;
-            if graph.nodes.is_empty() { anyhow::bail!("graph is empty — run `zerograph build`"); }
+            let store = store::Store::new(&repo);
+            if store.load()?.0.nodes.is_empty() { anyhow::bail!("graph is empty — run `zerograph build`"); }
             if cli.no_dense {
                 // Otherwise this exits 0 having printed nothing at all, which reads exactly
                 // like an embed that found every row already in place.
                 println!("dense: nothing embedded, --no-dense is set");
                 Ok(())
             } else {
+                // After the check above, which must not create the store a missing build leaves
+                // absent: taking the lock makes the directory.
+                let _lock = wait_for_writer(&store, "embed")?;
                 embed_all(&repo, cli.no_dense, &cfg)
             }
         }
@@ -1077,6 +1063,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None if json => { print!("{}", model_json(&repo, &cfg)?); Ok(()) }
                 None => { print!("{}", model_report(&repo, &cfg)?); Ok(()) }
                 Some(id) => {
+                    // Before the model is fetched, not after: the switch rewrites every row, and
+                    // a reader or `status` should see it running from the start. Not where there
+                    // is no store — taking the lock would make one, and a switch that fails must
+                    // leave the project as it was — nor for `--no-embed`, which writes none.
+                    let store = store::Store::new(&repo);
+                    let _lock = match !no_embed && store.stands() {
+                        true => Some(wait_for_writer(&store, "model")?),
+                        false => None,
+                    };
                     eprintln!("{}", refresh::RUN_MARKER);
                     switch_model(&repo, &cfg, &id, no_embed, cli.no_dense).map(|()| eprintln!("{}", refresh::RUN_FINISHED))
                 }
@@ -1137,11 +1132,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = load_cfg()?;
             cap_pools(index::embed::threads(cfg.resources));
             serve::run(&repo, &cfg, every, batch, idle, idle_model, cli.no_dense)
-        }
-        Cmd::Watch { every, batch } => {
-            let cfg = load_cfg()?;
-            cap_pools(index::embed::threads(cfg.resources));
-            run_watch(&repo, &cfg, every, batch, cli.no_dense)
         }
         Cmd::Explain { node, json, stale } => {
             let (graph, behind) = graph_for(&repo, &load_cfg()?, stale, cli.no_dense)?;
@@ -1783,6 +1773,38 @@ mod tests {
     }
 
     #[test]
+    fn a_waiting_writer_takes_the_lock_once_the_holder_lets_go() {
+        let dir = tempfile::tempdir().unwrap();
+        let held = store::Store::new(dir.path()).try_lock_writer().unwrap().expect("nobody holds it yet");
+        let repo = dir.path().to_path_buf();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let _lock = wait_for_writer(&store::Store::new(&repo), "embed").unwrap();
+            tx.send(()).unwrap();
+        });
+        assert!(rx.recv_timeout(std::time::Duration::from_millis(300)).is_err(), "it waits while the lock is held");
+        drop(held);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).expect("and takes it once it is free");
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn a_poll_skips_its_cycle_while_a_refresh_holds_the_writer_lock() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        built(repo, &cfg);
+        let mut w = Watcher::open(repo, &cfg).unwrap();
+        std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
+        let before = std::fs::read(repo.join(".zerograph/graph.json")).unwrap();
+        let held = store::Store::new(repo).try_lock_writer().unwrap().expect("nobody holds it yet");
+        assert!(matches!(w.poll(1).unwrap(), Polled::Busy { pending: 1 }), "the edit waits for the holder, and is counted");
+        assert_eq!(std::fs::read(repo.join(".zerograph/graph.json")).unwrap(), before, "nothing was written under the holder");
+        drop(held);
+        let Polled::Refreshed(r) = w.poll(1).unwrap() else { panic!("the edit is refreshed once the lock is free") };
+        assert_eq!((r.changed, r.removed), (1, 0));
+    }
+
+    #[test]
     fn a_watch_poll_resolves_against_a_nested_type_the_edit_added() {
         let dir = tempfile::tempdir().unwrap();
         let repo = dir.path();
@@ -1811,7 +1833,7 @@ mod tests {
         let mut w = Watcher::open(repo, &cfg).unwrap();
         std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
         for _ in 0..MAX_DEFERRALS {
-            assert!(matches!(w.poll(4).unwrap(), Polled::Deferred { pending: 1 }));
+            assert!(matches!(w.poll(4).unwrap(), Polled::Deferred));
         }
         let Polled::Refreshed(r) = w.poll(4).unwrap() else { panic!("the cap releases the edit") };
         assert_eq!((r.changed, r.removed), (1, 0));

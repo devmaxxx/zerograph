@@ -599,13 +599,17 @@ fn log(ctx: &mut ask::Context) {
 /// name: a store some other process wrote, which the poll read back into the watcher. Either
 /// way the watcher now holds a graph the context does not, and only an adopt leaves a reader
 /// where a one-shot `ask` would have been after loading that store from disk.
-fn adopt_if_moved(watcher: &mut crate::Watcher, ctx: &mut ask::Context, batch: usize) -> Result<()> {
-    match watcher.poll(batch)? {
-        crate::Polled::Refreshed(r) => ctx.adopt(watcher, Some(r))?,
-        _ if watcher.reloaded => ctx.adopt(watcher, None)?,
-        _ => {}
-    }
-    Ok(())
+///
+/// Returns the files the tree is ahead of the store by when another refresh held the lock and
+/// this poll could apply none of them.
+fn adopt_if_moved(watcher: &mut crate::Watcher, ctx: &mut ask::Context, batch: usize) -> Result<usize> {
+    let behind = match watcher.poll(batch)? {
+        crate::Polled::Refreshed(r) => { ctx.adopt(watcher, Some(r))?; return Ok(0) }
+        crate::Polled::Busy { pending } => pending,
+        _ => 0,
+    };
+    if watcher.reloaded { ctx.adopt(watcher, None)?; }
+    Ok(behind)
 }
 
 /// The client's hello, or None when the peer was gone before it said anything. A connect that
@@ -687,7 +691,9 @@ fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::
         if watcher.reload_if_moved()? { ctx.adopt(watcher, None)?; }
     } else {
         // The same refresh a one-shot ask does before answering: batch 1 applies any change now.
-        adopt_if_moved(watcher, ctx, 1)?;
+        // A refresh holding the lock is said the way a one-shot that finds it held says it.
+        let behind = adopt_if_moved(watcher, ctx, 1)?;
+        if behind > 0 { ctx.note(format!("{}, a refresh is already running", crate::refresh::files_line(behind))); }
     }
     let answered = ctx.answer(&hello.req);
     // Taken before the `?`: a model command started by an answer that then failed was still paid
