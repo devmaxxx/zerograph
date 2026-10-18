@@ -32,7 +32,7 @@ The other direction is refused. A store a newer release wrote — its manifest n
 this build's — is never re-read and never re-stamped by an older binary, such as a worktree pinned
 to an earlier release: `ask` and the other reads answer from it as it stands, `update` and `build`
 refuse, and each says so in one line naming both generations and the release that wrote it.
-`status` shows the same. The manifest records the writing release from 0.6.5 on; a store written
+`status` shows the same. The manifest records the writing release from 0.7.0 on; a store written
 before that is named by its grammar alone.
 
 ```bash
@@ -115,8 +115,15 @@ inside the checkout: a cloned repository that commits a `zerograph.toml` and an 
 in it. A project-local install (`pnpm add -D zerograph`) puts no `zerograph` on `PATH`, so set
 `ZEROGRAPH_BIN` to its absolute path, written out, in the environment the agent starts from, or
 install globally; without either the hook stays silent. A relative `ZEROGRAPH_BIN`, and a `PATH`
-entry that is relative or lies inside the checkout, are skipped, since each names the checkout's
-own file. The binary is started from its own directory, never the checkout's.
+entry that is relative or lies anywhere inside the checkout, are skipped, since each names the
+checkout's own file. On Windows a `zerograph.exe` anywhere on `PATH` is taken before npm's
+`zerograph.cmd` shim, which only `cmd` can start; when the shim is all there is, a call that runs
+out of time has its whole process tree ended. The binary is started from its own directory, never
+the checkout's.
+
+Inside a git checkout the hook asks about the checkout's top level, as the CLI does without
+`--repo`, whatever subdirectory the session is in; a store an earlier release built in a
+subdirectory is not read. Outside git it takes the nearest directory above that holds an index.
 
 The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
 smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached
