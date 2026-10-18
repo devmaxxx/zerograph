@@ -611,7 +611,7 @@ fn parse_worktrees(porcelain: &str) -> Vec<(PathBuf, bool)> {
 }
 
 fn listed_worktrees(root: &Path) -> Vec<(PathBuf, bool)> {
-    std::process::Command::new("git").arg("-C").arg(root).args(["worktree", "list", "--porcelain"])
+    crate::git_command().arg("-C").arg(root).args(["worktree", "list", "--porcelain"])
         .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
         .filter(|o| o.status.success())
         .map(|o| parse_worktrees(&String::from_utf8_lossy(&o.stdout)))
@@ -794,7 +794,7 @@ pub fn without_git_block(existing: &str) -> Option<String> {
 /// a hook that held nothing else is deleted.
 pub fn retire_git_hooks(root: &Path) -> Report {
     let mut report = Report::default();
-    let git_path = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(root).args(args)
+    let git_path = |args: &[&str]| crate::git_command().arg("-C").arg(root).args(args)
         .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
         .filter(|o| o.status.success())
         .map(|o| root.join(String::from_utf8_lossy(&o.stdout).trim()));
