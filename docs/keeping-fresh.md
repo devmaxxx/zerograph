@@ -106,6 +106,10 @@ The agent's session hook does that job per checkout instead. At SessionStart:
   `ZEROGRAPH_HOOK_SERVE=0` it starts `update --detach` instead, which writes nothing when nothing
   moved.
 
+The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
+smaller value already set): a refresh that would not finish inside that is left to a detached
+`update` rather than killed at the timeout with its work lost.
+
 ### Background priority
 
 The detached `update` that a reader, the session hook or the MCP `reindex` and `switch_model` tools start

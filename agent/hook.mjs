@@ -29,6 +29,13 @@ const SEEDS = 3;
 const LINE_CUT = 160;
 const REMINDER_EVERY = 40;
 const TIMEOUT_MS = 5000;
+/**
+ * The seconds of in-process refresh a call gets, passed as `ZEROGRAPH_READER_BUDGET`. Under the
+ * binary's own 10 s a refresh of 5–10 s was killed at the timeout above with its work lost, and the
+ * next call started it again; at 2 s what does not fit goes to a detached `update`, and the other
+ * 3 s are the process start, the store load, the walk and the answer.
+ */
+const HOOK_BUDGET = 2;
 /** What the autostarted `serve` is told: leave after half an hour unasked, forget the model after five minutes. */
 const SERVE_IDLE = 1800;
 const SERVE_IDLE_MODEL = 300;   // measured on the 33.5k-row copy: 0.08 s resident, 0.77 s after a drop
@@ -130,10 +137,17 @@ function spawnable(bin, args) {
   return { file: `"${bin}"`, args: args.map((a) => `"${a}"`), opts: { shell: true } };
 }
 
+/** `HOOK_BUDGET`, or a smaller whole number of seconds the environment already sets. */
+function readerBudget() {
+  const set = String(env('READER_BUDGET') ?? '').trim();
+  return /^\d+$/.test(set) && Number(set) < HOOK_BUDGET ? set : String(HOOK_BUDGET);
+}
+
 function run(root, args) {
   const { file, args: argv, opts } = spawnable(binary(root), ['--repo', root, '--no-dense', ...args]);
   const r = spawnSync(file, argv, {
-    encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, ...opts,
+    encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget() }, ...opts,
   });
   if (r.status !== 0) debug('exit', r.status, args.join(' '), (r.stderr || '').slice(0, 200));
   // Identifiers and headings in the answer are the repository's text, and it is about to enter an
