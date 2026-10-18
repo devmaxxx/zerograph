@@ -6,6 +6,7 @@
 
 [![npm](https://img.shields.io/npm/v/zerograph?logo=npm)](https://www.npmjs.com/package/zerograph)
 [![CI](https://github.com/devmaxxx/zerograph/actions/workflows/ci.yml/badge.svg)](https://github.com/devmaxxx/zerograph/actions/workflows/ci.yml)
+[![MCP server](https://img.shields.io/badge/MCP-server-blue?logo=modelcontextprotocol)](docs/mcp.md)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Platforms](https://img.shields.io/badge/platforms-macOS%20arm64%20%7C%20Linux%20x64%20%7C%20Windows%20x64-lightgrey)
 
