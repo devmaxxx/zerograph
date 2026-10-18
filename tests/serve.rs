@@ -720,6 +720,9 @@ fn serve_0_6_4(dir: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
         let mut line = String::new();
         let _ = BufReader::new(&s).read_line(&mut line);
         let _ = writeln!(w, "{{\"stopped\":\"0.6.4\"}}");
+        // The exit takes a moment after the confirmation, as a real one does, so `stop` has to
+        // wait for the file rather than find it already gone.
+        std::thread::sleep(Duration::from_millis(300));
         let _ = std::fs::remove_file(&sock);
         let _ = tx.send(line);
     });

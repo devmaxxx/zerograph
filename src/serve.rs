@@ -413,8 +413,9 @@ pub fn stop(repo: &Path) -> Result<bool> {
     Ok(current? | legacy?)
 }
 
-/// The two names coincide only when both fell back to the temp directory, and then the server
-/// there has already been asked.
+/// The two names coincide only when both fell back to the temp directory. That server is the one
+/// at the current name, already asked by `stop` and refused by `serve`'s own probe, and a server
+/// listening there may be this release's.
 fn stop_legacy(repo: &Path) -> Result<bool> {
     let legacy = legacy_socket_path(repo);
     if legacy == socket_path(repo) { return Ok(false); }
@@ -490,14 +491,6 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     // Before the socket is touched: the unlink and the bind below would otherwise act inside
     // whatever directory a clone pointed `.zerograph` at.
     crate::store::Store::new(repo).settle()?;
-    // The old server takes no writer lock, so binding beside it would put two writers on one
-    // store. One that will not leave is reported rather than fatal: refusing to start would leave
-    // the checkout with only that server.
-    match stop_legacy(repo) {
-        Ok(true) => eprintln!("serve: stopped a 0.6.4 server at {}", legacy_socket_path(repo).display()),
-        Ok(false) => {}
-        Err(e) => eprintln!("serve: {e:#}"),
-    }
     let path = socket_path(repo);
     prepare_socket_dir(&path)?;
     if sys::present(&path) && sys::connect(&path).is_ok() { anyhow::bail!("another serve answers at {}", path.display()); }
@@ -511,6 +504,16 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     let _guard = Unlink(path.clone(), sys::id(&path));
     // After the guard exists, so a signal arriving between the two still finds something to run.
     catch_termination();
+    // The old server takes no writer lock, so it has to be gone before the watcher below writes.
+    // After the bind, because a busy one reads the stop line only once its rerank is done, and
+    // `--detach` gives up on a socket that has not answered within `DETACH_WAIT`. One that will
+    // not leave is reported rather than fatal: refusing to start would leave the checkout with
+    // only that server.
+    match stop_legacy(repo) {
+        Ok(true) => eprintln!("serve: stopped a 0.6.4 server at {}", legacy_socket_path(repo).display()),
+        Ok(false) => {}
+        Err(e) => eprintln!("serve: {e:#}"),
+    }
     // The accept blocks on a thread of its own and hands each connection over, one at a time —
     // the answer still happens here, on the one thread that holds the context. A rendezvous
     // channel is what keeps it to one: the next connection is accepted but not delivered until
@@ -844,7 +847,7 @@ mod tests {
     #[test]
     fn the_socket_a_0_6_4_server_bound_is_where_that_release_put_it() {
         let shallow = std::path::Path::new("/tmp/r");
-        assert_eq!(super::legacy_socket_path(shallow), crate::store::dir_of(shallow).join("serve.sock"));
+        assert_eq!(super::legacy_socket_path(shallow), std::path::Path::new("/tmp/r/.zerograph/serve.sock"));
         let deep = std::path::Path::new("/tmp").join("a".repeat(120));
         let p = super::legacy_socket_path(&deep);
         assert_eq!(p.parent().unwrap(), super::fallback_dir(), "{}", p.display());

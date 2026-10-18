@@ -69,11 +69,14 @@ bound itself — told from a replacement's by device and inode on unix, by NTFS'
 number on Windows.
 
 **Upgrading from 0.6.4 or earlier.** A server started by zerograph 0.6.4 or earlier listens at the
-old place — `.zerograph/serve.sock`, or the temporary directory for a deep checkout — where no
+old place — `.zerograph/serve.sock`, or `$TMPDIR/zerograph-<uid>/` for a deep checkout — where no
 client of a newer release looks, and it writes without the writer lock. So `zerograph stop` sends
-the stop line to the old place as well as the new one, and a new `serve` does the same before it
-binds, printing `serve: stopped a 0.6.4 server at <path>` when one answered there. Until either
-runs, `ask` answers in its own process and the old server leaves at its own `--idle` timeout.
+the stop line to the old place as well as the new one, and a new `serve` does the same as soon as
+it binds, printing `serve: stopped a 0.6.4 server at <path>` when one answered there. A busy old
+server reads the line once its current answer is done. One that does not leave is named on the
+new server's stderr, and the new server runs beside it: end the old process by hand. Until either
+command runs, `ask` answers in its own process and the old server leaves at its own `--idle`
+timeout.
 
 The socket name is bounded by the platform's own limit — 104 bytes on macOS, 108 elsewhere — so
 only a very deep home directory reaches the fallback; the arithmetic of a deep Windows path, and the check that a resident
