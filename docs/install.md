@@ -99,7 +99,7 @@ and whether `serve` answers. `/zerograph` prints the full `zerograph status` rep
 a Claude Code prompt:
 
 ```
-/plugin install zerograph-status --marketplace devmaxxx/zerograph
+/plugin install zerograph --marketplace devmaxxx/zerograph
 ```
 
 It asks `zerograph` on `PATH`, then the project's `node_modules/.bin`, then `target/release` and

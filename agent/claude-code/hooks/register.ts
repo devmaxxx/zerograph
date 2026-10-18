@@ -7,7 +7,7 @@ import { lineOf, readRun, type Report } from './parse'
 const POLL_MS = 10_000
 const SHOWN_LINES = 15
 
-const report = atom({ plugin: 'zerograph-status', key: 'report' } as const, null)
+const report = atom({ plugin: 'zerograph', key: 'report' } as const, null)
 
 type Api = Parameters<Hook<'session.start'>>[0]
 

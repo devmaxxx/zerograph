@@ -11,6 +11,6 @@ export type Report = {
 
 declare module 'claude-code' {
   interface PluginState {
-    'zerograph-status': { report: Report | null }
+    'zerograph': { report: Report | null }
   }
 }

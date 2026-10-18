@@ -48,7 +48,7 @@ takes `--claude`, `--codex`, `--cursor`, `--copilot`, `--gemini` or `--opencode`
 
 - On Windows: [Windows notes](docs/install.md#windows-notes).
 - In Claude Code, the index's state can sit under the prompt:
-  `/plugin install zerograph-status --marketplace devmaxxx/zerograph`
+  `/plugin install zerograph --marketplace devmaxxx/zerograph`
   ([Claude Code status mod](docs/install.md#claude-code-status-mod)).
 - Upgrading from repograph: the old store, config and variables are read where they are, see
   [coming from repograph](docs/install.md#coming-from-repograph).

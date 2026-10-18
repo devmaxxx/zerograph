@@ -1,5 +1,5 @@
 {
-  "name": "zerograph-status",
+  "name": "zerograph",
   "version": "0.1.0",
   "description": "zerograph's state at the end of the prompt's hint line: refresh progress, files behind, serve and warnings",
   "author": {

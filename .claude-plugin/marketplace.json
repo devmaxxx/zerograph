@@ -6,7 +6,7 @@
   },
   "plugins": [
     {
-      "name": "zerograph-status",
+      "name": "zerograph",
       "source": "./agent/claude-code"
     }
   ]
