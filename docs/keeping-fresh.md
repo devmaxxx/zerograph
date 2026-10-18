@@ -82,7 +82,10 @@ dense: borrowed 5119 rows from /work/zerograph
 ```
 
 A sibling is read under its writer lock and left untouched: one that is refreshing, has no lock
-file, or holds a torn pair is skipped. A borrowed vector is the one this checkout would have
+file, or holds a torn pair is skipped. Its `vectors.json` is read first, and its rows only when
+that names one of the rows wanted; a sibling that held none is remembered against its rows' stamp
+for the life of the process, so the rows of a fresh edit, which no sibling has, cost no further
+read on each answer after it. A borrowed vector is the one this checkout would have
 embedded up to the last digits — batch padding makes two embeds of the same text near-identical,
 not bit-identical — so answers do not move. There is no switch: a repository with one checkout, or
 siblings on another model, simply embeds everything.
@@ -105,6 +108,15 @@ The agent's session hook does that job per checkout instead. At SessionStart:
 - **An index** — it starts the resident `serve`, which catches the store up as it starts; with
   `ZEROGRAPH_HOOK_SERVE=0` it starts `update --detach` instead, which writes nothing when nothing
   moved.
+
+The hook runs the binary `ZEROGRAPH_BIN` names, else the `zerograph` on `PATH`, and never one
+inside the checkout: a cloned repository that commits a `zerograph.toml` and an executable
+`node_modules/.bin/zerograph` would otherwise have that file started as soon as a session opened
+in it. A project-local install (`pnpm add -D zerograph`) puts no `zerograph` on `PATH`, so set
+`ZEROGRAPH_BIN` to its absolute path, written out, in the environment the agent starts from, or
+install globally; without either the hook stays silent. A relative `ZEROGRAPH_BIN`, and a `PATH`
+entry that is relative or lies inside the checkout, are skipped, since each names the checkout's
+own file. The binary is started from its own directory, never the checkout's.
 
 The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
 smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached

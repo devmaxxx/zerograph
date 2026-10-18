@@ -6,6 +6,13 @@ npm install -g zerograph           # or globally; pnpm add -g zerograph works th
 cargo install --path .             # from source; Rust 1.98, pinned in rust-toolchain.toml
 ```
 
+The session hooks `install-agent` writes run the `zerograph` on `PATH` and never one inside the
+checkout, so a global install is the simplest route. With only a project-local install (`pnpm add
+-D`), set `ZEROGRAPH_BIN` to that binary's absolute path, written out
+(`export ZEROGRAPH_BIN=/home/me/work/app/node_modules/.bin/zerograph`). A relative path is ignored,
+and `$PWD` in a shell profile names whichever checkout a shell opens in, so a cloned repository
+would supply the binary again. See [the session hook](keeping-fresh.md#the-session-hook).
+
 npm is the recommended route on every platform: it carries a provenance attestation, and on
 Windows it never meets SmartScreen (see [Windows notes](#windows-notes)).
 
@@ -102,8 +109,10 @@ the full `zerograph status` report. Install it at a Claude Code prompt:
 /plugin install zerograph --marketplace devmaxxx/zerograph
 ```
 
-It asks `zerograph` on `PATH`, then the project's `node_modules/.bin`, then `target/release` and
-`target/debug`; the `binary` option in `/config` names another one. A zerograph without `status`
+It asks the `zerograph` on `PATH` by its absolute path, and never a binary inside the project: a
+cloned repository that ships `node_modules/.bin/zerograph` or `target/*/zerograph` does not get it
+run, whether `PATH` names that directory relatively or absolutely. For a project-local install,
+name its absolute path in the `binary` option in `/config`; a relative one is ignored. A zerograph without `status`
 shows nothing on the line, and `/zerograph` falls back to the tail of `background.log`.
 
 `zerograph status --json` walks the whole tree to count the files behind, so the mod runs it at

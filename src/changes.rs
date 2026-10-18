@@ -210,13 +210,7 @@ pub fn render_json(graph: &Graph, r: &Report) -> String {
 }
 
 pub(crate) fn git(repo: &Path, args: &[&str]) -> anyhow::Result<String> {
-    // A hook exports its own repository into everything it runs, and those variables outrank
-    // `-C` — including the object store, which would otherwise take this repository's writes.
-    // The repository named by `--repo` is the one that was asked for.
-    let out = std::process::Command::new("git").arg("-C").arg(repo)
-        .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR").env_remove("GIT_OBJECT_DIRECTORY")
-        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    let out = crate::git_command().arg("-C").arg(repo)
         // `core.quotepath` is on by default, and it C-escapes every path with a byte outside
         // ASCII and puts the opening quote *before* the `b/` — a `+++` header `parse` reads no
         // name from, which drops the file's hunks in silence, and an `ls-files` name that matches
@@ -509,10 +503,7 @@ mod tests {
     }
 
     fn git_in(repo: &Path, args: &[&str]) {
-        let out = std::process::Command::new("git").arg("-C").arg(repo)
-            .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").env_remove("GIT_INDEX_FILE")
-            .env_remove("GIT_COMMON_DIR").env_remove("GIT_OBJECT_DIRECTORY")
-            .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        let out = crate::git_command().arg("-C").arg(repo)
             .args(args).output().unwrap_or_else(|e| panic!("git {args:?}: {e}"));
         assert!(out.status.success(), "git {}: {}", args.join(" "), String::from_utf8_lossy(&out.stderr));
     }

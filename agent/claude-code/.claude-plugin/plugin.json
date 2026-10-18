@@ -10,7 +10,7 @@
     "binary": {
       "type": "string",
       "title": "zerograph binary",
-      "description": "Command or absolute path of the zerograph to ask. Empty tries zerograph on PATH, then node_modules/.bin, then target/release and target/debug of the project.",
+      "description": "Absolute path of the zerograph to ask; a relative one is ignored. Empty asks the zerograph on PATH outside the project, so a binary inside the project runs only when named here.",
       "default": ""
     }
   }

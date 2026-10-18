@@ -107,12 +107,20 @@ pub(crate) enum Writer {
     PerAnswer,
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Runs once between the reader's load and its lock: the window another release's save can
+    /// land in, which no test could otherwise hit.
+    pub(crate) static BEFORE_LOCK: RefCell<Option<Box<dyn FnOnce()>>> = RefCell::new(None);
+}
+
 /// The stored graph brought in line with the working tree when that fits `budget`, plus what it
 /// cost. `ask` runs this before answering so an edit never has to be followed by an `update`; the
 /// extractors are built only when there is something to re-read. A refresh over budget is left
 /// to a detached `update`, and the stored graph answers.
 pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::Store, stale: bool, timing: &Timing, budget: &refresh::Budget) -> anyhow::Result<Read> {
-    let (mut graph, manifest, source) = store.load_traced()?;
+    let seen = store.stamp("manifest.json");
+    let (mut graph, mut manifest, mut source) = store.load_traced()?;
     timing.stage("graph loaded");
     // Before the lock: taking it writes into the store, and this build may write nothing into a
     // newer one.
@@ -126,12 +134,22 @@ pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::St
         return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::Barred, note: Some(note) });
     }
     if stale { return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::PerAnswer, note: None }); }
+    #[cfg(test)]
+    BEFORE_LOCK.with(|h| h.borrow_mut().take().map(|f| f()));
     let writer = match store.try_lock_writer() {
         Ok(Some(lock)) => Writer::Held(lock),
         Ok(None) => Writer::Barred,
         Err(_) if store.has_link() => Writer::Barred,
         Err(_) => Writer::Unlocked,
     };
+    // A newer release's save can land between the load above and the lock; read past it, this
+    // build's grammar would be stamped over that store by the refresh or the stamps below.
+    if matches!(writer, Writer::Held(_)) && store.stamp("manifest.json") != seen {
+        (graph, manifest, source) = store.load_traced()?;
+        if manifest.newer_grammar() {
+            return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::Barred, note: Some(manifest.newer_store_line()) });
+        }
+    }
     let linked = matches!(writer, Writer::Barred) && store.has_link();
     let entries = walk::walk(repo, cfg, &manifest)?;
     let diff = manifest.diff(&entries);
@@ -389,7 +407,9 @@ impl Context {
                         let width = qvec.as_ref().map_or(idx.dim, |v| v.len());
                         idx.written_by(emb.name(), width);
                         let budget = budget.get();
-                        // Borrowed first, so the budget weighs only the rows that must be embedded.
+                        // Borrowed first, so the budget weighs only the rows that must be embedded. The
+                        // deadline was set when the request began, so the borrow's time is already
+                        // spent from it; `started` times the embeds alone, whose rate is projected.
                         let lent = idx.borrow_owed(graph, &skip);
                         let owed = idx.owed(graph, &skip);
                         let started = std::time::Instant::now();

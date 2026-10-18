@@ -13,25 +13,46 @@ const full = atom({ plugin: 'zerograph', key: 'full' } as const, null)
 
 type Api = Parameters<Hook<'session.start'>>[0]
 
-// The configured binary, else where a project keeps one: on PATH, through pnpm's bin
-// directory (how a JS repository pins it), or built in place (zerograph's own checkout).
-async function candidates($: Api, configured: string): Promise<string[]> {
-  if (configured) return [configured]
-  const root = await $.session.root()
-  const local = [`${root}/node_modules/.bin/zerograph`, `${root}/target/release/zerograph`, `${root}/target/debug/zerograph`]
-  const present = await Promise.all(local.map(p => $.fs.exists(p)))
-  return ['zerograph', ...local.filter((_, i) => present[i])]
+// Whether `path` is absolute in either platform's spelling; the mod is told no platform.
+const isAbsolute = (path: string) => path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
+
+// Whether `dir` is `root` or below it, in either separator.
+function inside(root: string, dir: string): boolean {
+  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+  const r = norm(root)
+  const d = norm(dir)
+  return d === r || d.startsWith(`${r}/`)
 }
 
-// `undefined` when no zerograph found has `status`, or each failed.
-async function runStatus($: Api, configured: string, json: boolean): Promise<string | undefined> {
-  const cwd = await $.session.root()
-  for (const bin of await candidates($, configured)) {
-    const argv = json ? [bin, 'status', '--json'] : [bin, 'status']
-    const ran = await $.process.run(argv, { cwd, timeoutMs: 20_000 }).catch(() => undefined)
-    if (ran?.exitCode === 0 && ran.stdout.trim()) return ran.stdout
+// The configured binary, else PATH's by its absolute path, and never one under the checkout: a
+// cloned repository that ships an executable `node_modules/.bin/zerograph` would have it run the
+// moment a session opened in it. A bare name would let a relative PATH entry, or Windows' search
+// of the working directory first, pick that file; so would an absolute entry inside the checkout.
+async function binaryOf($: Api, configured: string, root: string): Promise<string | undefined> {
+  if (configured) return isAbsolute(configured) ? configured : undefined
+  const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
+  const win = path.includes(';') || /^[A-Za-z]:/.test(root)
+  const names = win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph']
+  for (const dir of path.split(win ? ';' : ':')) {
+    if (!dir || !isAbsolute(dir) || inside(root, dir)) continue
+    for (const name of names) {
+      const file = `${dir.replace(/[\\/]+$/, '')}${win ? '\\' : '/'}${name}`
+      const stat = await $.fs.stat(file).catch(() => undefined)
+      if (stat?.kind === 'file') return file
+    }
   }
   return undefined
+}
+
+// `undefined` when no zerograph is found, it has no `status`, or it failed.
+async function runStatus($: Api, configured: string, json: boolean): Promise<string | undefined> {
+  const root = await $.session.root()
+  const bin = await binaryOf($, configured, root)
+  if (!bin) return undefined
+  const argv = json ? [bin, 'status', '--json'] : [bin, 'status']
+  // `status` finds its store from the working directory; the binary was resolved without it.
+  const ran = await $.process.run(argv, { cwd: root, timeoutMs: 20_000 }).catch(() => undefined)
+  return ran?.exitCode === 0 && ran.stdout.trim() ? ran.stdout : undefined
 }
 
 // A store built before the rename still sits under `.repograph` until a write moves it.

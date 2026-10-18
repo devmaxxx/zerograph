@@ -934,8 +934,20 @@ fn repo_root(cwd: &std::path::Path) -> PathBuf {
         .unwrap_or_else(|| cwd.to_path_buf()))
 }
 
+/// `git`, without the repository a hook exports into everything it runs. Those variables outrank
+/// both `-C` and the cwd, so with `GIT_DIR` set and `GIT_WORK_TREE` unset `--show-toplevel` answers
+/// the cwd and `worktree list` names another repository's checkouts. The repository asked about is
+/// the one named by the path each call passes.
+pub(crate) fn git_command() -> std::process::Command {
+    let mut cmd = std::process::Command::new("git");
+    for var in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_COMMON_DIR", "GIT_PREFIX"] {
+        cmd.env_remove(var);
+    }
+    cmd
+}
+
 fn git_toplevel(cwd: &std::path::Path) -> Option<PathBuf> {
-    let out = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).current_dir(cwd)
+    let out = git_command().args(["rev-parse", "--show-toplevel"]).current_dir(cwd)
         .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
     if !out.status.success() { return None; }
     let top = String::from_utf8(out.stdout).ok()?;
@@ -1617,6 +1629,31 @@ mod tests {
         assert_eq!(std::fs::read(repo.join(".zerograph/manifest.json")).unwrap(), manifest_bytes);
     }
 
+    /// A newer release's `update` can save between the reader's load and its lock. What the
+    /// reader then writes under the lock would carry this build's grammar over the newer store,
+    /// whether the tree moved (a refresh) or not (the stamps).
+    #[test]
+    fn an_ask_never_restamps_a_newer_store_saved_between_its_load_and_its_lock() {
+        for edited in [true, false] {
+            let dir = doc_repo(ONE);
+            let (repo, cfg) = (dir.path().to_path_buf(), config::Config::default());
+            built(&repo, &cfg);
+            if edited { std::fs::write(repo.join("docs/a.md"), TWO).unwrap(); }
+            let newer = repo.clone();
+            ask::BEFORE_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+                let store = store::Store::new(&newer);
+                let (graph, manifest) = store.load().unwrap();
+                store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, release: "9.9.9".into(), ..manifest }).unwrap();
+            })));
+            let store = store::Store::new(&repo);
+            let read = ask::graph_for_ask(&repo, &cfg, &store, false, &ask::Timing::new(), &refresh::Budget::unlimited()).unwrap();
+            let written = store.load_manifest().unwrap();
+            assert_eq!(written.grammar, walk::GRAMMAR + 1, "edited={edited}: the newer store was stamped over");
+            assert!(read.refreshed.is_none() && matches!(read.writer, ask::Writer::Barred), "edited={edited}");
+            assert!(read.note.is_some_and(|n| n.contains(&format!("generation {}", walk::GRAMMAR + 1))), "edited={edited}");
+        }
+    }
+
     /// `status` sends a reader with an unreadable manifest to `build`, so `build` must not be the
     /// command that refuses to parse it.
     #[test]
@@ -1642,7 +1679,7 @@ mod tests {
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {
-        let ok = std::process::Command::new("git").args(args).current_dir(dir)
+        let ok = git_command().args(args).current_dir(dir)
             .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success();
         assert!(ok, "git {args:?}");
     }
@@ -1660,6 +1697,41 @@ mod tests {
         git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
         std::fs::create_dir_all(wt.join("sub")).unwrap();
         assert_eq!(repo_root(&wt.join("sub")), wt);
+    }
+
+    const HOOK_ROOT: &str = "ZEROGRAPH_TEST_HOOK_ROOT";
+
+    /// A hook manager exports `GIT_DIR` into what it runs, and with `GIT_WORK_TREE` unset git takes
+    /// the cwd for the top level. The variable is process-wide, so the reads run in a child of
+    /// this test binary that alone carries it, pointed at another repository than the one asked.
+    #[test]
+    fn git_calls_ignore_a_hooks_git_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = plain(dir.path().canonicalize().unwrap());
+        let (asked, other) = (top.join("asked"), top.join("other"));
+        for repo in [&asked, &other] {
+            std::fs::create_dir_all(repo.join("src")).unwrap();
+            git(repo, &["init", "-q"]);
+        }
+        std::fs::write(asked.join(".git/hooks/post-merge"), "#!/bin/sh\n# zerograph:begin\nzerograph update --detach\n# zerograph:end\n").unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--ignored", "--exact", "tests::git_calls_under_a_hooks_environment", "--test-threads=1"])
+            .env("GIT_DIR", other.join(".git")).env_remove("GIT_WORK_TREE")
+            .env(HOOK_ROOT, &asked)
+            .output().unwrap();
+        let said = String::from_utf8_lossy(&out.stdout);
+        assert!(out.status.success() && said.contains("1 passed"), "{said}{}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    #[test]
+    #[ignore = "run by git_calls_ignore_a_hooks_git_dir, with GIT_DIR set"]
+    fn git_calls_under_a_hooks_environment() {
+        let Some(asked) = std::env::var_os(HOOK_ROOT).map(PathBuf::from) else { return };
+        assert_eq!(repo_root(&asked.join("src")), asked, "the checkout around the cwd, not the cwd");
+        assert_eq!(install_agent::worktrees(&asked), std::slice::from_ref(&asked), "the asked repository's worktrees alone");
+        let retired = install_agent::retire_git_hooks(&asked);
+        assert_eq!(retired.written, 1, "{:?}", retired.notes);
+        assert!(!asked.join(".git/hooks/post-merge").exists());
     }
 
     #[test]
