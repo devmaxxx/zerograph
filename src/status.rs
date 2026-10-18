@@ -47,8 +47,12 @@ pub(crate) enum Index {
 #[serde(tag = "state", rename_all = "snake_case")]
 pub(crate) enum Tree {
     InStep,
-    /// The store was written by another grammar, and the next read or refresh re-reads every file.
-    OtherGrammar,
+    /// The store was written by an older grammar, and the next read or refresh re-reads every file.
+    /// `release` is empty for a store written before releases were recorded.
+    OtherGrammar { grammar: u32, release: String },
+    /// A newer release wrote the store: this build answers from it as it stands and never
+    /// rewrites it, so how far the tree has moved is that release's to find out.
+    NewerGrammar { grammar: u32, release: String },
     Behind { files: Vec<String> },
     NotWalked { error: String },
     /// The configuration did not load, so the walk it steers could not run.
@@ -106,11 +110,14 @@ pub(crate) fn report(repo: &Path, starting: bool) -> Result<Report> {
     // Before the walk, which runs on the global pool: the first call fixes its size for good.
     if let Ok(cfg) = &cfg { crate::cap_pools(index::embed::threads(cfg.resources)); }
     let tree = match &cfg {
+        // Before the walk: this build never refreshes such a store, so how far the tree moved is
+        // not its to report.
+        _ if manifest.newer_grammar() => Tree::NewerGrammar { grammar: manifest.grammar, release: manifest.release.clone() },
         Ok(cfg) => match walk::walk(repo, cfg, &manifest) {
             Ok(entries) => match manifest.diff(&entries) {
-                // No hash reports a store another grammar wrote, but a read treats it as behind
+                // No hash reports a store an older grammar wrote, but a read treats it as behind
                 // and re-reads every file, so "in step" would contradict the next answer.
-                d if d.changed.is_empty() && d.removed.is_empty() && manifest.stale_grammar() => Tree::OtherGrammar,
+                d if d.changed.is_empty() && d.removed.is_empty() && manifest.stale_grammar() => Tree::OtherGrammar { grammar: manifest.grammar, release: manifest.release.clone() },
                 d if d.changed.is_empty() && d.removed.is_empty() => Tree::InStep,
                 d => Tree::Behind { files: refresh::files_of(&d) },
             },
@@ -160,6 +167,10 @@ fn refresh_state(repo: &Path, starting: bool, log: &[String]) -> Refresh {
         (Ok(None), _) => Refresh::Running { progress: progress(log) },
         (Err(err), _) => Refresh::Unknown { error: format!("{err:#}") },
     }
+}
+
+fn by_release(release: &str) -> String {
+    match release.is_empty() { true => String::new(), false => format!(" (zerograph {release})") }
 }
 
 /// Only the lines after the last start marker are this run's: the log is kept across runs, and
@@ -222,7 +233,9 @@ pub(crate) fn render(r: &Report, repo: &Path, build: &str) -> String {
         Index::Unreadable { error } => format!("index: unreadable ({error}); {build} rewrites it"),
     });
     say(match &r.tree {
-        Tree::OtherGrammar => "tree: the index was written by another grammar and is re-read whole by the next read or `reindex`".to_string(),
+        Tree::OtherGrammar { grammar, release } => format!("tree: the index was written by grammar {grammar}{} and is re-read whole by the next read or `reindex`", by_release(release)),
+        Tree::NewerGrammar { grammar, release } => format!("tree: the index was written by grammar {grammar}{}, newer than this build's {} ({}); answered read-only, never rewritten — a newer zerograph refreshes it",
+            by_release(release), walk::GRAMMAR, env!("CARGO_PKG_VERSION")),
         Tree::InStep => "tree: the index is in step with it".to_string(),
         Tree::Behind { files } => format!("tree: {} ({})", refresh::files_line(files.len()), preview(files)),
         Tree::NotWalked { error } => format!("tree: not walked ({error})"),
@@ -353,6 +366,24 @@ mod tests {
         assert!(matches!(r.index, Index::Empty) && matches!(r.refresh, Refresh::None) && !r.serve.running);
         assert!(render(&r, dir.path(), "`zerograph build`").starts_with("index: empty; `zerograph build` builds it\n"));
         assert!(!store::dir_of(dir.path()).exists(), "status wrote the store directory");
+    }
+
+    #[test]
+    fn a_store_a_newer_release_wrote_is_named_with_its_grammar_and_release() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("docs")).unwrap();
+        std::fs::write(dir.path().join("docs/a.md"), "# A\n\n**FR-PAY-1 · MUST · refund**\n\nbody\n").unwrap();
+        crate::run_update(dir.path(), &config::Config::default(), true).unwrap();
+        let store = store::Store::new(dir.path());
+        let (graph, manifest) = store.load().unwrap();
+        store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, release: "9.9.9".into(), ..manifest }).unwrap();
+        // A tree that moved since is still not "behind" for this build, which will not refresh it.
+        std::fs::write(dir.path().join("docs/b.md"), "# B\n").unwrap();
+        let r = report(dir.path(), false).unwrap();
+        assert!(matches!(&r.tree, Tree::NewerGrammar { grammar, release } if *grammar == walk::GRAMMAR + 1 && release == "9.9.9"));
+        let text = render(&r, dir.path(), "`build`");
+        assert!(text.contains(&format!("grammar {} (zerograph 9.9.9), newer than this build's {}", walk::GRAMMAR + 1, walk::GRAMMAR)), "{text}");
+        assert_eq!(serde_json::to_value(&r).unwrap()["tree"]["state"], "newer_grammar");
     }
 
     #[test]

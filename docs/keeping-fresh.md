@@ -28,6 +28,13 @@ So the first `update`, `watch` poll or refreshing `ask` after such an upgrade sa
 is re-reading the whole tree and why, writes the new generation forward, and leaves every update
 after it incremental again. A release that does not change the grammar costs no walk at all.
 
+The other direction is refused. A store a newer release wrote — its manifest names a grammar past
+this build's — is never re-read and never re-stamped by an older binary, such as a worktree pinned
+to an earlier release: `ask` and the other reads answer from it as it stands, `update` and `build`
+refuse, and each says so in one line naming both generations and the release that wrote it.
+`status` shows the same. The manifest records the writing release from 0.6.5 on; a store written
+before that is named by its grammar alone.
+
 ```bash
 zerograph ask --stale отмена записи         # answer from the store as it stands, no check
 ```

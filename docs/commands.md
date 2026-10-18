@@ -28,8 +28,12 @@ zerograph --repo /path/to/project build     # full build
 zerograph --repo /path/to/project update    # re-extract only changed files
 ```
 
-`--repo` defaults to the current directory. State lives in `<repo>/.zerograph/`; add it to
-`.gitignore`.
+Without `--repo`, the root is found the way git finds it: the top of the checkout around the
+current directory (`git rev-parse --show-toplevel`, so a worktree is its own root), else the nearest
+directory above holding a `.zerograph/`, else the current directory. Run from `packages/x`, every
+command reads the store at the top of the checkout instead of building a second one there. State
+lives in `<repo>/.zerograph/`; add it to `.gitignore`. Only `build`, `update` and a refresh write
+it: a read where no store stands answers from nothing and creates no directory.
 
 After a first build, read which id families the documents defined and what was left as text:
 

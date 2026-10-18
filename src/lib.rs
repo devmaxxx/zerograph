@@ -52,9 +52,10 @@ pub fn env_name(suffix: &str) -> String {
 #[derive(Parser)]
 #[command(name = "zerograph", version)]
 struct Cli {
-    /// Repository root; defaults to the current directory.
-    #[arg(long, global = true, default_value = ".")]
-    repo: PathBuf,
+    /// Repository root; defaults to the top of the git checkout around the current directory,
+    /// else the nearest directory above it holding a store, else the current directory.
+    #[arg(long, global = true)]
+    repo: Option<PathBuf>,
     #[arg(long, global = true)]
     no_dense: bool,
     /// Runs at background priority. What a detached refresh is started with; nobody waits on it.
@@ -287,6 +288,8 @@ pub(crate) struct UpdateReport {
 /// and the whole tree is read once. Once, because the manifest saved below carries this build's
 /// generation — after which an update is the incremental one again.
 pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &mut model::Graph, entries: &[walk::Entry], diff: &walk::Diff, manifest: &walk::Manifest, ex: &Extractors) -> anyhow::Result<UpdateReport> {
+    // Every writer comes through here, so this is the one refusal no caller can route around.
+    if manifest.newer_grammar() { anyhow::bail!("{}", manifest.newer_store_line()); }
     let _pass = code::Pass;
     // A graph read from nothing is read beside no headers either, whatever an older store left.
     let fresh = graph.nodes.is_empty();
@@ -397,6 +400,9 @@ pub(crate) fn run_update(repo: &std::path::Path, cfg: &config::Config, wipe: boo
     // A build starts from nothing in memory and leaves the stored graph alone until its save
     // renames the new one over it: a build killed before then leaves a store that still answers.
     ask::mark("update started");
+    // A build would start from nothing and write this build's grammar over a newer one just the
+    // same, so it is refused before anything is read or dropped.
+    if let Some(line) = store.newer_store_line() { anyhow::bail!("{line}"); }
     let (mut graph, manifest) = if wipe { store.drop_leftovers()?; Default::default() } else { store.load()? };
     let (entries, oversized) = walk::walk_counted(repo, cfg, &manifest)?;
     ask::mark("walked");
@@ -433,11 +439,14 @@ pub(crate) fn run_update(repo: &std::path::Path, cfg: &config::Config, wipe: boo
 /// before the stat cache, or a file touched without being changed. Without this a tree that never
 /// changes would be hashed in full on every question.
 pub(crate) fn record_stamps(store: &store::Store, manifest: &walk::Manifest, entries: &[walk::Entry]) -> anyhow::Result<bool> {
+    if manifest.newer_grammar() { return Ok(false); }
     let mut now = walk::Manifest::from_entries(entries);
     if now.stamps == manifest.stamps { return Ok(false); }
     // Nothing was re-extracted here, so this save may not claim the graph beside it was read by
-    // this build's grammar: that claim is `apply_diff`'s to make, after the walk that earns it.
+    // this build's grammar or release: that claim is `apply_diff`'s to make, after the walk that
+    // earns it.
     now.grammar = manifest.grammar;
+    now.release = manifest.release.clone();
     store.save_manifest(&now)?;
     Ok(true)
 }
@@ -510,6 +519,8 @@ impl<'a> Watcher<'a> {
     /// overwritten, which is why the manifest stamp is checked before the graph in hand is used.
     fn poll(&mut self, batch: usize) -> anyhow::Result<Polled> {
         self.reloaded = self.reload_if_moved()?;
+        // Read-only for as long as a newer release's store stands here: nothing to walk for.
+        if self.manifest.newer_grammar() { return Ok(Polled::Quiet); }
         let entries = walk::walk(self.repo, self.cfg, &self.manifest)?;
         let diff = self.manifest.diff(&entries);
         let pending = diff.changed.len() + diff.removed.len();
@@ -572,6 +583,7 @@ fn run_watch(repo: &std::path::Path, cfg: &config::Config, every: u64, batch: us
     let skip = index::dense::EmbedSkip::new(&cfg.embed_skip)?;
     let verbose = ask::timing_on();
     eprintln!("watch: {} every {every}s, batch {batch}; Ctrl-C to stop", repo.display());
+    if w.manifest.newer_grammar() { eprintln!("{}", w.manifest.newer_store_line()); }
     loop {
         let t = std::time::Instant::now();
         match w.poll(batch)? {
@@ -669,6 +681,8 @@ fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Emb
 #[allow(clippy::type_complexity)]
 fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
     let store = store::Store::new(repo);
+    // `embed` and a model switch write only vectors, but into a store this build may not write.
+    if let Some(line) = store.newer_store_line() { anyhow::bail!("{line}"); }
     let graph_at = store.stamp("graph.json");
     let (graph, _) = store.load()?;
     let mut dense = index::dense::DenseIndex::load(&store)?;
@@ -883,6 +897,7 @@ fn graph_with_notes(repo: &std::path::Path, cfg: &config::Config, stale: bool, n
     let mut notes = Vec::new();
     match ask::graph_for_ask(repo, cfg, &store, stale, &timing, &budget) {
         Ok(read) => {
+            notes.extend(read.note);
             if let Some(r) = read.refreshed { notes.push(format!("refresh: {} changed, {} removed", r.changed, r.removed)); }
             let behind = read.behind.map(|(files, line)| { notes.push(line); refresh::Stale { files, vectors: 0 } });
             Ok((read.graph, behind, notes))
@@ -916,6 +931,28 @@ fn json_out(text: String, stale: &Option<refresh::Stale>) -> String {
         Some(s) => refresh::with_stale(text, s),
         None => text,
     }
+}
+
+/// The repository a command run in `cwd` without `--repo` is about, found the way git finds it:
+/// a subdirectory is part of the checkout around it, and a store built there would be a second,
+/// partial one. A worktree is a checkout of its own and gets its own root. Outside git, the nearest
+/// directory up that already holds a store is the one that was built; failing both, `cwd`.
+/// Answered plain: git states the top level without the verbatim prefix and `cwd` arrives with it.
+fn repo_root(cwd: &std::path::Path) -> PathBuf {
+    plain(git_toplevel(cwd)
+        .or_else(|| cwd.ancestors().find(|d| [store::DIR, store::LEGACY_DIR].iter().any(|n| d.join(n).is_dir())).map(PathBuf::from))
+        .unwrap_or_else(|| cwd.to_path_buf()))
+}
+
+fn git_toplevel(cwd: &std::path::Path) -> Option<PathBuf> {
+    let out = std::process::Command::new("git").args(["rev-parse", "--show-toplevel"]).current_dir(cwd)
+        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()?;
+    if !out.status.success() { return None; }
+    let top = String::from_utf8(out.stdout).ok()?;
+    let top = top.trim_end_matches(['\n', '\r']);
+    if top.is_empty() { return None; }
+    // Canonical like `--repo` is, so a store found through a symlinked path is the same store.
+    std::path::Path::new(top).canonicalize().ok()
 }
 
 /// The path as a user would write it. `canonicalize` on Windows answers in the `\\?\C:\…` form,
@@ -977,7 +1014,10 @@ pub fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> anyhow::Result<()> {
     // First of all, before anything here starts a thread that would keep the old priority.
     if cli.background || matches!(cli.cmd, Cmd::Watch { .. }) { priority::background_process(); }
-    let repo = plain(cli.repo.canonicalize()?);
+    let repo = match &cli.repo {
+        Some(repo) => plain(repo.canonicalize()?),
+        None => repo_root(&std::env::current_dir()?.canonicalize()?),
+    };
     // Loaded per command: `bench` reads its own from `ZEROGRAPH_BENCH_REPO`, and `explain`/`verify`
     // must not fail on a broken `zerograph.toml` they never read. `embed` does read it — the model
     // the vectors are written with lives there — so it fails on a broken one like the other writers.
@@ -1397,7 +1437,7 @@ mod tests {
         let files = store.load().unwrap().1.files;
         // The grammar is this build's: what is missing here is the stamps, and a store behind on
         // both would be re-read for the other reason.
-        store.save_manifest(&walk::Manifest { files, stamps: Default::default(), grammar: walk::GRAMMAR, kinds: Default::default() }).unwrap();
+        store.save_manifest(&walk::Manifest { files, stamps: Default::default(), grammar: walk::GRAMMAR, kinds: Default::default(), release: String::new() }).unwrap();
         let graph_before = std::fs::read(repo.join(".zerograph/graph.json")).unwrap();
         assert!(ask::graph_for_ask(repo, &cfg, &store, false, &ask::Timing::new(), &refresh::Budget::unlimited()).map(|r| (r.graph, r.refreshed)).unwrap().1.is_none());
         let manifest = store.load().unwrap().1;
@@ -1534,6 +1574,111 @@ mod tests {
         assert_eq!(saved("graph.json"), holed);
     }
 
+    /// An older binary — a worktree pinned to an earlier release — must not re-read a newer
+    /// release's store and stamp it with its own grammar: neither `update` nor `build` writes it.
+    #[test]
+    fn an_update_refuses_a_store_a_newer_grammar_wrote_and_leaves_it_whole() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        built(repo, &cfg);
+        let store = store::Store::new(repo);
+        let (graph, manifest) = store.load().unwrap();
+        store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, release: "9.9.9".into(), ..manifest }).unwrap();
+        std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
+        let saved = |name: &str| std::fs::read(repo.join(".zerograph").join(name)).unwrap();
+        let before = (saved("graph.json"), saved("manifest.json"));
+        for wipe in [false, true] {
+            let Err(err) = run_update(repo, &cfg, wipe) else { panic!("wipe={wipe}: the update ran") };
+            let err = format!("{err:#}");
+            assert!(err.contains(&format!("generation {}", walk::GRAMMAR + 1)) && err.contains(&format!("reads by {}", walk::GRAMMAR)), "{err}");
+            assert_eq!((saved("graph.json"), saved("manifest.json")), before, "wipe={wipe} wrote the store");
+        }
+    }
+
+    /// The reader's half of the same contract: it answers from the newer store as it stands, says
+    /// so in one line, and records no stamp, mirror or refresh.
+    #[test]
+    fn an_ask_on_a_store_a_newer_grammar_wrote_answers_read_only() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        built(repo, &cfg);
+        let store = store::Store::new(repo);
+        let (graph, manifest) = store.load().unwrap();
+        store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, stamps: Default::default(), ..manifest }).unwrap();
+        let _ = std::fs::remove_file(repo.join(".zerograph/graph.bin"));
+        std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
+        let listing = || { let mut v: Vec<_> = std::fs::read_dir(repo.join(".zerograph")).unwrap().map(|e| e.unwrap().file_name()).collect(); v.sort(); v };
+        let (files, manifest_bytes) = (listing(), std::fs::read(repo.join(".zerograph/manifest.json")).unwrap());
+        for stale in [false, true] {
+            let read = ask::graph_for_ask(repo, &cfg, &store, stale, &ask::Timing::new(), &refresh::Budget::unlimited()).unwrap();
+            assert!(read.refreshed.is_none() && read.behind.is_none());
+            assert!(matches!(read.writer, ask::Writer::Barred));
+            assert!(read.graph.nodes.contains_key("FR-PAY-22"), "the stored graph answers");
+            let note = read.note.expect("one line says why");
+            assert!(note.contains(&format!("generation {}", walk::GRAMMAR + 1)) && note.contains(&format!("reads by {}", walk::GRAMMAR)), "{note}");
+        }
+        assert_eq!(listing(), files, "no lock, mirror or log was written");
+        assert_eq!(std::fs::read(repo.join(".zerograph/manifest.json")).unwrap(), manifest_bytes);
+    }
+
+    /// `status` sends a reader with an unreadable manifest to `build`, so `build` must not be the
+    /// command that refuses to parse it.
+    #[test]
+    fn a_build_rewrites_a_manifest_that_does_not_parse() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        built(repo, &cfg);
+        std::fs::write(repo.join(".zerograph/manifest.json"), "garbage").unwrap();
+        run_update(repo, &cfg, true).unwrap();
+        assert_eq!(store::Store::new(repo).load().unwrap().1.grammar, walk::GRAMMAR);
+    }
+
+    #[test]
+    fn an_ask_where_no_store_stands_creates_none() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        for stale in [false, true] {
+            let read = ask::graph_for_ask(repo, &cfg, &store::Store::new(repo), stale, &ask::Timing::new(), &refresh::Budget::unlimited()).unwrap();
+            assert!(read.graph.nodes.is_empty() && read.refreshed.is_none());
+            assert!(read.note.is_some_and(|n| n.contains("`zerograph build` builds it")), "stale={stale}");
+        }
+        assert!(!repo.join(".zerograph").exists() && !repo.join(".repograph").exists());
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let ok = std::process::Command::new("git").args(args).current_dir(dir)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).status().unwrap().success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn the_root_is_the_checkout_around_a_subdirectory_and_a_worktree_is_its_own() {
+        let dir = tempfile::tempdir().unwrap();
+        // Plain, because git refuses a `\\?\` path as a worktree location.
+        let main = plain(dir.path().canonicalize().unwrap()).join("main");
+        std::fs::create_dir_all(main.join("packages/x")).unwrap();
+        git(&main, &["init", "-q"]);
+        assert_eq!(repo_root(&main.join("packages/x")), main);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", "-c", "core.hooksPath=/dev/null", "commit", "-q", "--allow-empty", "-m", "init"]);
+        let wt = main.join(".claude/worktrees/wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        std::fs::create_dir_all(wt.join("sub")).unwrap();
+        assert_eq!(repo_root(&wt.join("sub")), wt);
+    }
+
+    #[test]
+    fn outside_git_the_root_is_the_nearest_store_above_else_the_directory_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let top = plain(dir.path().canonicalize().unwrap());
+        // A temp directory inside someone's checkout would answer with that checkout instead.
+        if git_toplevel(&top).is_some() { return; }
+        let deep = top.join("a/b");
+        std::fs::create_dir_all(&deep).unwrap();
+        assert_eq!(repo_root(&deep), deep);
+        std::fs::create_dir_all(top.join("a/.zerograph")).unwrap();
+        assert_eq!(repo_root(&deep), top.join("a"));
+    }
+
     /// A file the walk cached and the re-read could not open is a hole in the graph, and the
     /// stamp is what would make it permanent — nothing looks twice at a file whose hash never
     /// moves. Unix only: Windows' read-only flag does not stop a read, so there is no portable
@@ -1548,10 +1693,9 @@ mod tests {
         built(repo, &cfg);
         let store = store::Store::new(repo);
         let (graph, manifest) = store.load().unwrap();
-        // A generation past this build's, so that the value held back below is visibly not the
-        // one the store claimed: writing that back would hand the newer build a store it reads as
-        // current and will not fill.
-        store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, ..manifest }).unwrap();
+        // An older generation that is not 0, so that the value held back below is visibly not the
+        // one the store claimed. A newer one would not do: this build refuses to rewrite it.
+        store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR - 1, ..manifest }).unwrap();
         // Shut after the build, so the stamp still matches and the walk hands back the hash it
         // recorded instead of reading the file and leaving it out.
         let a = repo.join("docs/a.md");

@@ -195,15 +195,36 @@ impl Store {
 
     pub fn load(&self) -> Result<(Graph, Manifest)> { self.load_traced().map(|(g, m, _)| (g, m)) }
 
+    /// Whether a store directory stands under either name. A reader that finds none has nothing
+    /// to answer from and creates nothing: the lock it would take makes the directory.
+    pub(crate) fn stands(&self) -> bool { dir_of(&self.repo).is_dir() }
+
+    /// [`Manifest::newer_store_line`] when a newer release wrote this store, read leniently: a
+    /// manifest that does not parse, or parses only under a newer schema, still names its grammar,
+    /// and one that names none is no reason to stop a `build` that rewrites it.
+    pub(crate) fn newer_store_line(&self) -> Option<String> {
+        let bytes = self.read_bytes("manifest.json").ok().flatten()?;
+        let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+        let grammar = u32::try_from(v.get("grammar")?.as_u64()?).ok()?;
+        let release = v.get("release").and_then(|r| r.as_str()).unwrap_or_default().to_string();
+        let m = Manifest { grammar, release, ..Manifest::default() };
+        m.newer_grammar().then(|| m.newer_store_line())
+    }
+
+    /// The manifest alone, for a writer that must know who wrote the store before it reads the
+    /// graph or decides to start from nothing.
+    pub fn load_manifest(&self) -> Result<Manifest> {
+        Ok(match self.read_bytes("manifest.json")? {
+            Some(b) => serde_json::from_slice(&b).context("manifest.json")?,
+            None => Manifest::default(),
+        })
+    }
+
     /// `load`, saying where the graph came from, so a reader that may write can leave the
     /// mirror a JSON-only store is missing.
     pub fn load_traced(&self) -> Result<(Graph, Manifest, Source)> {
         let (g, source) = self.load_mirrored::<Graph>("graph.json")?;
-        let m = match self.read_bytes("manifest.json")? {
-            Some(b) => serde_json::from_slice(&b).context("manifest.json")?,
-            None => Manifest::default(),
-        };
-        Ok((g.unwrap_or_default(), m, source))
+        Ok((g.unwrap_or_default(), self.load_manifest()?, source))
     }
 
     /// A JSON store file, read through its mirror when the mirror still describes these bytes.
