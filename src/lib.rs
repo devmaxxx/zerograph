@@ -1008,7 +1008,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if r.orphan_questions {
                 eprintln!("zerograph: {}/questions.json and questions.bin are no longer read (enrich was removed in 0.6.0); delete them", store::dir_name_of(&repo));
             }
-            embed_all(&repo, cli.no_dense, &cfg)
+            embed_all(&repo, cli.no_dense, &cfg).map(|()| eprintln!("{}", refresh::RUN_FINISHED))
         }
         Cmd::Embed => {
             let cfg = load_cfg()?;
@@ -1036,7 +1036,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             match hub_id {
                 None if json => { print!("{}", model_json(&repo, &cfg)?); Ok(()) }
                 None => { print!("{}", model_report(&repo, &cfg)?); Ok(()) }
-                Some(id) => { eprintln!("{}", refresh::RUN_MARKER); switch_model(&repo, &cfg, &id, no_embed, cli.no_dense) }
+                Some(id) => {
+                    eprintln!("{}", refresh::RUN_MARKER);
+                    switch_model(&repo, &cfg, &id, no_embed, cli.no_dense).map(|()| eprintln!("{}", refresh::RUN_FINISHED))
+                }
             }
         }
         Cmd::Ask { words, json, seeds, bodies, rerank, rerank_local, depth, stale, no_serve } => {
@@ -1080,7 +1083,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 true => println!("{}", serde_json::to_string(&report)?),
                 false => print!("{}", status::render(&report, &repo, "`zerograph build`")),
             }
-            if follow { status::follow(&repo)?; }
+            if follow { status::follow(&repo, &report.refresh)?; }
             Ok(())
         }
         Cmd::Stop => {

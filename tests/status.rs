@@ -39,7 +39,7 @@ fn follow_with_nothing_running_says_so_and_exits_clean() {
     let dir = built();
     let out = run(dir.path(), &["status", "--follow"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert!(String::from_utf8_lossy(&out.stdout).ends_with("refresh: none running\n"));
+    assert_eq!(String::from_utf8_lossy(&out.stdout).matches("refresh: none running").count(), 1, "said once, by the report");
 }
 
 #[test]

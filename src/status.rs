@@ -23,8 +23,7 @@ const SERVE_LINES: usize = 5;
 
 #[derive(Serialize)]
 pub(crate) struct Report {
-    /// `None` for a store with no nodes.
-    pub index: Option<Index>,
+    pub index: Index,
     pub tree: Tree,
     pub model: Model,
     /// `None` when no vectors were written.
@@ -36,7 +35,13 @@ pub(crate) struct Report {
 }
 
 #[derive(Serialize)]
-pub(crate) struct Index { pub doc_nodes: usize, pub code_nodes: usize, pub edges: usize }
+#[serde(tag = "state", rename_all = "snake_case")]
+pub(crate) enum Index {
+    Empty,
+    Built { doc_nodes: usize, code_nodes: usize, edges: usize },
+    /// Reported rather than raised: a damaged store is when the rest of this report is wanted most.
+    Unreadable { error: String },
+}
 
 #[derive(Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
@@ -88,12 +93,18 @@ pub(crate) struct Serve {
 /// which has not taken the lock yet.
 pub(crate) fn report(repo: &Path, starting: bool) -> Result<Report> {
     let store = store::Store::new(repo);
-    let (graph, manifest) = store.load()?;
-    let index = (!graph.nodes.is_empty()).then(|| {
-        let brief = prime::brief(&graph, 0, None);
-        Index { doc_nodes: brief.docs, code_nodes: brief.code, edges: brief.edges }
-    });
+    let (graph, manifest, index) = match store.load() {
+        Ok((graph, _)) if graph.nodes.is_empty() => (graph, Default::default(), Index::Empty),
+        Ok((graph, manifest)) => {
+            let brief = prime::brief(&graph, 0, None);
+            let index = Index::Built { doc_nodes: brief.docs, code_nodes: brief.code, edges: brief.edges };
+            (graph, manifest, index)
+        }
+        Err(err) => (Default::default(), Default::default(), Index::Unreadable { error: format!("{err:#}") }),
+    };
     let cfg = config::Config::load(repo);
+    // Before the walk, which runs on the global pool: the first call fixes its size for good.
+    if let Ok(cfg) = &cfg { crate::cap_pools(index::embed::threads(cfg.resources)); }
     let tree = match &cfg {
         Ok(cfg) => match walk::walk(repo, cfg, &manifest) {
             Ok(entries) => match manifest.diff(&entries) {
@@ -107,26 +118,38 @@ pub(crate) fn report(repo: &Path, starting: bool) -> Result<Report> {
         },
         Err(err) => Tree::ConfigUnread { error: format!("{err:#}") },
     };
-    let recorded = index::dense::DenseIndex::recorded_model(&store)?;
-    let vectors = match recorded.is_some() && index::dense::DenseIndex::present(&store) {
-        false => None,
-        true => Some(match index::dense::DenseIndex::load(&store) {
-            Ok(dense) => {
-                let rows = dense.ids.iter().filter(|id| !id.is_empty()).count();
-                let skip = cfg.as_ref().ok().and_then(|c| index::dense::EmbedSkip::new(&c.embed_skip).ok()).unwrap_or_default();
-                Vectors::Rows { rows, owed: dense.owed(&graph, &skip) }
-            }
-            Err(err) => Vectors::Unreadable { error: format!("{err:#}") },
-        }),
+    let (recorded, vectors) = match index::dense::DenseIndex::recorded_model(&store) {
+        Err(err) => (None, Some(Vectors::Unreadable { error: format!("{err:#}") })),
+        Ok(recorded) => {
+            let vectors = vectors(&store, &graph, cfg.as_ref().ok(), recorded.is_some());
+            (recorded, vectors)
+        }
     };
     let model = Model { recorded, configured: cfg.as_ref().ok().map(|c| c.embed_model.clone()) };
     let log = log_tail(repo, "background.log");
     Ok(Report { index, tree, model, vectors, refresh: refresh_state(repo, starting, &log), last_run: last_run(&log), serve: serve_state(repo) })
 }
 
+fn vectors(store: &store::Store, graph: &crate::model::Graph, cfg: Option<&config::Config>, recorded: bool) -> Option<Vectors> {
+    match recorded && index::dense::DenseIndex::present(store) {
+        false => None,
+        true => Some(match index::dense::DenseIndex::load(store) {
+            Ok(dense) => {
+                let rows = dense.ids.iter().filter(|id| !id.is_empty()).count();
+                let skip = cfg.and_then(|c| index::dense::EmbedSkip::new(&c.embed_skip).ok()).unwrap_or_default();
+                Vectors::Rows { rows, owed: dense.owed(graph, &skip) }
+            }
+            Err(err) => Vectors::Unreadable { error: format!("{err:#}") },
+        }),
+    }
+}
+
 /// Whether the writer lock is held cannot go stale: a killed process releases it with its
-/// handle, where a pid file would outlive it. A store directory that does not exist has no
-/// writer, and asking the lock would create it.
+/// handle, where a pid file would outlive it. The question is asked by taking the lock and
+/// dropping it at once — the one probe the lock has — so a writer that tries for it in that
+/// instant waits (`update`) or answers from the store as it stands (a reader's refresh), as it
+/// would behind any other writer. A store directory that does not exist has no writer, and
+/// asking the lock would create it.
 fn refresh_state(repo: &Path, starting: bool, log: &[String]) -> Refresh {
     if !store::dir_of(repo).is_dir() {
         return match starting { true => Refresh::Starting, false => Refresh::None };
@@ -168,7 +191,8 @@ fn serve_state(repo: &Path) -> Serve {
     // The socket is bound once, at start, and never touched again, so its age is the server's.
     let up_secs = running.then(|| std::fs::symlink_metadata(&path).and_then(|m| m.modified()).ok()?.elapsed().ok().map(|d| d.as_secs())).flatten();
     let log = log_tail(repo, "serve.log");
-    let since = log.iter().rposition(|l| serve::is_start_line(l)).unwrap_or(0);
+    // Lines from before a start the tail no longer holds would be read as this server's.
+    let Some(since) = log.iter().rposition(|l| serve::is_start_line(l)) else { return Serve { running, up_secs, log: vec![] } };
     let tail = &log[since..];
     Serve { running, up_secs, log: tail[tail.len().saturating_sub(SERVE_LINES)..].to_vec() }
 }
@@ -193,8 +217,9 @@ pub(crate) fn render(r: &Report, repo: &Path, build: &str) -> String {
     let mut out = String::new();
     let mut say = |line: String| { out.push_str(&line); out.push('\n'); };
     say(match &r.index {
-        None => format!("index: empty; {build} builds it"),
-        Some(i) => format!("index: {} doc nodes, {} code nodes, {} edges", i.doc_nodes, i.code_nodes, i.edges),
+        Index::Empty => format!("index: empty; {build} builds it"),
+        Index::Built { doc_nodes, code_nodes, edges } => format!("index: {doc_nodes} doc nodes, {code_nodes} code nodes, {edges} edges"),
+        Index::Unreadable { error } => format!("index: unreadable ({error}); {build} rewrites it"),
     });
     say(match &r.tree {
         Tree::OtherGrammar => "tree: the index was written by another grammar and is re-read whole by the next read or `reindex`".to_string(),
@@ -229,7 +254,10 @@ pub(crate) fn render(r: &Report, repo: &Path, build: &str) -> String {
     });
     if !r.serve.log.is_empty() {
         let log = format!("{}/serve.log", store::dir_name_of(repo));
-        say(format!("  last lines of {log}:"));
+        match r.serve.running {
+            true => say(format!("  last lines of {log}:")),
+            false => say(format!("  last lines of {log}, from the server that ran last:")),
+        }
         for line in &r.serve.log { say(format!("    {line}")); }
     }
     out
@@ -256,16 +284,22 @@ fn preview(files: &[String]) -> String {
 /// How often `--follow` reads the lock and the log; a meter comes every two seconds.
 const FOLLOW_EVERY: Duration = Duration::from_millis(500);
 
-/// Prints the refresh line each time it changes until the running refresh lets go of the store,
-/// then the run's last line. A run whose last line is an error fails this command too, so a
-/// script that waits on it learns how it ended.
-pub(crate) fn follow(repo: &Path) -> Result<()> {
+/// How long `--follow` waits for a refresh to take the lock when none holds it yet: a detached
+/// `update` started just before it is a process start away from the lock.
+const START_GRACE: Duration = Duration::from_secs(3);
+
+/// Prints the refresh line each time it moves on from `shown` — the line the report already
+/// printed — until the running refresh lets go of the store, then how it ended. A run that let go
+/// without its finished line was killed or failed, and fails this command too, so a script that
+/// waits on it learns how it ended.
+pub(crate) fn follow(repo: &Path, shown: &Refresh) -> Result<()> {
     let running = || store::dir_of(repo).is_dir() && matches!(store::Store::new(repo).try_lock_writer(), Ok(None));
-    if !running() {
-        println!("refresh: none running");
-        return Ok(());
+    let grace = std::time::Instant::now() + START_GRACE;
+    while !running() {
+        if std::time::Instant::now() >= grace { return Ok(()); }
+        std::thread::sleep(FOLLOW_EVERY);
     }
-    let mut shown = String::new();
+    let mut shown = match shown { Refresh::Running { progress } => progress.clone(), _ => String::new() };
     while running() {
         let now = progress(&log_tail(repo, "background.log"));
         if now != shown {
@@ -275,10 +309,13 @@ pub(crate) fn follow(repo: &Path) -> Result<()> {
         std::thread::sleep(FOLLOW_EVERY);
     }
     let log = log_tail(repo, "background.log");
-    let last = current_run(&log).and_then(<[String]>::last).cloned().unwrap_or_else(|| "no output".to_string());
-    if last.starts_with("Error") { anyhow::bail!("the refresh ended on an error: {last}"); }
-    println!("refresh: done ({last})");
-    Ok(())
+    let run = current_run(&log).unwrap_or_default();
+    if run.last().is_some_and(|l| l == refresh::RUN_FINISHED) {
+        println!("refresh: finished");
+        return Ok(());
+    }
+    let last = run.iter().rev().find(|l| !is_meter(l)).or(run.last()).map_or("no output", String::as_str);
+    anyhow::bail!("the refresh ended without finishing; its last line: {last}")
 }
 
 #[cfg(test)]
@@ -313,9 +350,28 @@ mod tests {
     fn a_project_never_built_reports_without_creating_its_store() {
         let dir = tempfile::tempdir().unwrap();
         let r = report(dir.path(), false).unwrap();
-        assert!(r.index.is_none() && matches!(r.refresh, Refresh::None) && !r.serve.running);
+        assert!(matches!(r.index, Index::Empty) && matches!(r.refresh, Refresh::None) && !r.serve.running);
         assert!(render(&r, dir.path(), "`zerograph build`").starts_with("index: empty; `zerograph build` builds it\n"));
         assert!(!store::dir_of(dir.path()).exists(), "status wrote the store directory");
+    }
+
+    #[test]
+    fn a_damaged_store_is_reported_with_everything_else_still_said() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(store::dir_of(dir.path())).unwrap();
+        std::fs::write(store::dir_of(dir.path()).join("graph.json"), "{ not json").unwrap();
+        std::fs::write(store::dir_of(dir.path()).join("background.log"), "refresh: started\nchanged 1 removed 0 nodes 2 edges 3\n").unwrap();
+        let r = report(dir.path(), false).unwrap();
+        assert!(matches!(r.index, Index::Unreadable { .. }), "{}", render(&r, dir.path(), "`build`"));
+        assert_eq!(r.last_run, ["changed 1 removed 0 nodes 2 edges 3"]);
+    }
+
+    #[test]
+    fn serve_lines_from_before_a_start_the_tail_lost_are_not_shown() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(store::dir_of(dir.path())).unwrap();
+        std::fs::write(store::dir_of(dir.path()).join("serve.log"), "serve: dropped the model\n").unwrap();
+        assert!(serve_state(dir.path()).log.is_empty());
     }
 
     #[test]
@@ -324,7 +380,8 @@ mod tests {
         let v = serde_json::to_value(report(dir.path(), false).unwrap()).unwrap();
         assert_eq!(v["refresh"]["state"], "none");
         assert_eq!(v["serve"]["running"], false);
-        assert!(v["index"].is_null() && v["last_run"].as_array().unwrap().is_empty());
+        assert_eq!(v["index"]["state"], "empty");
+        assert!(v["last_run"].as_array().unwrap().is_empty());
         for key in ["index", "tree", "model", "vectors", "refresh", "last_run", "serve"] {
             assert!(v.get(key).is_some(), "missing {key}: {v}");
         }
@@ -343,22 +400,24 @@ mod tests {
             std::fs::write(&log, format!("refresh: started\nembedded 1/2 (1.0 rows/s, ~1 s left)\n{ends_on}\n")).unwrap();
             drop(held);
         });
-        let followed = follow(dir.path());
+        let followed = follow(dir.path(), &Refresh::None);
         releaser.join().unwrap();
         followed
     }
 
     #[test]
     fn follow_waits_for_the_running_refresh_and_fails_with_it() {
-        followed("dense: embedded 2 rows in 1.0s").unwrap();
+        followed(refresh::RUN_FINISHED).unwrap();
         let err = followed("Error: the store went away").unwrap_err();
         assert!(format!("{err:#}").contains("the store went away"), "{err:#}");
+        let killed = followed("embedded 2/2 (1.0 rows/s, ~0 s left)").unwrap_err();
+        assert!(format!("{killed:#}").contains("ended without finishing"), "a run killed on a meter is not done: {killed:#}");
     }
 
     #[test]
     fn follow_returns_at_once_when_nothing_runs() {
         let dir = tempfile::tempdir().unwrap();
-        follow(dir.path()).unwrap();
+        follow(dir.path(), &Refresh::None).unwrap();
         assert!(!store::dir_of(dir.path()).exists());
     }
 }
