@@ -6,10 +6,10 @@
 //! The wire is JSON-RPC 2.0, one message a line. stdout carries nothing else; every diagnostic a
 //! library function prints goes to stderr, which the harness shows in its server log.
 
-use crate::{ask, changes, config, impact, index, prime, query, refresh, serve, store, walk};
+use crate::{ask, changes, config, impact, index, query, refresh, serve, status, store};
 use anyhow::{bail, Context as _, Result};
 use serde_json::{json, Value};
-use std::io::{BufRead, Read, Seek, Write};
+use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
 const PROTOCOL: &str = "2025-06-18";
@@ -20,10 +20,6 @@ const PARSE_ERROR: i64 = -32700;
 const INVALID_REQUEST: i64 = -32600;
 const METHOD_NOT_FOUND: i64 = -32601;
 const INVALID_PARAMS: i64 = -32602;
-
-/// How much of the background log's end `status` reads. A refresh prints a line every two
-/// seconds, and the log is kept across runs up to a megabyte, so the end is all that is current.
-const LOG_TAIL: u64 = 16 * 1024;
 
 const INSTRUCTIONS: &str = "Ask the graph before grepping for a concept. `status` says whether the index is behind the tree and \
 whether a background refresh is running; an answer given while files are behind says so itself. `reindex` starts a refresh \
@@ -262,66 +258,8 @@ impl Server {
     }
 
     fn status(&self) -> Result<String> {
-        let store = store::Store::new(&self.repo);
-        let (graph, manifest) = store.load()?;
-        let mut out = String::new();
-        let mut say = |line: String| { out.push_str(&line); out.push('\n'); };
-        if graph.nodes.is_empty() {
-            say("index: empty; `reindex` builds it".to_string());
-        } else {
-            let brief = prime::brief(&graph, 0, None);
-            say(format!("index: {} doc nodes, {} code nodes, {} edges", brief.docs, brief.code, brief.edges));
-        }
-        let cfg = self.config();
-        match &cfg {
-            Ok(cfg) => say(match walk::walk(&self.repo, cfg, &manifest) {
-                Ok(entries) => match manifest.diff(&entries) {
-                    // No hash reports a store another grammar wrote, but a read treats it as behind
-                    // and re-reads every file, so "in step" would contradict the next answer.
-                    d if d.changed.is_empty() && d.removed.is_empty() && manifest.stale_grammar() => "tree: the index was written by another grammar and is re-read whole by the next read or `reindex`".to_string(),
-                    d if d.changed.is_empty() && d.removed.is_empty() => "tree: the index is in step with it".to_string(),
-                    d => {
-                        let files = refresh::files_of(&d);
-                        format!("tree: {} ({})", refresh::files_line(files.len()), preview(&files))
-                    }
-                },
-                Err(err) => format!("tree: not walked ({err:#})"),
-            }),
-            Err(err) => say(format!("config: not read ({err:#})")),
-        }
-        let recorded = index::dense::DenseIndex::recorded_model(&store)?;
-        match (&recorded, &cfg) {
-            (Some(m), Ok(cfg)) if m.eq_ignore_ascii_case(&cfg.embed_model) => say(format!("model: {m} wrote the vectors and is the configured one")),
-            (Some(m), Ok(cfg)) => say(format!("model: {m} wrote the vectors; {} is configured, and takes effect when `reindex` or `switch_model` rewrites them", cfg.embed_model)),
-            (Some(m), Err(_)) => say(format!("model: {m} wrote the vectors")),
-            (None, Ok(cfg)) => say(format!("model: no vectors yet; {} is configured", cfg.embed_model)),
-            (None, Err(_)) => say("model: no vectors yet".to_string()),
-        }
-        if recorded.is_some() && index::dense::DenseIndex::present(&store) {
-            match index::dense::DenseIndex::load(&store) {
-                Ok(dense) => {
-                    let rows = dense.ids.iter().filter(|id| !id.is_empty()).count();
-                    let skip = cfg.as_ref().ok().and_then(|c| index::dense::EmbedSkip::new(&c.embed_skip).ok()).unwrap_or_default();
-                    let owed = dense.owed(&graph, &skip);
-                    say(format!("vectors: {rows} rows, {owed} owed"));
-                }
-                Err(err) => say(format!("vectors: unreadable ({err:#})")),
-            }
-        }
-        say(self.refresh_line(&store));
-        Ok(out)
-    }
-
-    /// Whether the writer lock is held cannot go stale: a killed process releases it with its
-    /// handle, where a pid file would outlive it. A refresh this server started is running from
-    /// the spawn, which is earlier than its lock.
-    fn refresh_line(&self, store: &store::Store) -> String {
-        match (store.try_lock_writer(), self.spawn_in_flight()) {
-            (Ok(Some(_)), false) => "refresh: none running".to_string(),
-            (Ok(Some(_)), true) => "refresh: running (starting)".to_string(),
-            (Ok(None), _) => format!("refresh: running ({})", progress(&self.repo)),
-            (Err(err), _) => format!("refresh: unknown ({err:#})"),
-        }
+        let report = status::report(&self.repo, self.spawn_in_flight())?;
+        Ok(status::render(&report, &self.repo, "`reindex`"))
     }
 
     fn reindex(&self) -> Result<String> {
@@ -381,40 +319,9 @@ fn with_notices(mut text: String, notices: Vec<String>) -> String {
     text
 }
 
-fn preview(files: &[String]) -> String {
-    const SHOWN: usize = 5;
-    let more = files.len().saturating_sub(SHOWN);
-    let shown = files.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
-    match more {
-        0 => shown,
-        n => format!("{shown}, and {n} more"),
-    }
-}
-
-/// How far the running refresh has got, from the end of the log it writes. Only the lines after
-/// the last start marker are this run's: the log is kept across runs, and a run that was killed
-/// leaves a meter behind that no later line takes back.
+/// How far the running refresh has got, for a reply that says one is already running.
 fn progress(repo: &Path) -> String {
-    let lines = log_tail(repo);
-    let Some(started) = lines.iter().rposition(|l| l == refresh::RUN_MARKER) else { return "no output yet".to_string() };
-    let current = &lines[started + 1..];
-    match (current.iter().rev().find(|l| l.starts_with("embedded ")), current.last()) {
-        (Some(meter), _) => meter.to_string(),
-        (None, Some(last)) => last.to_string(),
-        (None, None) => "no output yet".to_string(),
-    }
-}
-
-fn log_tail(repo: &Path) -> Vec<String> {
-    let read = || -> Result<String> {
-        let Some(mut f) = store::open_for_read(&store::dir_of(repo).join("background.log"))? else { return Ok(String::new()) };
-        let len = f.metadata()?.len();
-        f.seek(std::io::SeekFrom::Start(len.saturating_sub(LOG_TAIL)))?;
-        let mut bytes = Vec::new();
-        f.take(LOG_TAIL).read_to_end(&mut bytes)?;
-        Ok(String::from_utf8_lossy(&bytes).into_owned())
-    };
-    read().unwrap_or_default().split(['\n', '\r']).map(str::trim).filter(|l| !l.is_empty()).map(str::to_string).collect()
+    status::progress(&status::log_tail(repo, "background.log"))
 }
 
 struct Args<'a>(&'a Value);

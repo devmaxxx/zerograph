@@ -144,6 +144,10 @@ pub(crate) fn reap(mut child: std::process::Child) -> Alive {
 /// this run's lines from those a killed run left.
 pub(crate) const RUN_MARKER: &str = "refresh: started";
 
+/// The line a run writes once it has done all it set out to. A run that lets go of the store
+/// without it was killed or failed, whatever its last line says.
+pub(crate) const RUN_FINISHED: &str = "refresh: finished";
+
 /// Starts `zerograph <args>` in a process of its own, at background priority, and returns without
 /// waiting. It inherits none of this process's standard streams: a caller reading this reader's
 /// output through a pipe would otherwise wait for the refresh to close it too, which is the wait

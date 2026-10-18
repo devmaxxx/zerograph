@@ -8,7 +8,7 @@ Scala, Elixir and OCaml; every command below is
 implemented rather than planned:
 `build` (a full re-read that replaces the stored graph only when it saves, so one interrupted
 leaves the previous store answering) and `update` (incremental; a no-op `update` is a fixed point), `families`, `ask`, `explain`,
-`verify`, `impact`, `trace`, `changes`, `embed`, `watch`, `serve` (and `stop`), `mcp`, `prime`, `install-agent`,
+`verify`, `impact`, `trace`, `changes`, `embed`, `watch`, `serve` (and `stop`), `status`, `mcp`, `prime`, `install-agent`,
 `import-legacy`, `dump` and `bench`. Two rerank the fused pool and both are opt-in: `ask --rerank`,
 which spends model tokens, and `ask --rerank-local` (zero tokens, a local cross-encoder, measured and
 rejected as a floor candidate). `bench` fails the process when a floor in [Bench](benchmarks.md#bench) is missed;
@@ -37,6 +37,18 @@ After a first build, read which id families the documents defined and what was l
 zerograph families                          # every family, its nodes, and the line that defines it
 zerograph families --json                   # the same numbers for a script
 ```
+
+See what it holds and what is being done to it:
+
+```bash
+zerograph status                            # index size, files behind, model, vectors owed, refresh, serve
+zerograph status --follow                   # print the refresh line as it moves; fails if the run ends on an error
+zerograph status --json                     # the same facts as one object, each state tagged by `state`
+```
+
+Under the refresh line come the lines the current run wrote besides its progress meters — its result
+and any warning on the way — and under the serve line the last lines of `.zerograph/serve.log` since
+that server started. `status` reads the store and its logs and writes nothing.
 
 Ask it something:
 

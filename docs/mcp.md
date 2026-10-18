@@ -37,7 +37,7 @@ machine-wide file, so it is not covered; `zerograph mcp` is the command to give 
 | --- | --- |
 | `ask` | `question` (plus `seeds`, `bodies`, `rerank`, `rerank_local`, `depth`, `stale`) to the answer `ask` prints, with the low-confidence line when the retrievers disagree. `rerank` spends tokens on the agent's word, so one server process runs at most `mcp_reranks` of them (25 by default, set in the machine config) and answers the rest from the fused order, saying so |
 | `explain`, `impact`, `trace`, `changes` | the commands of those names, with their flags; an answer given while files are behind the tree says so |
-| `status` | nodes and edges, files behind the tree, the store's model against the configured one, vector rows owed, and whether a background refresh is running with its last progress line from `.zerograph/background.log` |
+| `status` | nodes and edges, files behind the tree, the store's model against the configured one, vector rows owed, and whether a background refresh is running with its last progress line from `.zerograph/background.log` and what the run said besides, and whether a `serve` answers with its last log lines. The same report as `zerograph status` |
 | `reindex` | starts a detached `update` and returns at once; says so when one is already running |
 | `switch_model` | `model <hub id>` in the background. Only catalogued models and ones trusted on this machine with `zerograph model <id>`; any other id is refused, because the caller is an agent and a model is code this machine downloads |
 
