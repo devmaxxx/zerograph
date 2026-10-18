@@ -8,6 +8,8 @@
 
 use super::dense::DenseIndex;
 use crate::store::{self, Store};
+use crate::walk::Stamp;
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 /// Every other worktree of `repo`'s repository whose store holds vectors, in the order git lists
@@ -23,23 +25,56 @@ pub(crate) fn worktrees(repo: &Path) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The sibling's rows as they stand, or `None` when its writer lock is held, its store or lock
-/// file is missing or a link, its pair does not read, or its metadata names a model other than
-/// `model`. The lock is released as soon as the read is done, which is what keeps a borrow from
-/// stalling the sibling's own refresh.
-pub(crate) fn read(sibling: &Path, model: &str) -> Option<DenseIndex> {
-    let dir = store::dir_of(sibling);
-    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) { return None; }
-    let lock = dir.join("writer.lock");
-    if !std::fs::symlink_metadata(&lock).is_ok_and(|m| m.is_file()) { return None; }
-    let f = store::open_unlinked(std::fs::OpenOptions::new().read(true), &lock).ok()?;
-    f.try_lock().ok()?;
-    let rows = read_locked(&dir, &Store::new(sibling), model);
-    drop(f);
-    rows
+/// What a sibling's store had for a borrow.
+pub(crate) enum Lend {
+    /// Its rows, read whole: its metadata named at least one of the wanted hashes.
+    Rows(Box<DenseIndex>),
+    /// It holds none of the wanted rows, or rows of another model: told by its metadata alone,
+    /// and remembered against its rows' stamp.
+    Miss,
+    /// It could not be read this time: its lock held or missing, its store or lock file a link,
+    /// its pair torn or unreadable. Nothing is remembered, since the next try may read.
+    Unread,
 }
 
-fn read_locked(dir: &Path, store: &Store, model: &str) -> Option<DenseIndex> {
+/// Sibling → the stamp its `vectors.f32` had and the hashes it was found not to hold then. A fresh
+/// edit's rows are in no sibling, and a resident process asks for them on every answer until they
+/// are embedded; rows that have not changed cannot have gained them. Held for the process's life.
+type Misses = std::collections::HashMap<PathBuf, (Stamp, HashSet<String>)>;
+static MISSES: std::sync::LazyLock<std::sync::Mutex<Misses>> = std::sync::LazyLock::new(Default::default);
+
+/// The sibling's rows when they hold any of the `wanted` text hashes. Its writer lock is taken
+/// without waiting and released as soon as the read is done, which is what keeps a borrow from
+/// stalling the sibling's own refresh; no lock file is created to read under.
+pub(crate) fn read(sibling: &Path, model: &str, wanted: &[&str]) -> Lend {
+    let dir = store::dir_of(sibling);
+    if !std::fs::symlink_metadata(&dir).is_ok_and(|m| m.is_dir()) { return Lend::Unread; }
+    // Taken before the read, so a save racing it leaves a stamp the next look will not match.
+    let Some(rows_at) = std::fs::metadata(dir.join("vectors.f32")).ok().and_then(|m| crate::walk::stamp_of(&m)) else { return Lend::Unread };
+    if missed(sibling, rows_at, wanted) { return Lend::Miss; }
+    let lock = dir.join("writer.lock");
+    if !std::fs::symlink_metadata(&lock).is_ok_and(|m| m.is_file()) { return Lend::Unread; }
+    let Ok(f) = store::open_unlinked(std::fs::OpenOptions::new().read(true), &lock) else { return Lend::Unread };
+    if f.try_lock().is_err() { return Lend::Unread; }
+    let lent = read_locked(&dir, &Store::new(sibling), model, wanted);
+    drop(f);
+    if matches!(lent, Lend::Miss) { remember_miss(sibling, rows_at, wanted); }
+    lent
+}
+
+fn missed(sibling: &Path, rows_at: Stamp, wanted: &[&str]) -> bool {
+    let misses = MISSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    misses.get(sibling).is_some_and(|(at, absent)| *at == rows_at && wanted.iter().all(|h| absent.contains(*h)))
+}
+
+fn remember_miss(sibling: &Path, rows_at: Stamp, wanted: &[&str]) {
+    let mut misses = MISSES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    let entry = misses.entry(sibling.to_path_buf()).or_insert_with(|| (rows_at, HashSet::new()));
+    if entry.0 != rows_at { *entry = (rows_at, HashSet::new()); }
+    entry.1.extend(wanted.iter().map(|h| h.to_string()));
+}
+
+fn read_locked(dir: &Path, store: &Store, model: &str, wanted: &[&str]) -> Lend {
     // A sibling built by an older release may have saved without the writer lock, and a save
     // renames the rows in before the metadata: rows newer than their metadata are a save caught
     // halfway, whose offsets the metadata may no longer describe.
@@ -47,13 +82,14 @@ fn read_locked(dir: &Path, store: &Store, model: &str) -> Option<DenseIndex> {
         let at = |name: &str| std::fs::metadata(dir.join(name)).and_then(|m| m.modified()).ok();
         Some((at("vectors.f32")?, at("vectors.json")?))
     };
-    let before = written()?;
-    if before.0 > before.1 { return None; }
-    // The model first, from the metadata alone: a sibling of another model is not worth its rows'
-    // read, nor the time its lock is held for it.
-    if !DenseIndex::recorded_model(store).ok()??.eq_ignore_ascii_case(model) { return None; }
-    let rows = DenseIndex::load(store).ok()?;
-    (written()? == before).then_some(rows)
+    let Some(before) = written() else { return Lend::Unread };
+    if before.0 > before.1 { return Lend::Unread; }
+    // The metadata first: a sibling of another model, or one holding none of the wanted rows, is
+    // not worth its rows' read, nor the time its lock is held for it.
+    let Some(holds) = DenseIndex::holds_any(store, model, wanted) else { return Lend::Unread };
+    if !holds { return Lend::Miss; }
+    let Ok(rows) = DenseIndex::load(store) else { return Lend::Unread };
+    match written() == Some(before) { true => Lend::Rows(Box::new(rows)), false => Lend::Unread }
 }
 
 #[cfg(test)]

@@ -82,7 +82,10 @@ dense: borrowed 5119 rows from /work/zerograph
 ```
 
 A sibling is read under its writer lock and left untouched: one that is refreshing, has no lock
-file, or holds a torn pair is skipped. A borrowed vector is the one this checkout would have
+file, or holds a torn pair is skipped. Its `vectors.json` is read first, and its rows only when
+that names one of the rows wanted; a sibling that held none is remembered against its rows' stamp
+for the life of the process, so the rows of a fresh edit, which no sibling has, cost no further
+read on each answer after it. A borrowed vector is the one this checkout would have
 embedded up to the last digits — batch padding makes two embeds of the same text near-identical,
 not bit-identical — so answers do not move. There is no switch: a repository with one checkout, or
 siblings on another model, simply embeds everything.

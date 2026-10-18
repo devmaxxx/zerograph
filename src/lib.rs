@@ -1728,7 +1728,7 @@ mod tests {
     fn git_calls_under_a_hooks_environment() {
         let Some(asked) = std::env::var_os(HOOK_ROOT).map(PathBuf::from) else { return };
         assert_eq!(repo_root(&asked.join("src")), asked, "the checkout around the cwd, not the cwd");
-        assert_eq!(install_agent::worktrees(&asked), [asked.clone()], "the asked repository's worktrees alone");
+        assert_eq!(install_agent::worktrees(&asked), std::slice::from_ref(&asked), "the asked repository's worktrees alone");
         let retired = install_agent::retire_git_hooks(&asked);
         assert_eq!(retired.written, 1, "{:?}", retired.notes);
         assert!(!asked.join(".git/hooks/post-merge").exists());

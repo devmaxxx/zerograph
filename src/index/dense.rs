@@ -220,6 +220,18 @@ impl DenseIndex {
         Ok(model_of(&w.model, store.has("vectors.f32")))
     }
 
+    /// Whether the store's metadata names `model` and at least one of `wanted` among its text
+    /// rows, read without the rows themselves; `None` when the metadata does not read.
+    pub(crate) fn holds_any(store: &Store, model: &str, wanted: &[&str]) -> Option<bool> {
+        #[derive(serde::Deserialize)]
+        struct Written { #[serde(default)] model: String, #[serde(default)] hashes: Vec<String>, #[serde(default)] kinds: Vec<bool> }
+        let meta = store.read_bytes("vectors.json").ok()??;
+        let w: Written = serde_json::from_slice(&meta).ok()?;
+        if !model_of(&w.model, store.has("vectors.f32")).is_some_and(|m| m.eq_ignore_ascii_case(model)) { return Some(false); }
+        let wanted: std::collections::HashSet<&str> = wanted.iter().copied().collect();
+        Some(w.hashes.iter().enumerate().any(|(i, h)| !w.kinds.get(i).copied().unwrap_or(false) && wanted.contains(h.as_str())))
+    }
+
     /// The stamp of the `vectors.f32` these rows were read from, for a reader that holds an
     /// index across requests: a file that no longer matches was rewritten by someone else, and
     /// what is in hand is no longer what an `ask` starting now would load.
@@ -493,7 +505,8 @@ impl DenseIndex {
         let mut missing: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
         for h in wanted { *missing.entry(h.as_str()).or_default() += 1; }
         for sibling in super::siblings::worktrees(home) {
-            let Some(rows) = super::siblings::read(&sibling, &self.model) else { continue };
+            let asked: Vec<&str> = missing.keys().copied().collect();
+            let super::siblings::Lend::Rows(rows) = super::siblings::read(&sibling, &self.model, &asked) else { continue };
             if !rows.lends_to(&self.model, self.claimed_dim) { continue; }
             let mut borrowed = 0;
             for &i in &rows.live {
@@ -1136,6 +1149,49 @@ mod tests {
         std::fs::remove_file(main.join(".zerograph/writer.lock")).unwrap();
         assert_eq!(borrower(&other, &graph("x"), "m").1, 2, "no lock file is created to read under");
         assert!(!main.join(".zerograph/writer.lock").exists());
+    }
+
+    /// A fresh edit's rows are in no sibling, and every answer after it asks for them again: the
+    /// metadata says so without the 50 MB of rows behind it being read.
+    #[cfg(unix)]
+    #[test]
+    fn a_sibling_holding_none_of_the_wanted_rows_is_judged_by_its_metadata_alone() {
+        use crate::index::siblings::{read, Lend};
+        use std::os::unix::fs::PermissionsExt;
+        let (_root, main, _other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", fake);
+        let held = DenseIndex::load(&Store::new(&main)).unwrap().hashes[0].clone();
+        let rows = main.join(".zerograph/vectors.f32");
+        let mode = std::fs::metadata(&rows).unwrap().permissions();
+        std::fs::set_permissions(&rows, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let missed = read(&main, "m", &["a-row-from-a-fresh-edit"]);
+        let wanted = read(&main, "m", &[held.as_str()]);
+        std::fs::set_permissions(&rows, mode).unwrap();
+        assert!(matches!(missed, Lend::Miss), "the rows file was read for a sibling that holds none of them");
+        assert!(matches!(wanted, Lend::Unread), "a sibling that holds a wanted row has its rows read");
+    }
+
+    #[test]
+    fn a_sibling_that_lent_nothing_is_not_read_again_until_its_rows_change() {
+        use crate::index::siblings::{read, Lend};
+        let (_root, main, _other) = crate::index::siblings::tests::two_worktrees();
+        lender(&main, &graph("x"), "m", fake);
+        let meta = main.join(".zerograph/vectors.json");
+        let rows = main.join(".zerograph/vectors.f32");
+        assert!(matches!(read(&main, "m", &["fresh"]), Lend::Miss));
+        std::fs::write(&meta, "{not json").unwrap();
+        std::fs::File::options().write(true).open(&rows).unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(3600)).unwrap();
+        // The rows' stamp moved only now, after the miss above was remembered against the old one.
+        assert!(matches!(read(&main, "m", &["fresh"]), Lend::Unread), "rows that changed are looked at again");
+        assert!(matches!(read(&main, "m", &["fresh"]), Lend::Unread), "an unreadable store is no remembered miss");
+        let (_root2, main2, _other2) = crate::index::siblings::tests::two_worktrees();
+        lender(&main2, &graph("x"), "m", fake);
+        let meta2 = main2.join(".zerograph/vectors.json");
+        assert!(matches!(read(&main2, "m", &["fresh"]), Lend::Miss));
+        std::fs::write(&meta2, "{not json").unwrap();
+        assert!(matches!(read(&main2, "m", &["fresh"]), Lend::Miss), "unchanged rows: the miss is remembered, nothing is read");
+        assert!(matches!(read(&main2, "m", &["fresh", "other"]), Lend::Unread), "a hash not asked about before is looked for");
     }
 
     #[test]
