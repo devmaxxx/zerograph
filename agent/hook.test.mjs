@@ -9,7 +9,7 @@ import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-import { queryWords, searchPattern, binary, rule, RULE_FALLBACK, COMMAND } from './hook.mjs';
+import { queryWords, searchPattern, binary, onPath, bounded, rule, RULE_FALLBACK, COMMAND } from './hook.mjs';
 
 const HOOK = join(dirname(fileURLToPath(import.meta.url)), 'hook.mjs');
 
@@ -36,12 +36,14 @@ function world({ store = true, answer = '', status = 0 } = {}) {
   const argvLog = join(root, 'argv.txt');
   const budgetLog = join(root, 'budget.txt');
   const cwdLog = join(root, 'cwd.txt');
+  const pathLog = join(root, 'path.txt');
   const fake = join(bin, 'fake.mjs');
   writeFileSync(fake, [
     "import { appendFileSync, writeSync } from 'node:fs';",
     `appendFileSync(${JSON.stringify(argvLog)}, process.argv.slice(2).join(' ') + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(budgetLog)}, process.argv[2] + ' ' + (process.env.ZEROGRAPH_READER_BUDGET ?? '-') + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(cwdLog)}, process.cwd() + '\\n', 'utf8');`,
+    `appendFileSync(${JSON.stringify(pathLog)}, (process.env.PATH ?? '') + '\\n', 'utf8');`,
     `writeSync(1, ${JSON.stringify(answer + '\n')});`,
     `process.exit(${status});`,
   ].join('\n'), 'utf8');
@@ -53,7 +55,7 @@ function world({ store = true, answer = '', status = 0 } = {}) {
     ? `@echo off\r\n"${process.execPath}" "${fake}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`);
   if (!WIN) chmodSync(launcher, 0o755);
-  return { root, bin, launcher, argvLog, budgetLog, cwdLog };
+  return { root, bin, launcher, argvLog, budgetLog, cwdLog, pathLog };
 }
 
 function fire(w, payload, env = {}, hook = HOOK) {
@@ -349,6 +351,85 @@ test('a session started in a subdirectory finds the index above it, and a nested
   writeFileSync(join(nested, '.git'), 'gitdir: ../.git/worktrees/worktree\n');
   assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: join(nested, 'src') }, env), null,
     'a checkout of its own ends the walk: its parent\'s index is not its index');
+});
+
+test('in a checkout the store is its top level\'s, as the CLI picks it: a package\'s own store is not read', () => {
+  const w = world({ store: false, answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  const env = { ZEROGRAPH_HOOK_SERVE: '0' };
+  mkdirSync(join(w.root, '.git'));
+  const pkg = join(w.root, 'packages', 'x');
+  mkdirSync(join(pkg, '.zerograph'), { recursive: true });
+  writeFileSync(join(pkg, '.zerograph', 'manifest.json'), '{}');
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: pkg }, env);
+  assert.deepEqual(argv(w).filter((l) => l.includes(pkg)), [], 'the hook answered from a store `zerograph status` does not see');
+
+  mkdirSync(join(w.root, '.zerograph'));
+  writeFileSync(join(w.root, '.zerograph', 'manifest.json'), '{}');
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: pkg, session_id: 'second' }, env);
+  assert.ok(argv(w).some((l) => l.startsWith(`--repo ${w.root} --no-dense prime`)), argv(w).join(' | '));
+});
+
+test('a PATH entry anywhere in the checkout is refused, even from a package with a store of its own', () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  const pkg = join(w.root, 'packages', 'x');
+  mkdirSync(join(pkg, '.zerograph'), { recursive: true });
+  writeFileSync(join(pkg, '.zerograph', 'manifest.json'), '{}');
+  const shim = join(w.root, 'node_modules', '.bin');
+  mkdirSync(shim, { recursive: true });
+  const name = WIN ? 'zerograph.exe' : 'zerograph';
+  writeFileSync(join(shim, name), '');
+  chmodSync(join(shim, name), 0o755);
+  const saved = { bin: process.env.ZEROGRAPH_BIN, old: process.env.REPOGRAPH_BIN, path: process.env.PATH };
+  delete process.env.ZEROGRAPH_BIN;
+  delete process.env.REPOGRAPH_BIN;
+  process.env.PATH = shim;
+  try {
+    assert.equal(binary(pkg), null, 'the checkout\'s node_modules/.bin was taken for the machine\'s');
+  } finally {
+    for (const [k, v] of [['ZEROGRAPH_BIN', saved.bin], ['REPOGRAPH_BIN', saved.old], ['PATH', saved.path]]) {
+      if (v === undefined) delete process.env[k]; else process.env[k] = v;
+    }
+  }
+});
+
+test('the binary inherits no PATH entry inside the checkout, so the `node` an npm launcher asks for is never the checkout\'s', async () => {
+  const w = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  mkdirSync(join(w.root, '.git'));
+  const planted = join(w.root, 'bin');
+  const env = { PATH: [w.bin, planted, dirname(process.execPath)].join(delimiter), ZEROGRAPH_HOOK_SERVE: '0' };
+  fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } }, env);
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env);
+  await waitFor(w, / update /);
+  const paths = readFileSync(w.pathLog, 'utf8').trim().split('\n');
+  assert.ok(paths.length >= 2, paths.join(' | '));
+  assert.ok(paths.every((p) => !p.split(delimiter).includes(planted)), paths.join(' | '));
+  assert.ok(paths.every((p) => p.split(delimiter).includes(w.bin)), 'the machine\'s entries stay');
+});
+
+test('on Windows a zerograph.exe anywhere on PATH wins over an earlier npm .cmd shim', () => {
+  const npm = mkdtempSync(join(tmpdir(), 'zerograph-npm-'));
+  const cargo = mkdtempSync(join(tmpdir(), 'zerograph-cargo-'));
+  writeFileSync(join(npm, 'zerograph.cmd'), '');
+  writeFileSync(join(cargo, 'zerograph.exe'), '');
+  const path = process.env.PATH;
+  process.env.PATH = [npm, cargo].join(delimiter);
+  try {
+    assert.equal(onPath(null, 'win32'), join(cargo, 'zerograph.exe'));
+  } finally {
+    process.env.PATH = path;
+  }
+});
+
+test('a batch-file call that runs out of time has its whole tree killed, not just the shell', { skip: WIN }, () => {
+  const dir = mkdtempSync(join(tmpdir(), 'zerograph-bounded-'));
+  const killed = join(dir, 'killed.txt');
+  const kill = [process.execPath, '-e', `require('fs').writeFileSync(${JSON.stringify(killed)}, process.argv[1]); process.kill(Number(process.argv[1]))`];
+  const started = Date.now();
+  const r = bounded('sleep', ['30'], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }, kill, 300);
+  assert.notEqual(r.status, 0);
+  assert.ok(Date.now() - started < 5000, `waited ${Date.now() - started} ms`);
+  assert.match(readFileSync(killed, 'utf8'), /^\d+$/, 'the tree killer was handed the shell\'s pid');
 });
 
 test('a hook run through a symlinked path still answers', () => {

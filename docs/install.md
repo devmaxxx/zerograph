@@ -112,7 +112,9 @@ the full `zerograph status` report. Install it at a Claude Code prompt:
 It asks the `zerograph` on `PATH` by its absolute path, and never a binary inside the project: a
 cloned repository that ships `node_modules/.bin/zerograph` or `target/*/zerograph` does not get it
 run, whether `PATH` names that directory relatively or absolutely. For a project-local install,
-name its absolute path in the `binary` option in `/config`; a relative one is ignored. A zerograph without `status`
+name its absolute path in the `binary` option in `/config`; a relative path is ignored, and a bare
+name such as `zerograph` means the `PATH` lookup. On Windows a `zerograph.exe` on `PATH` is asked
+before npm's `zerograph.cmd` shim, which the mod runs through `cmd`. A zerograph without `status`
 shows nothing on the line, and `/zerograph` falls back to the tail of `background.log`.
 
 `zerograph status --json` walks the whole tree to count the files behind, so the mod runs it at

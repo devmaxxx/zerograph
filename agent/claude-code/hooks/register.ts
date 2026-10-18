@@ -16,26 +16,43 @@ type Api = Parameters<Hook<'session.start'>>[0]
 // Whether `path` is absolute in either platform's spelling; the mod is told no platform.
 const isAbsolute = (path: string) => path.startsWith('/') || /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
 
-// Whether `dir` is `root` or below it, in either separator.
-function inside(root: string, dir: string): boolean {
-  const norm = (p: string) => p.replace(/\\/g, '/').replace(/\/+$/, '')
+// Whether `dir` is `root` or below it, in either separator; Windows paths name one file in any case.
+function inside(root: string, dir: string, win: boolean): boolean {
+  const norm = (p: string) => {
+    const slashed = p.replace(/\\/g, '/').replace(/\/+$/, '')
+    return win ? slashed.toLowerCase() : slashed
+  }
   const r = norm(root)
   const d = norm(dir)
   return d === r || d.startsWith(`${r}/`)
 }
 
+// The checkout the session's root is in: a session opened in a package of a monorepo has the
+// whole checkout around it, and a PATH entry anywhere in that is still the checkout's file.
+async function checkoutOf($: Api, root: string): Promise<string> {
+  for (let d = root; ; ) {
+    if (await $.fs.exists(`${d}/.git`).catch(() => false)) return d
+    const up = d.replace(/[\\/][^\\/]*$/, '')
+    if (!up || up === d || /^[A-Za-z]:$/.test(up)) return root
+    d = up
+  }
+}
+
 // The configured binary, else PATH's by its absolute path, and never one under the checkout: a
 // cloned repository that ships an executable `node_modules/.bin/zerograph` would have it run the
-// moment a session opened in it. A bare name would let a relative PATH entry, or Windows' search
-// of the working directory first, pick that file; so would an absolute entry inside the checkout.
-async function binaryOf($: Api, configured: string, root: string): Promise<string | undefined> {
-  if (configured) return isAbsolute(configured) ? configured : undefined
+// moment a session opened in it. A relative path would let a relative PATH entry, or Windows'
+// search of the working directory first, pick that file; so would an absolute entry inside the
+// checkout. A bare name is what 0.6.4 took for a PATH lookup, so it still means one.
+async function binaryOf($: Api, configured: string, root: string, checkout: string): Promise<string | undefined> {
+  if (configured && /[\\/]/.test(configured)) return isAbsolute(configured) ? configured : undefined
   const path = (await $.env.get('PATH').catch(() => undefined)) ?? ''
   const win = path.includes(';') || /^[A-Za-z]:/.test(root)
+  const dirs = path.split(win ? ';' : ':').filter(dir => dir && isAbsolute(dir) && !inside(checkout, dir, win))
+  // Every `.exe` before any `.cmd`: npm's global shim is a `.cmd`, which only `cmd` can start, and
+  // `cmd` expands `%NAME%` in what it runs and outlives nothing it is killed for.
   const names = win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph']
-  for (const dir of path.split(win ? ';' : ':')) {
-    if (!dir || !isAbsolute(dir) || inside(root, dir)) continue
-    for (const name of names) {
+  for (const name of names) {
+    for (const dir of dirs) {
       const file = `${dir.replace(/[\\/]+$/, '')}${win ? '\\' : '/'}${name}`
       const stat = await $.fs.stat(file).catch(() => undefined)
       if (stat?.kind === 'file') return file
@@ -44,14 +61,26 @@ async function binaryOf($: Api, configured: string, root: string): Promise<strin
   return undefined
 }
 
+// How to start `bin`. `$.process.run` takes no shell, and Node has refused to start a batch file
+// without one since CVE-2024-27980, so a `.cmd` goes through `cmd` by hand. `call` keeps the
+// command line from opening on a quote, which `cmd /c` would strip along with the last one.
+async function launch($: Api, bin: string): Promise<string[]> {
+  if (!/\.(cmd|bat)$/i.test(bin)) return [bin]
+  const comspec = (await $.env.get('ComSpec').catch(() => undefined)) ?? 'C:\\Windows\\System32\\cmd.exe'
+  return [comspec, '/d', '/c', 'call', bin]
+}
+
 // `undefined` when no zerograph is found, it has no `status`, or it failed.
 async function runStatus($: Api, configured: string, json: boolean): Promise<string | undefined> {
   const root = await $.session.root()
-  const bin = await binaryOf($, configured, root)
+  const checkout = await checkoutOf($, root)
+  const bin = await binaryOf($, configured, root, checkout)
   if (!bin) return undefined
-  const argv = json ? [bin, 'status', '--json'] : [bin, 'status']
-  // `status` finds its store from the working directory; the binary was resolved without it.
-  const ran = await $.process.run(argv, { cwd: root, timeoutMs: 20_000 }).catch(() => undefined)
+  const argv = [...(await launch($, bin)), '--repo', checkout, 'status', ...(json ? ['--json'] : [])]
+  // Never from the checkout: npm's `.cmd` shim starts a bare `node`, and `cmd` looks for that in
+  // the working directory before PATH. The binary is told its repository by `--repo`.
+  const home = bin.replace(/[\\/][^\\/]*$/, '') || '/'
+  const ran = await $.process.run(argv, { cwd: home, timeoutMs: 20_000 }).catch(() => undefined)
   return ran?.exitCode === 0 && ran.stdout.trim() ? ran.stdout : undefined
 }
 

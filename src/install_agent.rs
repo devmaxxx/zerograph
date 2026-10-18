@@ -210,7 +210,7 @@ fn write_if_changed(path: &Path, text: &str, report: &mut Report) -> Result<()> 
 pub fn codex_hooks_block(hook_abs: &str) -> String {
     let entry = |matcher: &str, timeout: u64| serde_json::json!({
         "matcher": matcher,
-        "hooks": [{ "type": "command", "command": format!("node '{hook_abs}'"), "timeout": timeout }]
+        "hooks": [{ "type": "command", "command": node_command(hook_abs, cfg!(windows)), "timeout": timeout }]
     });
     serde_json::to_string_pretty(&serde_json::json!({
         "hooks": {
@@ -219,6 +219,12 @@ pub fn codex_hooks_block(hook_abs: &str) -> String {
             "PostToolUse": [entry("apply_patch|Edit|Write", 10)],
         }
     })).unwrap_or_default()
+}
+
+/// `node <hook>` as the shell Codex hands it to reads it. A POSIX shell takes the path as one
+/// word through `shell_word`; `cmd` knows only double quotes, which a Windows path cannot contain.
+fn node_command(hook_abs: &str, windows: bool) -> String {
+    if windows { format!("node \"{hook_abs}\"") } else { format!("node {}", shell_word(hook_abs)) }
 }
 
 /// The hook `~/.codex/hooks.json` should run, for an install in `root`. Codex's hooks are per user,
@@ -1565,6 +1571,22 @@ mod tests {
         assert_eq!(events.len(), 3, "{events:?}");
         assert!(v["hooks"]["PreToolUse"].is_null(), "the interceptor is not carried over blind");
         assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().contains("/abs/hook.mjs"));
+    }
+
+    /// A checkout directory named with a `'` must not close the quoting once the block is pasted;
+    /// on Windows `cmd` reads no single quote as quoting at all.
+    #[test]
+    fn the_codex_hook_command_quotes_the_path_for_the_shell_that_runs_it() {
+        let posix = "/home/o'brien/my repo/.codex/hooks/zerograph-hook.mjs";
+        let cmd = node_command(posix, false);
+        #[cfg(unix)]
+        {
+            let word = cmd.strip_prefix("node ").unwrap();
+            let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {word}")).output().unwrap();
+            assert_eq!(String::from_utf8_lossy(&out.stdout), posix, "{cmd}");
+        }
+        assert!(cmd.starts_with("node "), "{cmd}");
+        assert_eq!(node_command(r"C:\Users\o'brien\repo\hook.mjs", true), r#"node "C:\Users\o'brien\repo\hook.mjs""#);
     }
 
     #[test]

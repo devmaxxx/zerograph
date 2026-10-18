@@ -83,7 +83,7 @@ fn binary_at(path: &Path) -> std::io::Result<bool> {
     Ok(binary(&head))
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
     pub files: BTreeMap<String, String>,
     /// A manifest written before the stat cache existed has none; every file is hashed once more
