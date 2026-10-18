@@ -32,6 +32,11 @@ test('owed vectors and a configured model the vectors are not under are both due
   expect(lineOf(r)).toBe('◇ zerograph · 4 to embed · model switch due')
 })
 
+test('a store a newer release wrote reads as read-only and names that release', () => {
+  expect(lineOf({ ...base, tree: { state: 'newer_grammar', grammar: 7, release: '0.7.0' } })).toBe('◇ zerograph · read-only, written by zerograph 0.7.0')
+  expect(lineOf({ ...base, tree: { state: 'newer_grammar', grammar: 7, release: '' } })).toBe('◇ zerograph · read-only, written by a newer release')
+})
+
 test('an empty index says so', () => {
   expect(lineOf({ ...base, index: { state: 'empty' } })).toBe('◇ zerograph · no index')
   expect(lineOf({ ...base, index: { state: 'unreadable', error: 'x' } })).toBe('◇ zerograph · ⚠ index unreadable')

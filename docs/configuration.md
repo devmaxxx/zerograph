@@ -36,6 +36,11 @@ keys and keystores, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, cloud cre
 The store writes its own `.gitignore` holding `*`, so `.zerograph/` stays out of a commit in a
 repository that never listed it.
 
+A directory below the root that holds a `.git` of its own — a worktree such as
+`.claude/worktrees/*`, a clone, or a git submodule — is another checkout and is never walked,
+whether or not an ignore file names it. Submodules therefore leave the index too: build one with
+`--repo` pointed at it if its files should be answered from.
+
 `text_globs` (empty by default) takes in every file no doc or code glob claims whose content is
 text — configuration, YAML, JSON, data — as one node each, searchable by `ask` and named by
 `changes`, with nothing parsed below it. A file is binary when its first 8,000 bytes hold a NUL.

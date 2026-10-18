@@ -99,6 +99,10 @@ pub struct Manifest {
     /// whose kind moved diffs as changed. Empty in a manifest written before kinds were recorded,
     /// which compares nothing until the next save writes them.
     #[serde(default)] pub kinds: BTreeMap<String, FileKind>,
+    /// The zerograph release that read the graph beside this manifest, so a store another release
+    /// wrote can be named by more than its grammar number. Empty in a manifest written before it
+    /// was recorded.
+    #[serde(default)] pub release: String,
 }
 
 #[derive(Debug, Default)]
@@ -156,6 +160,13 @@ fn is_store(e: &ignore::DirEntry) -> bool {
     e.depth() == 1 && (e.file_name() == crate::store::DIR || e.file_name() == crate::store::LEGACY_DIR)
 }
 
+/// A directory below the root that holds a `.git` of its own — a worktree, a clone, a submodule —
+/// is another checkout with an index of its own, and walking it would fold its files into this
+/// one's. Kept out whether or not the repository's ignore file names it.
+fn is_nested_checkout(e: &ignore::DirEntry) -> bool {
+    e.depth() > 0 && e.file_type().is_some_and(|t| t.is_dir()) && std::fs::symlink_metadata(e.path().join(".git")).is_ok()
+}
+
 fn walk_inner(repo: &Path, cfg: &Config, prev: &Manifest, count: bool) -> Result<(Vec<Entry>, usize)> {
     let docs = globs(&cfg.doc_globs)?;
     let code = globs(&cfg.code_globs)?;
@@ -178,7 +189,7 @@ fn walk_inner(repo: &Path, cfg: &Config, prev: &Manifest, count: bool) -> Result
     // git checkout alone.
     let walker = ignore::WalkBuilder::new(repo)
         .hidden(false)
-        .filter_entry(|e| e.file_name() != ".git" && !is_store(e))
+        .filter_entry(|e| e.file_name() != ".git" && !is_store(e) && !is_nested_checkout(e))
         .git_ignore(true)
         .build();
     for dent in walker {
@@ -244,15 +255,29 @@ impl Manifest {
             stamps: entries.iter().filter_map(|e| Some((e.rel.clone(), e.stamp?))).collect(),
             grammar: GRAMMAR,
             kinds: entries.iter().map(|e| (e.rel.clone(), e.kind)).collect(),
+            release: env!("CARGO_PKG_VERSION").to_string(),
         }
     }
 
-    /// Whether the graph beside this manifest was read by a grammar other than this build's — a
-    /// store every hash calls current and that is still short of what a re-read would find, or
-    /// long by what a newer build put in it. Different, not older: either way it is not the store
-    /// this build would have written, and one walk is what makes it one.
+    /// Whether the graph beside this manifest was read by an older grammar than this build's — a
+    /// store every hash calls current and that is still short of what a re-read would find. One
+    /// walk is what makes it the store this build would have written.
     pub fn stale_grammar(&self) -> bool {
-        self.grammar != GRAMMAR
+        self.grammar < GRAMMAR
+    }
+
+    /// Whether a newer release read the graph beside this manifest. This build cannot write the
+    /// store it would make — re-reading it would stamp it with the older grammar and drop what the
+    /// newer one found — so it answers from it as it stands and writes nothing.
+    pub fn newer_grammar(&self) -> bool {
+        self.grammar > GRAMMAR
+    }
+
+    /// The one line every reader and writer says about a store [`Manifest::newer_grammar`] holds.
+    pub fn newer_store_line(&self) -> String {
+        let by = match self.release.is_empty() { true => String::new(), false => format!(" (zerograph {})", self.release) };
+        format!("grammar: this store was read by generation {}{by} and this build ({}) reads by {GRAMMAR}; it is left as it stands — answered read-only, never rewritten; a newer zerograph refreshes it",
+            self.grammar, env!("CARGO_PKG_VERSION"))
     }
 
     pub fn diff(&self, now: &[Entry]) -> Diff {
@@ -338,6 +363,7 @@ mod tests {
             stamps: BTreeMap::new(),
             grammar: GRAMMAR,
             kinds: BTreeMap::new(),
+            release: String::new(),
         }).unwrap()).unwrap();
         assert!(old.stamps.is_empty());
         let again = walk(d.path(), &Config::default(), &old).unwrap();
@@ -353,6 +379,46 @@ mod tests {
         assert_eq!(old.grammar, 0);
         assert!(old.stale_grammar());
         assert!(!Manifest::from_entries(&[]).stale_grammar());
+    }
+
+    // A newer release's store is not behind this build: re-reading it would stamp it with the
+    // older grammar and drop what the newer one found.
+    #[test]
+    fn a_manifest_a_newer_grammar_wrote_is_newer_not_stale_and_names_both_generations() {
+        let newer = Manifest { grammar: GRAMMAR + 1, release: "9.9.9".into(), ..Manifest::default() };
+        assert!(newer.newer_grammar());
+        assert!(!newer.stale_grammar());
+        let line = newer.newer_store_line();
+        assert!(line.contains(&format!("generation {}", GRAMMAR + 1)) && line.contains(&format!("reads by {GRAMMAR}")), "{line}");
+        assert!(line.contains("zerograph 9.9.9") && !line.contains('\n'), "{line}");
+        assert!(!Manifest::from_entries(&[]).newer_grammar());
+    }
+
+    #[test]
+    fn a_manifest_records_the_release_that_wrote_it_and_one_without_it_still_loads() {
+        assert_eq!(Manifest::from_entries(&[]).release, env!("CARGO_PKG_VERSION"));
+        let old: Manifest = serde_json::from_str(&format!("{{\"files\":{{}},\"grammar\":{GRAMMAR}}}")).unwrap();
+        assert!(old.release.is_empty());
+        assert!(!old.newer_store_line().contains("(zerograph )"));
+    }
+
+    // A worktree, clone or submodule inside the checkout has a `.git` of its own; its files are
+    // that checkout's, whether or not an ignore file names the directory.
+    #[test]
+    fn a_checkout_nested_below_the_root_is_not_walked() {
+        let d = repo();
+        for (nested, git_is_file) in [(".claude/worktrees/wt", true), ("vendored/clone", false)] {
+            let root = d.path().join(nested);
+            std::fs::create_dir_all(root.join("docs")).unwrap();
+            std::fs::write(root.join("docs/n.md"), "# nested\n").unwrap();
+            match git_is_file {
+                true => std::fs::write(root.join(".git"), "gitdir: /elsewhere\n").unwrap(),
+                false => std::fs::create_dir_all(root.join(".git")).unwrap(),
+            }
+        }
+        let rels: Vec<String> = walk(d.path(), &Config::default(), &Manifest::default()).unwrap().into_iter().map(|e| e.rel).collect();
+        assert!(rels.iter().any(|r| r == "docs/a.md"), "the root's own files stay: {rels:?}");
+        assert!(rels.iter().all(|r| !r.contains("n.md")), "{rels:?}");
     }
 
     // The stamp is what decides whether a file is read at all: with the recorded mtime and length

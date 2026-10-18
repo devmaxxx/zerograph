@@ -85,6 +85,9 @@ pub(crate) struct Read {
     /// did not fit the budget or another writer held the lock.
     pub behind: Option<(Vec<String>, String)>,
     pub writer: Writer,
+    /// A line the reader is owed about the store itself rather than about the tree: there is
+    /// none, or a newer release wrote it.
+    pub note: Option<String>,
 }
 
 /// Whether this reader may write the store, decided once at the walk and held to by the dense
@@ -111,7 +114,18 @@ pub(crate) enum Writer {
 pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::Store, stale: bool, timing: &Timing, budget: &refresh::Budget) -> anyhow::Result<Read> {
     let (mut graph, manifest, source) = store.load_traced()?;
     timing.stage("graph loaded");
-    if stale { return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::PerAnswer }); }
+    // Before the lock: taking it writes into the store, and this build may write nothing into a
+    // newer one.
+    if manifest.newer_grammar() {
+        return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::Barred, note: Some(manifest.newer_store_line()) });
+    }
+    // Taking the lock makes the directory, and a read from a directory nobody built would leave
+    // a store behind in it; building one is `build`'s to do.
+    if !store.stands() {
+        let note = format!("index: none at {} — `zerograph build` builds it", repo.display());
+        return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::Barred, note: Some(note) });
+    }
+    if stale { return Ok(Read { graph, refreshed: None, behind: None, writer: Writer::PerAnswer, note: None }); }
     let writer = match store.try_lock_writer() {
         Ok(Some(lock)) => Writer::Held(lock),
         Ok(None) => Writer::Barred,
@@ -129,7 +143,7 @@ pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::St
     if diff.changed.is_empty() && diff.removed.is_empty() && !manifest.stale_grammar() {
         // A reader that found the lock held writes nothing at all: the stamps it would record
         // are older than the manifest the holder is about to save.
-        if busy { return Ok(Read { graph, refreshed: None, behind: None, writer }); }
+        if busy { return Ok(Read { graph, refreshed: None, behind: None, writer, note: None }); }
         crate::record_stamps(store, &manifest, &entries)?;
         // A store another release or a bare `graph.json` left without a mirror pays the JSON
         // parse once; a refresh below writes the mirror on its own.
@@ -137,7 +151,7 @@ pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::St
             store.write_mirror("graph.json", read, &graph)?;
             timing.stage("mirror written");
         }
-        return Ok(Read { graph, refreshed: None, behind: None, writer });
+        return Ok(Read { graph, refreshed: None, behind: None, writer, note: None });
     }
     let work = match manifest.stale_grammar() { true => entries.len(), false => diff.changed.len() + diff.removed.len() };
     if busy || !budget.fits(work, refresh::FILE_COST) {
@@ -156,11 +170,11 @@ pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::St
             true => { let mut all: Vec<String> = entries.iter().map(|e| e.rel.clone()).collect(); all.sort(); all }
             false => refresh::files_of(&diff),
         };
-        return Ok(Read { graph, refreshed: None, behind: Some((files, line)), writer: Writer::Barred });
+        return Ok(Read { graph, refreshed: None, behind: Some((files, line)), writer: Writer::Barred, note: None });
     }
     let r = crate::apply_diff(repo, store, &mut graph, &entries, &diff, &manifest, &crate::extractors(repo, cfg)?)?;
     timing.stage("refreshed");
-    Ok(Read { graph, refreshed: Some(r), behind: None, writer })
+    Ok(Read { graph, refreshed: Some(r), behind: None, writer, note: None })
 }
 
 /// A reader's sync in small steps that grow, so the first one measures the machine's rate before
@@ -219,8 +233,11 @@ impl Context {
         // of its own bytes, since a `stat` after it may already see another writer's graph.
         let read_at = store.stamp("graph.json");
         let (graph, refreshed, graph_at, behind, writer) = match graph_for_ask(repo, cfg, &store, stale, &timing, &budget) {
-            Ok(Read { graph, refreshed: None, behind, writer }) => (graph, None, read_at, behind, writer),
-            Ok(Read { graph, refreshed: Some(r), behind, writer }) => { let at = r.graph_at; (graph, Some(r), at, behind, writer) }
+            Ok(Read { graph, refreshed, behind, writer, note }) => {
+                notices.extend(note);
+                let at = refreshed.as_ref().map_or(read_at, |r| r.graph_at);
+                (graph, refreshed, at, behind, writer)
+            }
             // A store that cannot be written (read-only checkout, a walk that failed) still
             // holds an answer: say once that it may be behind, then give the stored one.
             Err(err) => { notices.push(format!("refresh: skipped ({err:#})")); (store.load()?.0, None, None, None, Writer::Unlocked) }
@@ -497,6 +514,9 @@ impl Context {
     pub(crate) fn adopt(&mut self, w: &crate::Watcher, refreshed: Option<crate::UpdateReport>) -> anyhow::Result<()> {
         self.graph = w.graph.clone();
         self.graph_at = w.graph_at;
+        // A newer release may have written the store since this context opened; from then on its
+        // per-answer vector sync would write into a store this build may not write.
+        if w.manifest.newer_grammar() { self.writer = Writer::Barred; }
         // An adopted graph is a new population, so the indexes built over the old one cannot
         // outlive this call.
         *self.lexical.borrow_mut() = None;

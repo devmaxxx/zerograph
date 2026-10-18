@@ -40,6 +40,7 @@ export function lineOf(r: Report): string {
   if (warnings > 0) parts.push(`⚠ ${warnings}`)
   if (r.tree.state === 'behind') parts.push(`${r.tree.files?.length ?? 0} behind`)
   if (r.tree.state === 'other_grammar') parts.push('re-read due')
+  if (r.tree.state === 'newer_grammar') parts.push(`read-only, written by ${r.tree.release ? `zerograph ${r.tree.release}` : 'a newer release'}`)
   if (r.vectors?.state === 'rows' && r.vectors.owed > 0) parts.push(`${r.vectors.owed} to embed`)
   if (r.model.recorded && r.model.configured && r.model.recorded.toLowerCase() !== r.model.configured.toLowerCase()) parts.push('model switch due')
   if (parts.length === 1) parts.push('in sync')
