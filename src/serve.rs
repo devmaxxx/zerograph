@@ -390,6 +390,17 @@ pub fn stop(repo: &Path) -> Result<bool> {
     Ok(true)
 }
 
+/// Whether a server of this user's answers at `path`. The connect is closed before any hello,
+/// which the server reads as a liveness probe: not a question, and not counted against `--idle`.
+pub fn answering(path: &Path) -> bool {
+    sys::present(path) && sys::ours(path) && sys::connect(path).is_ok()
+}
+
+/// The line `run` logs once it listens, which is where one server's lines in `serve.log` begin.
+pub(crate) fn is_start_line(line: &str) -> bool {
+    line.starts_with("serve: ") && line.ends_with("; Ctrl-C stops")
+}
+
 /// `serve --detach`: the same server in a process of its own, with no console and its output in
 /// `serve.log`, and this one gone once the socket answers. Waiting for the bind is what lets the
 /// next command be a question rather than a race with the start.

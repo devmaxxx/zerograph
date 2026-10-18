@@ -20,6 +20,7 @@ mod priority;
 mod query;
 mod refresh;
 mod serve;
+mod status;
 mod store;
 mod text;
 mod walk;
@@ -112,6 +113,16 @@ enum Cmd {
     },
     /// Ends the `serve` answering for this repository, through the exit that removes its socket.
     Stop,
+    /// What the index holds and what is being done to it: its size, the files the tree is ahead
+    /// by, the model that wrote the vectors against the configured one, whether a background
+    /// refresh is running and how far it has got with what it said on the way, and whether a
+    /// `serve` answers. Reads the store and its logs; never refreshes, never writes.
+    Status {
+        #[arg(long, conflicts_with = "follow")] json: bool,
+        /// Prints the refresh line each time it moves until the running refresh ends, then its
+        /// last line; fails when that line is an error.
+        #[arg(long)] follow: bool,
+    },
     /// Keeps the store in step with the tree for readers that do not refresh themselves —
     /// editors, MCP servers. Polls, applies the same incremental update `ask` does, and embeds
     /// what changed, at background priority. Ctrl-C stops it; every write is a rename, so there is
@@ -235,7 +246,7 @@ impl Cmd {
         match self {
             Cmd::Ask { json, .. } | Cmd::Explain { json, .. } | Cmd::Impact { json, .. }
             | Cmd::Trace { json, .. } | Cmd::Changes { json, .. } | Cmd::Verify { json, .. }
-            | Cmd::Prime { json, .. } | Cmd::Families { json, .. } | Cmd::Model { json, .. } => *json,
+            | Cmd::Prime { json, .. } | Cmd::Status { json, .. } | Cmd::Families { json, .. } | Cmd::Model { json, .. } => *json,
             // Listed rather than `_`, so a command that gains `--json` fails to compile here
             // until its errors are given the JSON form too.
             Cmd::Build | Cmd::Update { .. } | Cmd::Serve { .. } | Cmd::Stop | Cmd::Watch { .. }
@@ -1062,6 +1073,15 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let args = ["serve", "--every", &every.to_string(), "--batch", &batch.to_string(), "--idle", &idle.to_string(), "--idle-model", &idle_model.to_string()]
                 .map(String::from);
             serve::detach(&repo, cli.no_dense, &args)
+        }
+        Cmd::Status { json, follow } => {
+            let report = status::report(&repo, false)?;
+            match json {
+                true => println!("{}", serde_json::to_string(&report)?),
+                false => print!("{}", status::render(&report, &repo, "`zerograph build`")),
+            }
+            if follow { status::follow(&repo)?; }
+            Ok(())
         }
         Cmd::Stop => {
             match serve::stop(&repo)? {
