@@ -100,9 +100,9 @@ enum Cmd {
         /// Answers in this process even when a `serve` is listening.
         #[arg(long)] no_serve: bool,
     },
-    /// Answers `ask` from a resident process over `.zerograph/serve.sock`: the model, the
-    /// vectors and the indexes open once. Refreshes before every answer the way `ask` does,
-    /// polls between them like `watch`, exits after `--idle` seconds without a question.
+    /// Answers `ask` from a resident process over a socket in `~/.cache/zerograph/sock`: the
+    /// model, the vectors and the indexes open once. Refreshes before every answer the way `ask`
+    /// does, polls between them like `watch`, exits after `--idle` seconds without a question.
     Serve {
         #[arg(long, default_value_t = 30)] every: u64,
         #[arg(long, default_value_t = 1)] batch: usize,

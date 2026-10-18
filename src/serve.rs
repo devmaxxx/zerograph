@@ -166,29 +166,47 @@ fn ack_line() -> String { serde_json::to_string(&Ack { ack: VERSION.into() }).un
 /// cost every question half that timer: at 50 ms, measured, half a lexical answer.
 const WAKE: Duration = Duration::from_millis(250);
 
-/// The socket a repository's server binds and its clients connect to: `.zerograph/serve.sock`,
-/// which is where a person looks for it — unless that name will not fit in `sun_path`, 104 bytes
-/// on macOS including the NUL, in which case a name derived from the canonical repository path
-/// goes in `fallback_dir`. 100 rather than 104 is one margin for every platform, and
-/// four bytes is not worth two numbers. Server and client both come here, so the fallback is
-/// never half-taken. The hash names a file; it defends nothing, which is why it is four lines of
-/// FNV rather than a dependency.
+/// The socket a repository's server binds and its clients connect to:
+/// `~/.cache/zerograph/sock/<hash>.sock`, the hash of the canonical repository path. One place
+/// every client finds whatever it is: a socket inside the checkout moved to the temp directory
+/// once the checkout sat deep enough, and the temp directory is `$TMPDIR`, which two processes of
+/// one user — a shell and an editor's agent — can disagree on, so each found a different server
+/// or none. Home is read the way the model cache reads it, through the platform rather than
+/// `$HOME`. Server, client and `status` all come here, so no side guesses.
 pub fn socket_path(repo: &Path) -> PathBuf {
-    let in_repo = crate::store::dir_of(repo).join("serve.sock");
-    if in_repo.as_os_str().len() <= 100 { return in_repo; }
+    socket_path_under(std::env::home_dir().as_deref(), repo)
+}
+
+/// `socket_path` against a given home. The name has to fit in `sun_path`, 104 bytes on macOS
+/// including the NUL; 100 rather than 104 is one margin for every platform, and four bytes is not
+/// worth two numbers. A home too deep for that, or none at all, puts the same name in
+/// `fallback_dir`. A relative home is no home: it would put the socket wherever each process
+/// happens to stand.
+fn socket_path_under(home: Option<&Path>, repo: &Path) -> PathBuf {
+    let name = socket_name(repo);
+    if let Some(home) = home.filter(|h| h.is_absolute()) {
+        let path = home.join(".cache").join("zerograph").join("sock").join(format!("{name}.sock"));
+        if path.as_os_str().len() <= 100 { return path; }
+    }
+    fallback_dir().join(format!("zerograph-{name}.sock"))
+}
+
+/// The hash names a file; it defends nothing, which is why it is four lines of FNV rather than a
+/// dependency. Canonical, so a checkout reached through a link or a relative `--repo` is one name.
+fn socket_name(repo: &Path) -> String {
     let canonical = std::fs::canonicalize(repo).unwrap_or_else(|_| repo.to_path_buf());
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in canonical.as_os_str().as_encoded_bytes() {
         h ^= u64::from(*b);
         h = h.wrapping_mul(0x0000_0100_0000_01b3);
     }
-    fallback_dir().join(format!("zerograph-{h:016x}.sock"))
+    format!("{h:016x}")
 }
 
-/// Where a socket goes when the repository's own path is too long. `/tmp` is shared, and a name
-/// there that anyone can predict is a name another user can bind first and answer under, so on
-/// unix the socket sits in a directory named for the user, which `prepare_socket_dir` makes
-/// private. Windows' temp directory is already per-user.
+/// Where a socket goes when home cannot hold one. `/tmp` is shared, and a name there that anyone
+/// can predict is a name another user can bind first and answer under, so on unix the socket sits
+/// in a directory named for the user, which `prepare_socket_dir` makes private. Windows' temp
+/// directory is already per-user.
 #[cfg(unix)]
 fn fallback_dir() -> PathBuf {
     // SAFETY: geteuid has no preconditions and cannot fail.
@@ -200,12 +218,16 @@ fn fallback_dir() -> PathBuf { std::env::temp_dir() }
 
 /// Makes the directory a socket will be bound in, refusing one that is not ours alone: another
 /// user may have created the name first, or planted a symlink at it, and a socket bound there is
-/// theirs to read and replace. Only the fallback directory is checked; the repository's own
-/// `.zerograph` is the repository owner's to protect.
+/// theirs to read and replace. The home cache is held to the same rule as the temp directory —
+/// a shared or mis-permissioned home would otherwise hand the socket over just the same. Only the
+/// leaf is made private: the directories above it are the user's own to arrange.
 #[cfg(unix)]
 fn prepare_socket_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
-    let Some(dir) = path.parent().filter(|d| *d == fallback_dir()) else { return Ok(()) };
+    let Some(dir) = path.parent() else { return Ok(()) };
+    if let Some(above) = dir.parent() {
+        std::fs::create_dir_all(above).with_context(|| format!("create {}", above.display()))?;
+    }
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -220,8 +242,13 @@ fn prepare_socket_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// The profile directory's own ACL is what keeps others out on Windows; all a first `serve` there
+/// owes the socket is a directory to be bound in.
 #[cfg(not(unix))]
-fn prepare_socket_dir(_path: &Path) -> Result<()> { Ok(()) }
+fn prepare_socket_dir(path: &Path) -> Result<()> {
+    let Some(dir) = path.parent() else { return Ok(()) };
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))
+}
 
 /// What a `stat` says about `zerograph.toml`, or None where there is none — the configuration a
 /// one-shot `ask` would read, watched so a resident process cannot answer under an older one.
@@ -734,26 +761,82 @@ mod tests {
     }
 
 
-    /// `sun_path` is 104 bytes on macOS, including the NUL, so a repository under a deep enough
-    /// path cannot bind a socket inside itself at all — which was every store copy the resource
-    /// rounds worked on. The name moves; the way both sides compute it does not.
-    #[test]
-    fn a_deep_repository_gets_a_socket_that_fits() {
-        let deep = std::path::PathBuf::from("/private/tmp").join("a".repeat(120));
-        let p = socket_path(&deep);
-        assert!(p.as_os_str().len() <= 100, "{}", p.display());
-        assert!(p.file_name().unwrap().to_string_lossy().starts_with("zerograph-"), "{}", p.display());
-        #[cfg(unix)]
-        assert!(p.parent().unwrap().ends_with(format!("zerograph-{}", unsafe { libc::geteuid() })), "the fallback is a directory of the user's own: {}", p.display());
-        assert_eq!(socket_path(&deep), p, "a client that computes it again finds the same name");
-        assert_ne!(socket_path(&deep.join("x")), p, "another repository is another socket");
+    /// A socket bound where `socket_path` puts it, for a test that plays the server: the directory
+    /// made the way `run` makes it, and the file gone when the test is, since the name lives in
+    /// the user's own cache rather than in the test's temp directory.
+    struct Bound(std::path::PathBuf);
+
+    impl Bound {
+        fn at(repo: &std::path::Path) -> (sys::Listener, Bound) {
+            let path = socket_path(repo);
+            super::prepare_socket_dir(&path).unwrap();
+            let _ = std::fs::remove_file(&path);
+            (sys::bind(&path).unwrap(), Bound(path))
+        }
     }
 
-    /// `serve` unlinks a stale socket and binds a new one before anything else touches the store,
-    /// so a `.zerograph` that is a link was acted on before `ensure_dir` could refuse it.
+    impl Drop for Bound {
+        fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+    }
+
+    /// An absolute path on the platform the test runs on: `/home` is relative on Windows, and a
+    /// relative home is no home.
+    fn rooted(rest: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(if cfg!(windows) { r"C:\" } else { "/" }).join(rest)
+    }
+
+    /// One place every client finds: a checkout's socket does not move with how deep the checkout
+    /// sits, nor with a `TMPDIR` two processes of one user can disagree on.
+    #[test]
+    fn a_repository_gets_its_socket_under_the_user_cache() {
+        let home = &rooted("home/u");
+        let repo = std::path::Path::new("/private/tmp").join("a".repeat(120));
+        let p = super::socket_path_under(Some(home), &repo);
+        assert_eq!(p.parent().unwrap(), home.join(".cache/zerograph/sock"), "{}", p.display());
+        assert!(p.extension().is_some_and(|e| e == "sock"), "{}", p.display());
+        assert_eq!(super::socket_path_under(Some(home), &repo), p, "a client that computes it again finds the same name");
+        assert_ne!(super::socket_path_under(Some(home), &repo.join("x")), p, "another repository is another socket");
+    }
+
+    /// Through the platform's idea of home, as the model cache is: a Windows console sets no `$HOME`.
+    #[test]
+    fn the_socket_of_a_real_repository_is_under_the_home_the_platform_names() {
+        let repo = std::path::Path::new("/tmp/r");
+        assert_eq!(socket_path(repo), super::socket_path_under(std::env::home_dir().as_deref(), repo));
+    }
+
+    /// `sun_path` is 104 bytes on macOS, including the NUL, so a home deep enough cannot hold a
+    /// socket at all; and with no home there is nowhere of the user's own to look. Either way the
+    /// name moves to a directory of the user's own under the temp directory, under the same hash.
+    #[test]
+    fn a_socket_that_would_not_fit_under_home_goes_to_the_private_temp_directory() {
+        let deep_home = rooted("home").join("h".repeat(80));
+        let repo = std::path::Path::new("/tmp/r");
+        let in_home = super::socket_path_under(Some(&rooted("home/u")), repo);
+        for p in [super::socket_path_under(Some(&deep_home), repo), super::socket_path_under(None, repo)] {
+            assert!(p.as_os_str().len() <= 100, "{}", p.display());
+            assert_eq!(p.parent().unwrap(), super::fallback_dir(), "{}", p.display());
+            assert_eq!(p.file_name().unwrap().to_string_lossy(), format!("zerograph-{}", in_home.file_name().unwrap().to_string_lossy()),
+                       "one hash, whichever directory it lands in");
+        }
+        #[cfg(unix)]
+        assert!(super::fallback_dir().ends_with(format!("zerograph-{}", unsafe { libc::geteuid() })), "the fallback is a directory of the user's own");
+    }
+
+    /// A home that is not absolute would put the socket wherever the process happens to stand, and
+    /// two processes in two directories would never meet.
+    #[test]
+    fn a_relative_home_is_no_home() {
+        let p = super::socket_path_under(Some(std::path::Path::new("rel")), std::path::Path::new("/tmp/r"));
+        assert_eq!(p.parent().unwrap(), super::fallback_dir(), "{}", p.display());
+    }
+
+    /// `serve` once unlinked a stale socket inside `.zerograph` before anything else touched the
+    /// store, so a `.zerograph` that is a link was acted on before `ensure_dir` could refuse it.
+    /// The socket has left the store since, and the store is still refused before any of it.
     #[cfg(unix)]
     #[test]
-    fn a_store_directory_that_is_a_link_is_refused_before_its_socket_is_unlinked() {
+    fn a_store_directory_that_is_a_link_is_refused_before_any_socket_is_touched() {
         let d = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
         let outside = d.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -761,16 +844,12 @@ mod tests {
         let repo = d.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
         std::os::unix::fs::symlink(&outside, repo.join(".zerograph")).unwrap();
-        assert_eq!(socket_path(&repo), repo.join(".zerograph/serve.sock"), "the socket is where the link leads");
+        let sock = socket_path(&repo);
+        assert!(!sock.starts_with(&repo) && !sock.starts_with(&outside), "the socket does not follow the store: {}", sock.display());
         let err = super::run(&repo, &crate::config::Config::default(), 1, 1, 1, 0, true).unwrap_err();
         assert!(format!("{err:#}").contains("symlink"), "{err:#}");
         assert_eq!(std::fs::read_to_string(outside.join("serve.sock")).unwrap(), "victim\n");
-    }
-
-    #[test]
-    fn a_shallow_repository_keeps_the_socket_it_has_always_had() {
-        let p = socket_path(std::path::Path::new("/tmp/r"));
-        assert!(p.ends_with(".zerograph/serve.sock"), "{}", p.display());
+        assert!(!sys::present(&sock), "nothing was bound for a store that was refused");
     }
 
     /// The two facts `try_ask` and `Unlink` read off the socket file, through the platform's own
@@ -800,8 +879,7 @@ mod tests {
     #[test]
     fn a_server_that_never_answers_hands_a_reranked_question_back_on_the_first_line() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
-        let listener = sys::bind(&socket_path(dir.path())).unwrap();
+        let (listener, _bound) = Bound::at(dir.path());
         // Accepts, reads nothing, replies nothing -- a wedged worker, a process under a debugger,
         // a reranker child that hung.
         let held = std::thread::spawn(move || {
@@ -822,8 +900,7 @@ mod tests {
     #[test]
     fn a_connection_acknowledged_before_its_hello_is_read_keeps_the_long_wait() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
-        let listener = sys::bind(&socket_path(dir.path())).unwrap();
+        let (listener, _bound) = Bound::at(dir.path());
         let build = build_stamp();
         let held = std::thread::spawn(move || {
             let mut s = sys::accept(&listener).unwrap();
@@ -846,8 +923,7 @@ mod tests {
     #[test]
     fn a_reply_that_arrives_after_the_ack_still_extends_the_wait_to_find_it() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
-        let listener = sys::bind(&socket_path(dir.path())).unwrap();
+        let (listener, _bound) = Bound::at(dir.path());
         let build = build_stamp();
         let held = std::thread::spawn(move || {
             let mut s = sys::accept(&listener).unwrap();
@@ -871,8 +947,7 @@ mod tests {
     #[test]
     fn a_failed_resident_answer_is_handed_back_with_what_it_spent() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
-        let listener = sys::bind(&socket_path(dir.path())).unwrap();
+        let (listener, _bound) = Bound::at(dir.path());
         let build = build_stamp();
         let held = std::thread::spawn(move || {
             let mut s = sys::accept(&listener).unwrap();
@@ -897,8 +972,7 @@ mod tests {
     #[test]
     fn a_reply_already_behind_a_closed_peer_is_read_even_when_extending_the_timeout_fails() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
-        let listener = sys::bind(&socket_path(dir.path())).unwrap();
+        let (listener, _bound) = Bound::at(dir.path());
         let build = build_stamp();
         let held = std::thread::spawn(move || {
             let mut s = sys::accept(&listener).unwrap();
@@ -1002,8 +1076,7 @@ mod tests {
     #[test]
     fn a_fallback_directory_that_is_not_private_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let long = std::path::PathBuf::from("/private/tmp").join("b".repeat(120)).join("x");
-        let sock = socket_path(&long);
+        let sock = super::socket_path_under(None, std::path::Path::new("/tmp/b"));
         let dir = sock.parent().unwrap().to_path_buf();
         super::prepare_socket_dir(&sock).unwrap();
         assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700);
@@ -1011,6 +1084,26 @@ mod tests {
         let refused = super::prepare_socket_dir(&sock);
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(refused.is_err(), "a group- or world-accessible directory is not ours alone");
+    }
+
+    /// The home cache is held to the fallback's rule: a shared or mis-permissioned home would
+    /// otherwise hand the socket to whoever else can reach the directory.
+    #[cfg(unix)]
+    #[test]
+    fn a_home_socket_directory_is_made_private_and_refused_when_it_is_not() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::Builder::new().tempdir_in("/tmp").unwrap();
+        let sock = super::socket_path_under(Some(home.path()), std::path::Path::new("/tmp/r"));
+        let dir = sock.parent().unwrap().to_path_buf();
+        assert_eq!(dir, home.path().join(".cache/zerograph/sock"), "{}", sock.display());
+        super::prepare_socket_dir(&sock).unwrap();
+        assert_eq!(std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777, 0o700, "made private where it did not exist");
+        super::prepare_socket_dir(&sock).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o750)).unwrap();
+        assert!(super::prepare_socket_dir(&sock).is_err(), "a group-readable socket directory is not ours alone");
+        std::fs::remove_dir(&dir).unwrap();
+        std::os::unix::fs::symlink(home.path(), &dir).unwrap();
+        assert!(super::prepare_socket_dir(&sock).is_err(), "a link in the directory's place is not a directory of ours");
     }
 
     /// A peer that sends a byte at a time, each inside the per-read timeout, is a hold on the

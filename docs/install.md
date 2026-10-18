@@ -136,4 +136,4 @@ Install through npm; nothing else is required. What can still trip a Windows use
   paths even when set there.
 - **Long paths.** A tree deeper than 260 characters needs `git config core.longpaths true`.
 - **Synced folders.** Keep the repository out of OneDrive, Dropbox or Google Drive: every store
-  write is a rename the client re-uploads, and the socket is a reparse point they do not know.
+  write is a rename the client re-uploads.

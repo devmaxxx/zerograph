@@ -44,6 +44,42 @@ fn child(path: &std::path::Path) -> Command {
 
 fn zerograph() -> Command { child(std::path::Path::new(env!("CARGO_BIN_EXE_zerograph"))) }
 
+/// Where this repository's server listens, in the binary's own words: `status --json` names the
+/// socket it checks, which is the one `serve` binds and `ask` connects to. The crate is a binary
+/// with no library, so asking it is how a test learns the name without a second copy of the rule.
+fn socket_of(dir: &std::path::Path) -> std::path::PathBuf {
+    let out = zerograph().arg("--repo").arg(dir).args(["status", "--json"]).output().unwrap();
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    std::path::PathBuf::from(v["serve"]["socket"].as_str().unwrap_or_else(|| panic!("status names no socket: {v}")))
+}
+
+/// A stand-in server's socket, bound where the binary looks. Its directory is made as `serve`
+/// makes it — private on unix, or the next real `serve` would refuse it — and the file goes with
+/// the test, since the name lives in the user's cache rather than in the test's temp directory.
+struct Fake(std::path::PathBuf);
+
+impl Fake {
+    fn bind(dir: &std::path::Path) -> (transport::Listener, Fake) {
+        let sock = socket_of(dir);
+        let parent = sock.parent().unwrap();
+        std::fs::create_dir_all(parent.parent().unwrap()).unwrap();
+        #[cfg(unix)]
+        match std::os::unix::fs::DirBuilderExt::mode(&mut std::fs::DirBuilder::new(), 0o700).create(parent) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => panic!("{}: {e}", parent.display()),
+            _ => {}
+        }
+        #[cfg(not(unix))]
+        std::fs::create_dir_all(parent).unwrap();
+        let _ = std::fs::remove_file(&sock);
+        (transport::bind(&sock), Fake(sock))
+    }
+}
+
+impl Drop for Fake {
+    fn drop(&mut self) { let _ = std::fs::remove_file(&self.0); }
+}
+
 fn repo_with_docs() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(dir.path().join("docs")).unwrap();
@@ -103,7 +139,7 @@ fn hello_with_no_build() -> String {
 /// connection carries one.
 fn reply_to(dir: &std::path::Path, hello: &str) -> String {
     use std::io::{BufRead, Write};
-    let sock = dir.join(".zerograph/serve.sock");
+    let sock = socket_of(dir);
     let start = Instant::now();
     loop {
         if let Ok(mut s) = transport::connect(&sock) {
@@ -122,12 +158,41 @@ fn reply_to(dir: &std::path::Path, hello: &str) -> String {
     }
 }
 
-fn serve_in(arm: &[&str], dir: &std::path::Path, extra: &[&str]) -> std::process::Child {
-    zerograph().args(arm).arg("--repo").arg(dir).arg("serve").args(extra)
-        .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap()
+/// A `serve` child that ends with the test and takes its socket file along. A killed server leaves
+/// the file behind, which used to go with the test's temp directory; the name lives in the user's
+/// cache now, and a run of this file would otherwise leave one there per kill.
+struct Server { child: std::process::Child, sock: std::path::PathBuf }
+
+impl Server {
+    /// The name is asked for before the start, so the asking is not a probe the new server sees.
+    fn start(dir: &std::path::Path, cmd: &mut Command) -> Server {
+        let sock = socket_of(dir);
+        Server { child: cmd.stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap(), sock }
+    }
 }
 
-fn serve(dir: &std::path::Path, extra: &[&str]) -> std::process::Child {
+impl std::ops::Deref for Server {
+    type Target = std::process::Child;
+    fn deref(&self) -> &std::process::Child { &self.child }
+}
+
+impl std::ops::DerefMut for Server {
+    fn deref_mut(&mut self) -> &mut std::process::Child { &mut self.child }
+}
+
+impl Drop for Server {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let _ = std::fs::remove_file(&self.sock);
+    }
+}
+
+fn serve_in(arm: &[&str], dir: &std::path::Path, extra: &[&str]) -> Server {
+    Server::start(dir, zerograph().args(arm).arg("--repo").arg(dir).arg("serve").args(extra))
+}
+
+fn serve(dir: &std::path::Path, extra: &[&str]) -> Server {
     serve_in(LEXICAL, dir, extra)
 }
 
@@ -144,7 +209,7 @@ fn ask_until_resident(dir: &std::path::Path, words: &[&str]) -> (String, String)
 }
 
 fn wait_for_socket(dir: &std::path::Path) {
-    let sock = dir.join(".zerograph/serve.sock");
+    let sock = socket_of(dir);
     let start = Instant::now();
     // A socket file is a reparse point on Windows, and `exists` would follow it to nowhere; its
     // own metadata is what says it is there, on every platform.
@@ -200,8 +265,7 @@ fn a_server_catches_up_with_the_tree_at_start_rather_than_at_its_first_poll() {
 #[test]
 fn a_socket_nobody_listens_on_is_answered_here_and_left_for_the_next_serve() {
     let dir = repo_with_docs();
-    let sock = dir.path().join(".zerograph/serve.sock");
-    transport::bind(&sock);
+    let (_, fake) = Fake::bind(dir.path());
     // The listener is dropped at once: the file stays, nothing accepts.
     let started = Instant::now();
     let (out, err) = ask(dir.path(), &[], &["штраф"]);
@@ -216,7 +280,7 @@ fn a_socket_nobody_listens_on_is_answered_here_and_left_for_the_next_serve() {
     // A client that cannot be answered falls back; it does not delete files. A refused connect
     // is also what a live server with a full backlog gives, and unlinking on that guess would
     // strand it. `serve` owns the file, and binds over a dead one.
-    assert!(std::fs::symlink_metadata(&sock).is_ok(), "the client leaves the socket file alone");
+    assert!(std::fs::symlink_metadata(&fake.0).is_ok(), "the client leaves the socket file alone");
     let mut server = serve(dir.path(), &["--every", "3600", "--idle", "60"]);
     let (through, _) = ask_until_resident(dir.path(), &["штраф"]);
     assert_eq!(through, want);
@@ -290,8 +354,7 @@ fn a_stale_socket_answer_is_no_older_than_the_store_on_disk() {
 #[test]
 fn a_reply_from_another_version_is_ignored() {
     let dir = repo_with_docs();
-    let sock = dir.path().join(".zerograph/serve.sock");
-    let listener = transport::bind(&sock);
+    let (listener, _fake) = Fake::bind(dir.path());
     // Stamped as the asking binary is, so the version is the only field left to refuse it on —
     // the client reads the build and the arm first, and a reply that failed those would prove
     // nothing about the check this test is named for.
@@ -350,8 +413,7 @@ fn a_lexical_question_is_still_answered_by_a_server_holding_the_dense_arm() {
 #[test]
 fn a_reply_from_another_build_of_this_version_is_ignored() {
     let dir = repo_with_docs();
-    let sock = dir.path().join(".zerograph/serve.sock");
-    let listener = transport::bind(&sock);
+    let (listener, _fake) = Fake::bind(dir.path());
     let fake = std::thread::spawn(move || {
         use std::io::{BufRead, Write};
         let mut s = transport::accept(&listener);
@@ -381,9 +443,8 @@ fn a_binary_replaced_under_a_live_server_is_another_build_and_the_client_answers
     std::fs::copy(env!("CARGO_BIN_EXE_zerograph"), &path).unwrap();
     let started_as = stamp_of(&path);
     let want = ask(dir.path(), &["--no-serve"], &["штраф"]).0;
-    let mut server = child(&path).args(LEXICAL).arg("--repo").arg(dir.path())
-        .args(["serve", "--every", "3600", "--idle", "60"])
-        .stdout(Stdio::null()).stderr(Stdio::piped()).spawn().unwrap();
+    let mut server = Server::start(dir.path(), child(&path).args(LEXICAL).arg("--repo").arg(dir.path())
+        .args(["serve", "--every", "3600", "--idle", "60"]));
     // The one build on both ends answers over the socket, which is what makes the run below a
     // test of the replacement rather than of a server that was never reachable.
     let start = Instant::now();
@@ -516,7 +577,7 @@ fn an_idle_server_exits_clean_and_takes_its_socket_with_it() {
     // a server that never bound would leave no socket either, and prove nothing by it.
     assert!(err.contains("idle 1s, model idle 300s; Ctrl-C stops"), "the server never bound: {err}");
     assert!(err.contains("idle for 1s"), "it left for some other reason: {err}");
-    assert!(std::fs::symlink_metadata(dir.path().join(".zerograph/serve.sock")).is_err(), "the socket file outlived its server: {err}");
+    assert!(std::fs::symlink_metadata(socket_of(dir.path())).is_err(), "the socket file outlived its server: {err}");
 }
 
 /// The two ways to ask for a cold answer while a server is up. `--no-serve` is a flag on the
@@ -603,7 +664,7 @@ fn stop_ends_a_running_server_through_the_exit_that_removes_its_socket() {
     std::io::Read::read_to_string(&mut server.stderr.take().unwrap(), &mut log).unwrap();
     assert!(status.success(), "{status}: {log}");
     assert!(log.contains("terminated, exiting"), "it left for some other reason: {log}");
-    assert!(std::fs::symlink_metadata(dir.path().join(".zerograph/serve.sock")).is_err(), "the socket file outlived its server: {log}");
+    assert!(std::fs::symlink_metadata(socket_of(dir.path())).is_err(), "the socket file outlived its server: {log}");
 }
 
 #[test]
@@ -629,5 +690,5 @@ fn a_detached_server_answers_after_the_command_returns_and_stop_ends_it() {
     assert!(stop(dir.path()).status.success());
     let log = std::fs::read_to_string(dir.path().join(".zerograph/serve.log")).unwrap();
     assert!(log.contains("terminated, exiting"), "{log}");
-    assert!(std::fs::symlink_metadata(dir.path().join(".zerograph/serve.sock")).is_err(), "{log}");
+    assert!(std::fs::symlink_metadata(socket_of(dir.path())).is_err(), "{log}");
 }

@@ -15,7 +15,7 @@ fn status_reports_the_index_the_tree_and_that_nothing_runs() {
     let dir = built();
     let text = ok(dir.path(), &["status"]);
     assert!(text.contains("doc nodes") && text.contains("tree: the index is in step"), "{text}");
-    assert!(text.contains("refresh: none running") && text.contains("serve: not running"), "{text}");
+    assert!(text.contains("refresh: none running") && text.contains("serve: not running (nothing answers at "), "{text}");
 
     write(dir.path(), "docs/more.md", "# More\n");
     let text = ok(dir.path(), &["status"]);
@@ -32,6 +32,10 @@ fn status_json_carries_the_same_facts_as_one_object() {
     assert_eq!(v["refresh"]["state"], "none");
     assert_eq!(v["last_run"], serde_json::json!(["refresh: 1 changed, 0 removed"]));
     assert_eq!(v["serve"]["running"], false);
+    let socket = v["serve"]["socket"].as_str().unwrap_or_else(|| panic!("no socket named: {v}"));
+    assert!(socket.ends_with(".sock"), "{v}");
+    assert!(!std::path::Path::new(socket).starts_with(dir.path()), "the socket is kept out of the checkout: {v}");
+    assert!(ok(dir.path(), &["status"]).contains(&format!("nothing answers at {socket}")), "the text names the same socket");
 }
 
 #[test]
@@ -57,8 +61,11 @@ fn a_detached_serve_is_reported_answering_with_its_log() {
     let out = run(dir.path(), &["serve", "--detach", "--every", "3600", "--idle", "600"]);
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let v: serde_json::Value = serde_json::from_str(&ok(dir.path(), &["status", "--json"])).unwrap();
+    let socket = v["serve"]["socket"].as_str().map(std::path::PathBuf::from);
+    let bound = socket.as_ref().is_some_and(|s| std::fs::symlink_metadata(s).is_ok());
     let stopped = run(dir.path(), &["stop"]);
     assert_eq!(v["serve"]["running"], true, "{v}");
+    assert!(bound, "the socket named is the one serve bound: {v}");
     assert!(v["serve"]["log"].as_array().unwrap().iter().any(|l| l.as_str().unwrap().ends_with("; Ctrl-C stops")), "{v}");
     assert!(stopped.status.success());
 }
