@@ -48,8 +48,8 @@ answer — an edited file is re-extracted in milliseconds. Pass `--stale` when y
 now and can live one edit behind. Nothing here needs a build step in your loop; `{{command}} build` is
 for a repository that has no index at all.
 
-The rest keeps itself fresh: the git hooks start `{{command}} update --detach` after a pull or a
-branch switch, a `serve` polls between questions, and a reader whose refresh would not fit hands it
+The rest keeps itself fresh: the session hook starts `{{command}} update --detach` in a checkout
+with no index yet, a `serve` polls between questions, and a reader whose refresh would not fit hands it
 to a detached update. The detached update runs at background priority and yields to builds, tests
 and editors.
 

@@ -79,7 +79,7 @@ enum Cmd {
     Build,
     Update {
         /// Starts the update in a process of its own, at background priority, and returns at once;
-        /// its output goes to `.zerograph/background.log`. What the git hooks `install-agent` writes run.
+        /// its output goes to `.zerograph/background.log`. What the session hook and a reader start.
         #[arg(long)] detach: bool,
     },
     Ask {
@@ -100,9 +100,9 @@ enum Cmd {
         /// Answers in this process even when a `serve` is listening.
         #[arg(long)] no_serve: bool,
     },
-    /// Answers `ask` from a resident process over `.zerograph/serve.sock`: the model, the
-    /// vectors and the indexes open once. Refreshes before every answer the way `ask` does,
-    /// polls between them like `watch`, exits after `--idle` seconds without a question.
+    /// Answers `ask` from a resident process over a socket in `~/.cache/zerograph/sock`: the
+    /// model, the vectors and the indexes open once. Refreshes before every answer the way `ask`
+    /// does, polls between them like `watch`, exits after `--idle` seconds without a question.
     Serve {
         #[arg(long, default_value_t = 30)] every: u64,
         #[arg(long, default_value_t = 1)] batch: usize,
@@ -959,7 +959,7 @@ fn git_toplevel(cwd: &std::path::Path) -> Option<PathBuf> {
 /// which std puts back itself wherever a call needs it; carried around instead it is four bytes
 /// of the socket name's budget and a prefix in every message.
 #[cfg(windows)]
-fn plain(p: PathBuf) -> PathBuf {
+pub(crate) fn plain(p: PathBuf) -> PathBuf {
     let Some(s) = p.to_str() else { return p };
     match s.strip_prefix(r"\\?\") {
         Some(rest) if rest.starts_with(r"UNC\") => PathBuf::from(format!(r"\\{}", &rest[4..])),
@@ -969,7 +969,7 @@ fn plain(p: PathBuf) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn plain(p: PathBuf) -> PathBuf { p }
+pub(crate) fn plain(p: PathBuf) -> PathBuf { p }
 
 /// A determination the command was asked to make and made: no call path within the depth, a
 /// bench suite that answered every case and missed a floor. Carried to `main` as an error because
@@ -1230,30 +1230,36 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     n => println!("{target:?}: wrote {n} files\n  {}", r.paths.join("\n  ")),
                 }
                 for note in &r.notes { println!("{target:?}: {note}"); }
+                // Per checkout: a local-scope server is keyed by the project's path, so a session in
+                // a worktree sees only what was registered for that worktree.
                 if target == install_agent::Target::Claude {
-                    let m = install_agent::register_mcp(&repo, &command, &install_agent::run_claude);
-                    for path in &m.paths { println!("Claude: registered the MCP server\n  {path}"); }
-                    for note in &m.notes { println!("Claude: {note}"); }
+                    let registered = install_agent::register_mcp_everywhere(&repo, &command, &install_agent::run_claude);
+                    for (checkout, m) in &registered {
+                        let at = match registered.len() { 1 => String::new(), _ => format!(" for {}", checkout.display()) };
+                        for path in &m.paths { println!("Claude: registered the MCP server{at}\n  {path}"); }
+                        for note in &m.notes { println!("Claude: {note}{at}"); }
+                    }
+                    if let Some(config) = install_agent::claude_config() {
+                        for note in &install_agent::prune_stale_mcp(&config).notes { println!("Claude: {note}"); }
+                    }
                 }
                 // Codex reads its hooks from `~/.codex/hooks.json`, which is the machine's and not
                 // this repository's. Printed for a person to paste; see `agent/codex.md`.
                 if target == install_agent::Target::Codex {
-                    let hook = repo.join(".codex/hooks/zerograph-hook.mjs");
-                    let abs = hook.canonicalize().unwrap_or(hook);
+                    let (hook, r) = install_agent::codex_hook(&repo, &command)?;
+                    for note in &r.notes { println!("Codex: {note}"); }
                     println!("\nTo run the hook on this machine, add to ~/.codex/hooks.json \
                               (merging with what is already there):\n{}\n\
                               Codex trusts a hook by hash: the first session after this is added \
-                              asks once, and editing the script later asks again. The hook reads \
-                              each session's own working directory and stays silent where there is \
-                              no index, so one copy serves every repository — move it to \
-                              ~/.codex/hooks/ and adjust the path if this checkout may go away.",
-                             install_agent::codex_hooks_block(&abs.display().to_string()));
+                              asks once, and editing the script later asks again. The path is the \
+                              main worktree's copy, which stays when a linked worktree is removed. \
+                              The hook reads each session's own working directory and stays silent \
+                              where no index was asked for, so one copy serves every repository.",
+                             install_agent::codex_hooks_block(&hook.display().to_string()));
                 }
             }
-            // Once whatever the harnesses: git runs these, not the agent.
-            let r = install_agent::install_git_hooks(&repo, &command)?;
-            if r.written > 0 { println!("git: wrote {} hooks\n  {}", r.written, r.paths.join("\n  ")); }
-            for note in &r.notes { println!("git: {note}"); }
+            // Once whatever the harnesses: an earlier release wrote these, and nothing writes them now.
+            for note in &install_agent::retire_git_hooks(&repo).notes { println!("git: {note}"); }
             Ok(())
         }
         Cmd::Prime { json } => {

@@ -2,13 +2,29 @@
 
 ```bash
 zerograph mcp                    # a stdio MCP server (protocol 2025-06-18) over the current repository
-claude mcp add zerograph -- zerograph mcp   # what `install-agent --claude` runs, once
+claude mcp add zerograph -- zerograph --repo /path/to/checkout mcp   # what `install-agent --claude` runs, per checkout
 ```
 
-`install-agent --claude` registers the server through the `claude` CLI, leaves one that is already
-registered alone, and prints the command to run by hand where `claude` is not on `PATH`. The
-protocol is newline-delimited JSON-RPC on stdout and nothing else; diagnostics go to stderr. A tool
-that fails returns an `isError` result and the server carries on.
+`install-agent --claude` registers the server through the `claude` CLI, at local scope, once for
+every checkout of the clone that `git worktree list` names, each with its own `--repo`. Local scope
+is keyed by the project's path, so a session opened in a worktree sees only what was registered for
+that worktree; a worktree added later gets its server from the next `install-agent` run. A
+registration that already says the same is left alone, and the command to run by hand is printed
+where `claude` is not on `PATH`.
+
+The same run prunes `~/.claude.json` (or `.claude.json` in `CLAUDE_CONFIG_DIR`): a `zerograph` server
+it registered for a checkout that is no longer on disk — a removed worktree — is taken out, and so is
+one registered as `repograph` before the rename. `claude mcp remove` cannot do this, since it finds
+the project by a working directory that is gone. Nothing else in the file is changed, though its keys
+are written back in sorted order.
+
+Why not one project-scope `.mcp.json` with no `--repo`: Claude Code's
+[MCP documentation](https://code.claude.com/docs/en/mcp) does not say which working directory a
+stdio server starts in, so a server that found its checkout from its working directory would be
+relying on something undocumented.
+
+The protocol is newline-delimited JSON-RPC on stdout and nothing else; diagnostics go to stderr. A
+tool that fails returns an `isError` result and the server carries on.
 
 ### Other agents
 

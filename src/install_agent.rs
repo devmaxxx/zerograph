@@ -221,6 +221,31 @@ pub fn codex_hooks_block(hook_abs: &str) -> String {
     })).unwrap_or_default()
 }
 
+/// The hook `~/.codex/hooks.json` should run, for an install in `root`. Codex's hooks are per user,
+/// so the path has to outlive the checkout it was printed from: it is the main worktree's copy,
+/// which stays while linked worktrees come and go. When the install runs in a linked worktree and
+/// the main one has no hook yet, the hook and its rule are written there; one already there is
+/// left as it is. A bare clone, or no git, is `root`'s own copy.
+pub fn codex_hook(root: &Path, command: &str) -> Result<(PathBuf, Report)> {
+    let mut report = Report::default();
+    let here = canonical(root).unwrap_or_else(|| root.to_path_buf());
+    let home = main_worktree(root).unwrap_or_else(|| here.clone());
+    let hooks = home.join(Target::Codex.dir()).join("hooks");
+    let path = hooks.join("zerograph-hook.mjs");
+    if home != here {
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&path).is_err() => {
+                write_if_changed(&path, &hook(command), &mut report)?;
+                write_if_changed(&hooks.join("rule.txt"), &with_command(RULE, command), &mut report)?;
+                report.notes.push(format!("wrote the hook into the main worktree, {}, which outlives this one", home.display()));
+            }
+            Ok(text) if text == hook(command) => {}
+            _ => report.notes.push(format!("{} is left as it is; `install-agent --codex` run there updates it", path.display())),
+        }
+    }
+    Ok((path, report))
+}
+
 /// Removes the script an install made before the rename, which nothing runs once the settings
 /// name the new one. Only a regular file that still carries the hook's debug tag, which every
 /// release of it printed, is ours to remove: a link, or a file someone rewrote into something
@@ -362,7 +387,7 @@ pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
     let merged = merged_instructions(&existing, command);
     // Never written through a link, and not an error either: `CLAUDE.md` linked to `AGENTS.md` is
     // common, and failing here would abort an install that has already rewritten the settings and
-    // removed the old hook, before the MCP server and the git hooks are reached.
+    // removed the old hook, before the MCP server is reached.
     match merged != existing && is_symlink(&instructions) {
         true => report.notes.push(format!(
             "{} is a symlink, so the stanza was not written through it; `install-agent --codex` writes it \
@@ -577,6 +602,140 @@ fn retire_legacy_mcp(root: &Path, run: &dyn Fn(&Path, &[&str]) -> Option<std::pr
     }
 }
 
+/// The worktrees `git worktree list --porcelain` names, as (path, bare), main worktree first.
+fn parse_worktrees(porcelain: &str) -> Vec<(PathBuf, bool)> {
+    porcelain.split("\n\n").filter_map(|block| {
+        let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
+        Some((PathBuf::from(path), block.lines().any(|l| l == "bare")))
+    }).collect()
+}
+
+fn listed_worktrees(root: &Path) -> Vec<(PathBuf, bool)> {
+    std::process::Command::new("git").arg("-C").arg(root).args(["worktree", "list", "--porcelain"])
+        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_worktrees(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Every checkout of the clone `root` belongs to that is still on disk, `root` among them, each
+/// canonical as `--repo` is. Claude Code keys a local-scope server by the project's path, so a
+/// server registered for one checkout is not there in a session opened in another.
+pub fn worktrees(root: &Path) -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = listed_worktrees(root).into_iter()
+        .filter(|(_, bare)| !bare)
+        .filter_map(|(path, _)| canonical(&path))
+        .collect();
+    let root = canonical(root).unwrap_or_else(|| root.to_path_buf());
+    if !all.contains(&root) { all.insert(0, root); }
+    all
+}
+
+/// The path as `--repo` resolves it, without the `\\?\` prefix `canonicalize` puts on a Windows
+/// path: Claude Code keys a project by the path as written, and an earlier registration said it
+/// without one.
+fn canonical(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().map(crate::plain)
+}
+
+/// [`register_mcp`] once in every checkout [`worktrees`] names, each answer beside its checkout.
+pub fn register_mcp_everywhere(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> Option<std::process::Output>) -> Vec<(PathBuf, Report)> {
+    worktrees(root).into_iter().map(|checkout| { let r = register_mcp(&checkout, command, run); (checkout, r) }).collect()
+}
+
+/// The main worktree of the clone `root` belongs to: the one that stays while linked worktrees
+/// come and go. `None` for a bare clone, or where git cannot say.
+pub fn main_worktree(root: &Path) -> Option<PathBuf> {
+    let (path, bare) = listed_worktrees(root).into_iter().next()?;
+    if bare { return None; }
+    canonical(&path)
+}
+
+/// The file Claude Code keeps its local-scope servers in: `.claude.json` in `CLAUDE_CONFIG_DIR`
+/// when that is set, in the home directory otherwise.
+pub fn claude_config() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir).join(".claude.json")),
+        None => Some(std::env::home_dir()?.join(".claude.json")),
+    }
+}
+
+/// Whether a registered server is one `register_mcp` made: it runs `… --repo <path> mcp`.
+fn registered_by_us(server: &serde_json::Value) -> bool {
+    let Some(args) = server["args"].as_array() else { return false };
+    args.last().and_then(|a| a.as_str()) == Some("mcp") && args.iter().any(|a| a.as_str() == Some("--repo"))
+}
+
+/// Drops the server this tool registered for a checkout that is no longer on disk — a removed
+/// worktree, mostly — from Claude Code's `config` file. `claude mcp remove` cannot do it: it finds
+/// the project by its working directory, which is gone. Only our entry under either name goes, and
+/// only where the project's path is missing; everything else in the file is kept, though its keys
+/// come back in sorted order. The file is written beside itself and renamed over, with its
+/// permissions, and not at all when there is nothing to prune.
+pub fn prune_stale_mcp(config: &Path) -> Report {
+    let mut report = Report::default();
+    // Written through a link to where it points, so a dotfile manager's link stays one.
+    let config = &config.canonicalize().unwrap_or_else(|_| config.to_path_buf());
+    let Ok(seen) = std::fs::metadata(config) else { return report };
+    let Ok(text) = std::fs::read_to_string(config) else { return report };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        report.notes.push(format!("{} is not JSON, so no registration for a removed checkout was pruned from it", config.display()));
+        return report;
+    };
+    let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else { return report };
+    let mut pruned = Vec::new();
+    for (path, project) in projects.iter_mut() {
+        // Only a path known to be gone: one that cannot be looked at now (a mount that is down, a
+        // directory without permission) may still be there.
+        if !matches!(Path::new(path).try_exists(), Ok(false)) { continue; }
+        let Some(servers) = project.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else { continue };
+        let before = servers.len();
+        servers.retain(|name, server| !([MCP_NAME, LEGACY_MCP_NAME].contains(&name.as_str()) && registered_by_us(server)));
+        if servers.len() < before { pruned.push(path.clone()); }
+    }
+    if pruned.is_empty() { return report; }
+    let written = serde_json::to_string_pretty(&root).map_err(anyhow::Error::from).and_then(|out| replace_config(config, &seen, &(out + "\n")));
+    match written {
+        Ok(()) => {
+            report.written = 1;
+            report.paths.push(config.display().to_string());
+            for path in pruned { report.notes.push(format!("removed the MCP server registered for {path}, which is no longer on disk")); }
+        }
+        Err(e) => report.notes.push(format!("{} could not be rewritten ({e:#}); the MCP servers registered for {} stay", config.display(), pruned.join(", "))),
+    }
+    report
+}
+
+/// Puts `text` in place of `config`, unless the file changed since it was read as `seen`: a Claude
+/// Code session writes the same file, and its write must not be lost to ours. The new copy is
+/// created with the old one's permissions from the start, since the file holds account data, under
+/// a name no other run picks, and removed when anything fails.
+fn replace_config(config: &Path, seen: &std::fs::Metadata, text: &str) -> Result<()> {
+    use std::io::Write;
+    let name = config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = config.with_file_name(format!(".{name}.zerograph-{}", std::process::id()));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        open.mode(seen.permissions().mode() & 0o777);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = open.open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        let now = std::fs::metadata(config)?;
+        if now.len() != seen.len() || now.modified().ok() != seen.modified().ok() {
+            anyhow::bail!("it changed while being read, so it is left for the next run");
+        }
+        std::fs::rename(&tmp, config)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
+}
+
 /// `word` as one shell word: bare when it has nothing the shell would split or expand, and
 /// single-quoted otherwise, so a path with a space still pastes as the one argument it is.
 fn shell_word(word: &str) -> String {
@@ -606,140 +765,59 @@ pub fn run_claude(root: &Path, args: &[&str]) -> Option<std::process::Output> {
     std::process::Command::new("claude").args(args).current_dir(root).stdin(std::process::Stdio::null()).output().ok()
 }
 
-/// The git events after which the tree can have moved by a pull's worth of files.
+/// The git events an earlier release wrote a refresh block into.
 const GIT_HOOKS: [&str; 2] = ["post-merge", "post-checkout"];
-const GIT_BEGIN: &str = "# zerograph:begin";
-const GIT_END: &str = "# zerograph:end";
-const LEGACY_GIT_BEGIN: &str = "# repograph:begin";
-const LEGACY_GIT_END: &str = "# repograph:end";
+/// The markers of that block, under both names the tool has had.
+const GIT_MARKERS: [(&str, &str); 2] = [("# zerograph:begin", "# zerograph:end"), ("# repograph:begin", "# repograph:end")];
 
-/// The block each git hook runs. `update --detach` starts the refresh and returns, so neither a
-/// pull nor a checkout waits for it, and a binary missing from PATH costs the hook nothing.
-/// `$3` is post-checkout's flag, `0` for a file checkout that moves nothing worth a refresh;
-/// post-merge passes no third argument.
-fn git_block(command: &str) -> String {
-    format!("{GIT_BEGIN}\n\
-        # Brings zerograph's index in line with what this pull or checkout moved, in the background.\n\
-        if [ \"$3\" != \"0\" ]; then {command} update --detach >/dev/null 2>&1 || true; fi\n\
-        {GIT_END}\n")
-}
-
-/// A hook script with our block in it, right after the shebang, ahead of whatever the
-/// repository's own hook does: a hook manager's script ends in `exit 0` or `exec`, and a block
-/// after that never runs. Running first costs nothing, since the block only starts a background
-/// update. A block already there is taken out first and put back in that place, which moves one
-/// an older install appended at the end. A hook that was not there starts as a POSIX shell
-/// script, which Git for Windows runs as well.
-pub fn merged_git_hook(existing: &str, command: &str) -> String {
-    let block = git_block(command);
-    // A block from before the rename goes the same way, or the hook would refresh twice.
-    let found = marked(existing, GIT_BEGIN, GIT_END).or_else(|| marked(existing, LEGACY_GIT_BEGIN, LEGACY_GIT_END));
-    match found {
-        Some((a, b)) => {
-            let tail = existing[b..].strip_prefix('\n').unwrap_or(&existing[b..]);
-            merged_git_hook(&format!("{}{tail}", &existing[..a]), command)
-        }
-        _ if existing.trim().is_empty() => format!("#!/bin/sh\n{block}"),
-        _ if existing.starts_with("#!") => {
-            let (shebang, body) = existing.split_once('\n').unwrap_or((existing, ""));
-            format!("{shebang}\n{block}{body}")
-        }
-        _ => format!("{block}{existing}"),
+/// `existing` without the refresh block an earlier release wrote, or `None` when it holds none. A
+/// hook left with nothing but its shebang comes back empty: the block was all that file was for.
+pub fn without_git_block(existing: &str) -> Option<String> {
+    let mut text = existing.to_string();
+    let mut found = false;
+    while let Some((a, b)) = GIT_MARKERS.iter().find_map(|(begin, end)| marked(&text, begin, end)) {
+        let tail = skip_break(&text[b..]).to_string();
+        text = format!("{}{tail}", &text[..a]);
+        found = true;
     }
+    if !found { return None; }
+    let body = text.split_once('\n').filter(|_| text.starts_with("#!")).map_or(text.as_str(), |(_, rest)| rest);
+    Some(if body.trim().is_empty() { String::new() } else { text })
 }
 
-/// Writes the `post-merge` and `post-checkout` hooks into the directory git itself runs hooks
-/// from — `core.hooksPath` when a hook manager set one, the worktree's common `hooks/` otherwise.
-/// Outside a git repository, or without git on PATH, it writes nothing and says so.
-pub fn install_git_hooks(root: &Path, command: &str) -> Result<Report> {
+/// Takes the `post-merge` and `post-checkout` block an earlier release wrote out of the hooks git
+/// runs. The block fired in every worktree, since hooks live in the common git directory, and git
+/// runs `post-checkout` on `git worktree add`, so each new worktree started a full embed; every read
+/// already refreshes, and the session hook builds a checkout that has no index. Both the directory
+/// git runs hooks from (`core.hooksPath` when set) and the common `hooks/` are looked at, since a
+/// hook manager may have moved the first since the block was written. The rest of each hook stays;
+/// a hook that held nothing else is deleted.
+pub fn retire_git_hooks(root: &Path) -> Report {
     let mut report = Report::default();
-    let out = std::process::Command::new("git").arg("-C").arg(root).args(["rev-parse", "--git-path", "hooks"]).output();
-    let dir = match out {
-        Ok(o) if o.status.success() => root.join(String::from_utf8_lossy(&o.stdout).trim()),
-        _ => {
-            report.notes.push("not a git repository, or no git on PATH: the post-merge and post-checkout hooks were not written".into());
-            return Ok(report);
-        }
-    };
-    if hooks_path_is_foreign(root, &dir) {
-        report.notes.push("core.hooksPath points outside the git directory (a shared hooks directory, or a tracked one like .husky): the post-merge and post-checkout hooks were not written".into());
-        return Ok(report);
-    }
-    for name in GIT_HOOKS {
-        let path = dir.join(name);
-        let existing = match std::fs::read_to_string(&path) {
-            Ok(text) => text,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(e) => {
-                report.notes.push(format!("{name}: the hook already there could not be read as text ({e}), left alone"));
-                continue;
-            }
-        };
-        if !is_shell_hook(&existing) {
-            report.notes.push(format!("{name}: the hook already there is not a shell script, left alone; run `{command} update --detach` from it"));
-            continue;
-        }
-        let before = report.written;
-        write_if_changed(&path, &merged_git_hook(&existing, command), &mut report)?;
-        if report.written > before {
-            make_executable(&path)?;
-            if !existing.trim().is_empty() && !existing.contains(GIT_BEGIN) && !existing.contains(LEGACY_GIT_BEGIN) {
-                report.notes.push(format!("{name}: inserted into the hook already there, which runs after it"));
+    let git_path = |args: &[&str]| std::process::Command::new("git").arg("-C").arg(root).args(args)
+        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| root.join(String::from_utf8_lossy(&o.stdout).trim()));
+    let mut dirs: Vec<PathBuf> = [git_path(&["rev-parse", "--git-path", "hooks"]), git_path(&["rev-parse", "--git-common-dir"]).map(|d| d.join("hooks"))]
+        .into_iter().flatten().collect();
+    dirs.dedup_by(|a, b| a.canonicalize().ok().zip(b.canonicalize().ok()).is_some_and(|(a, b)| a == b) || a == b);
+    for dir in dirs {
+        for name in GIT_HOOKS {
+            let path = dir.join(name);
+            let Ok(existing) = std::fs::read_to_string(&path) else { continue };
+            let Some(rest) = without_git_block(&existing) else { continue };
+            let done = match rest.is_empty() {
+                true => std::fs::remove_file(&path).map(|()| format!("removed {}, which held only the refresh block an earlier release wrote", path.display())),
+                false => std::fs::write(&path, &rest).map(|()| format!("{}: took out the refresh block an earlier release wrote; the rest of the hook is as it was", path.display())),
+            };
+            match done {
+                Ok(note) => { report.written += 1; report.paths.push(path.display().to_string()); report.notes.push(note); }
+                Err(e) => report.notes.push(format!("{}: the refresh block an earlier release wrote could not be taken out ({e}); remove the lines between `# zerograph:begin` and `# zerograph:end` by hand", path.display())),
             }
         }
     }
-    Ok(report)
+    report
 }
-
-/// A hook whose interpreter is named and is not a POSIX-style shell would be corrupted by a shell
-/// block put into it; `fish` and the like parse `if [ ... ]; then` differently.
-fn is_shell_hook(existing: &str) -> bool {
-    const SHELLS: [&str; 6] = ["sh", "bash", "dash", "ksh", "zsh", "ash"];
-    let Some(rest) = existing.strip_prefix("#!") else { return true };
-    let mut words = rest.lines().next().unwrap_or("").split_whitespace();
-    let base = |path: &str| path.rsplit('/').next().unwrap_or(path).to_string();
-    let Some(first) = words.next().map(base) else { return false };
-    let interpreter = match first.as_str() {
-        "env" => words.find(|w| !w.starts_with('-') && !w.contains('=')).map(base).unwrap_or_default(),
-        "busybox" => words.next().map(base).unwrap_or_default(),
-        _ => first,
-    };
-    SHELLS.contains(&interpreter.as_str())
-}
-
-/// Whether `core.hooksPath` is set at any level and resolves outside this repository's git
-/// directory. A global or system value is run by every repository that reads it, and a local one
-/// like `.husky` lands in a tracked directory, so a hook written there would be committed and
-/// start an index for everyone who pulls it. A path inside the git directory is private to this
-/// clone and fine.
-fn hooks_path_is_foreign(root: &Path, dir: &Path) -> bool {
-    let set = std::process::Command::new("git").arg("-C").arg(root).args(["config", "--get", "core.hooksPath"]).output().ok()
-        .filter(|o| o.status.success())
-        .is_some_and(|o| !o.stdout.iter().all(u8::is_ascii_whitespace));
-    if !set { return false; }
-    let common = std::process::Command::new("git").arg("-C").arg(root).args(["rev-parse", "--git-common-dir"]).output().ok()
-        .filter(|o| o.status.success())
-        .and_then(|o| root.join(String::from_utf8_lossy(&o.stdout).trim()).canonicalize().ok());
-    // A hooks directory not made yet is judged by where its parent is.
-    let dir = dir.canonicalize().ok()
-        .or_else(|| Some(dir.parent()?.canonicalize().ok()?.join(dir.file_name()?)));
-    match (common, dir) {
-        (Some(common), Some(dir)) => !dir.starts_with(common),
-        _ => true,
-    }
-}
-
-#[cfg(unix)]
-fn make_executable(path: &Path) -> Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mut p = std::fs::metadata(path)?.permissions();
-    p.set_mode(p.mode() | 0o755);
-    std::fs::set_permissions(path, p).with_context(|| format!("chmod {}", path.display()))
-}
-
-/// Git for Windows runs a hook by its shebang and has no executable bit to ask for.
-#[cfg(windows)]
-fn make_executable(_: &Path) -> Result<()> { Ok(()) }
 
 #[cfg(test)]
 mod tests {
@@ -919,7 +997,7 @@ mod tests {
     }
 
     #[test]
-    fn a_stanza_and_git_block_from_before_the_rename_are_replaced_not_doubled() {
+    fn a_stanza_from_before_the_rename_is_replaced_not_doubled() {
         let legacy = "# House rules\n\n<!-- repograph:begin -->\nrun `repograph ask`\n<!-- repograph:end -->\n\nMore rules.\n";
         let merged = merged_instructions(legacy, "zerograph");
         assert!(!merged.contains("repograph"), "{merged}");
@@ -938,12 +1016,6 @@ mod tests {
         let merged = merged_instructions(twice, "zerograph");
         assert!(!merged.contains("repograph") && merged.matches(BEGIN).count() == 1, "{merged}");
         assert_eq!(merged_instructions(&merged, "zerograph"), merged, "one run reaches the fixed point");
-
-        let hook = "#!/bin/sh\n# repograph:begin\nif [ \"$3\" != \"0\" ]; then repograph update --detach >/dev/null 2>&1 || true; fi\n# repograph:end\nnpx lefthook run post-merge\n";
-        let merged = merged_git_hook(hook, "zerograph");
-        assert!(!merged.contains("repograph"), "{merged}");
-        assert_eq!(merged.matches(GIT_BEGIN).count(), 1);
-        assert!(merged.starts_with("#!/bin/sh\n# zerograph:begin") && merged.ends_with("npx lefthook run post-merge\n"), "{merged}");
     }
 
     #[test]
@@ -1059,57 +1131,217 @@ mod tests {
         dir
     }
 
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git").arg("-C").arg(dir).args(args)
+            .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().unwrap().success();
+        assert!(ok, "git {args:?}");
+    }
+
     #[test]
-    fn the_git_hooks_are_written_once_and_start_a_detached_update() {
+    fn the_porcelain_listing_is_read_main_first_with_a_bare_clone_marked() {
+        let listed = parse_worktrees("worktree /a\nHEAD 1\nbranch refs/heads/main\n\nworktree /a b/wt\nHEAD 2\ndetached\n\nworktree /bare\nbare\n");
+        assert_eq!(listed, [(PathBuf::from("/a"), false), (PathBuf::from("/a b/wt"), false), (PathBuf::from("/bare"), true)]);
+        assert!(parse_worktrees("").is_empty());
+    }
+
+    #[test]
+    fn every_checkout_of_the_clone_is_found_from_any_of_them_and_the_main_one_named() {
         let dir = git_repo();
-        let first = install_git_hooks(dir.path(), "zerograph").unwrap();
-        assert_eq!(first.written, 2, "{first:?}");
-        for name in GIT_HOOKS {
-            let text = std::fs::read_to_string(dir.path().join(".git/hooks").join(name)).unwrap();
-            assert!(text.starts_with("#!/bin/sh\n"), "{text}");
-            assert!(text.contains("zerograph update --detach"), "{text}");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mode = std::fs::metadata(dir.path().join(".git/hooks").join(name)).unwrap().permissions().mode();
-                assert!(mode & 0o111 != 0, "{name} is executable");
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        let (main, wt) = (canonical(&main).unwrap(), canonical(&wt).unwrap());
+        assert_eq!(worktrees(&wt), [main.clone(), wt.clone()]);
+        assert_eq!(main_worktree(&wt), Some(main.clone()));
+        assert_eq!(main_worktree(&main), Some(main));
+        let lone = root();
+        assert_eq!(worktrees(lone.path()), [canonical(lone.path()).unwrap()], "outside git, the checkout itself");
+        assert_eq!(main_worktree(lone.path()), None);
+    }
+
+    #[test]
+    fn a_registration_for_a_checkout_that_is_gone_is_pruned_and_every_other_entry_kept() {
+        let dir = root();
+        let live = dir.path().to_str().unwrap().to_string();
+        let gone = dir.path().join("removed-worktree").to_str().unwrap().to_string();
+        let ours = |p: &str| serde_json::json!({ "type": "stdio", "command": "pnpm", "args": ["exec", "zerograph", "--repo", p, "mcp"] });
+        let config = dir.path().join(".claude.json");
+        let before = serde_json::json!({
+            "numStartups": 3,
+            "projects": {
+                live.clone(): { "mcpServers": { "zerograph": ours(&live) } },
+                gone.clone(): { "allowedTools": ["x"], "mcpServers": { "zerograph": ours(&gone), "repograph": ours(&gone), "other": { "command": "x", "args": [] } } },
+                "/gone/hand-made": { "mcpServers": { "zerograph": { "command": "zerograph", "args": ["serve"] } } },
             }
+        });
+        std::fs::write(&config, serde_json::to_string(&before).unwrap()).unwrap();
+        let r = prune_stale_mcp(&config);
+        assert_eq!(r.written, 1, "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains(&gone)), "{r:?}");
+        let after = read_json(&config);
+        assert_eq!(after["numStartups"], 3);
+        assert_eq!(after["projects"][&live], before["projects"][&live], "a checkout on disk keeps its server");
+        assert_eq!(after["projects"][&gone]["mcpServers"], serde_json::json!({ "other": { "command": "x", "args": [] } }));
+        assert_eq!(after["projects"][&gone]["allowedTools"], serde_json::json!(["x"]));
+        assert_eq!(after["projects"]["/gone/hand-made"], before["projects"]["/gone/hand-made"], "not one `register_mcp` made");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(prune_stale_mcp(&config).written, 0, "nothing left to prune");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text, "and nothing rewritten");
+        assert_eq!(prune_stale_mcp(&dir.path().join("missing.json")).written, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pruned_config_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root();
+        let config = dir.path().join(".claude.json");
+        std::fs::write(&config, r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(prune_stale_mcp(&config).written, 1);
+        assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_agent_registers_the_server_in_every_checkout_each_with_its_own_repo() {
+        let dir = git_repo();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        let (main, wt) = (canonical(&main).unwrap(), canonical(&wt).unwrap());
+        let registries = std::cell::RefCell::new(std::collections::BTreeMap::<PathBuf, std::cell::RefCell<std::collections::BTreeMap<String, String>>>::new());
+        let adds = std::cell::RefCell::new(Vec::<(PathBuf, Vec<String>)>::new());
+        let calls = std::cell::RefCell::new(Vec::new());
+        let claude = |cwd: &Path, args: &[&str]| {
+            if args.get(1) == Some(&"add") { adds.borrow_mut().push((cwd.to_path_buf(), args.iter().map(|a| a.to_string()).collect())); }
+            let mut all = registries.borrow_mut();
+            let registry = all.entry(cwd.to_path_buf()).or_default();
+            fake_claude(&calls, registry, args)
+        };
+        let done = register_mcp_everywhere(&wt, "zerograph", &claude);
+        assert_eq!(done.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(), [main.clone(), wt.clone()]);
+        let adds = adds.into_inner();
+        assert_eq!(adds.len(), 2, "{adds:?}");
+        for (cwd, args) in &adds {
+            let repo = args.iter().position(|a| a == "--repo").map(|i| PathBuf::from(&args[i + 1]));
+            assert_eq!(repo.as_ref(), Some(cwd), "each checkout's server reads that checkout: {args:?}");
         }
-        assert_eq!(install_git_hooks(dir.path(), "zerograph").unwrap().written, 0, "a second install is a no-op");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_changed_while_pruning_is_left_for_the_next_run() {
+        let dir = root();
+        let config = dir.path().join(".claude.json");
+        let stale = r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#;
+        std::fs::write(&config, stale).unwrap();
+        let seen = std::fs::metadata(&config).unwrap();
+        std::fs::write(&config, format!("{stale} ")).unwrap();
+        assert!(replace_config(&config, &seen, "{}\n").is_err());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), format!("{stale} "), "Claude Code's write is kept");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no copy left beside it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_is_pruned_through_its_link() {
+        let dir = root();
+        let real = dir.path().join("dotfiles.json");
+        std::fs::write(&real, r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#).unwrap();
+        let link = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(prune_stale_mcp(&link).written, 1);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(read_json(&real)["projects"]["/gone/wt"]["mcpServers"], serde_json::json!({}));
     }
 
     #[test]
-    fn a_hook_already_there_keeps_its_own_lines_and_gets_the_block_once() {
-        let mine = "#!/bin/sh\nnpx lefthook run post-merge\n";
-        let once = merged_git_hook(mine, "zerograph");
-        assert!(once.starts_with("#!/bin/sh\n") && once.ends_with("npx lefthook run post-merge\n"), "{once}");
-        assert_eq!(merged_git_hook(&once, "zerograph"), once, "re-merging is a no-op");
-        let upgraded = merged_git_hook(&once, "pnpm exec zerograph");
-        assert!(upgraded.ends_with("npx lefthook run post-merge\n") && upgraded.contains("pnpm exec zerograph update --detach"), "{upgraded}");
-        assert_eq!(upgraded.matches(GIT_BEGIN).count(), 1);
-        let appended = format!("#!/bin/sh\nexec npx lefthook run post-merge\n{}", git_block("zerograph"));
-        let moved = merged_git_hook(&appended, "zerograph");
-        assert!(moved.ends_with("exec npx lefthook run post-merge\n") && moved.find(GIT_BEGIN) < moved.find("exec"), "an older install's block moves ahead of exec: {moved}");
+    fn the_codex_hook_from_a_linked_worktree_is_the_main_worktrees_and_one_already_there_is_kept() {
+        let dir = git_repo();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        let main = canonical(&main).unwrap();
+        let (path, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
+        assert_eq!(path, main.join(".codex/hooks/zerograph-hook.mjs"));
+        assert_eq!(r.written, 2, "{r:?}");
+        assert!(std::fs::read_to_string(&path).unwrap().contains("const COMMAND = \"pnpm exec zerograph\";"));
+        assert!(main.join(".codex/hooks/rule.txt").exists());
+        assert_eq!(codex_hook(&wt, "pnpm exec zerograph").unwrap().1.written, 0, "a second run writes nothing");
+
+        std::fs::write(&path, "// the main checkout's own\n").unwrap();
+        let (_, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
+        assert_eq!(r.written, 0);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// the main checkout's own\n");
+        assert!(r.notes.iter().any(|n| n.contains("left as it is")), "{r:?}");
+
+        let (from_main, r) = codex_hook(&main, "zerograph").unwrap();
+        assert_eq!(from_main, path, "the main worktree names its own copy");
+        assert_eq!(r.written, 0);
+        let lone = root();
+        assert_eq!(codex_hook(lone.path(), "zerograph").unwrap().0, canonical(lone.path()).unwrap().join(".codex/hooks/zerograph-hook.mjs"));
+    }
+
+    /// The block as the last release that wrote one spelled it.
+    const OLD_BLOCK: &str = "# zerograph:begin\n# Brings zerograph's index in line with what this pull or checkout moved, in the background.\nif [ \"$3\" != \"0\" ]; then zerograph update --detach >/dev/null 2>&1 || true; fi\n# zerograph:end\n";
+
+    #[test]
+    fn the_block_an_earlier_release_wrote_comes_out_and_the_rest_of_the_hook_stays() {
+        let mine = format!("#!/bin/sh\n{OLD_BLOCK}npx lefthook run post-merge\n");
+        assert_eq!(without_git_block(&mine).as_deref(), Some("#!/bin/sh\nnpx lefthook run post-merge\n"));
+        let renamed = "#!/bin/sh\n# repograph:begin\nrepograph update --detach\n# repograph:end\nexec x\n";
+        assert_eq!(without_git_block(renamed).as_deref(), Some("#!/bin/sh\nexec x\n"), "the block from before the rename goes too");
+        let both = format!("#!/bin/sh\n{OLD_BLOCK}# repograph:begin\nold\n# repograph:end\necho hi\n");
+        assert_eq!(without_git_block(&both).as_deref(), Some("#!/bin/sh\necho hi\n"));
+        assert_eq!(without_git_block(&format!("#!/bin/sh\n{OLD_BLOCK}\n")).as_deref(), Some(""), "only the shebang left: the file was ours");
+        assert_eq!(without_git_block(OLD_BLOCK).as_deref(), Some(""));
+        assert_eq!(without_git_block("#!/bin/sh\necho hi\n"), None, "a hook without the block is not touched");
     }
 
     #[test]
-    fn the_block_runs_before_a_hook_that_ends_in_exit_or_exec() {
-        let husky = "#!/usr/bin/env sh\n. husky.sh\nexec npx lefthook run post-merge\n";
-        let merged = merged_git_hook(husky, "zerograph");
-        assert!(merged.find(GIT_BEGIN).unwrap() < merged.find("exec npx").unwrap(), "{merged}");
-        assert!(merged.starts_with("#!/usr/bin/env sh\n"), "{merged}");
-        let bare = merged_git_hook("echo hi\n", "zerograph");
-        assert!(bare.starts_with(GIT_BEGIN) && bare.ends_with("echo hi\n"), "{bare}");
+    fn a_re_run_removes_the_old_block_keeps_a_shared_hook_and_deletes_one_that_was_only_ours() {
+        let dir = git_repo();
+        let hooks = dir.path().join(".git/hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("post-merge"), format!("#!/bin/sh\n{OLD_BLOCK}npx lefthook run post-merge\n")).unwrap();
+        std::fs::write(hooks.join("post-checkout"), format!("#!/bin/sh\n{OLD_BLOCK}")).unwrap();
+        let r = retire_git_hooks(dir.path());
+        assert_eq!(r.written, 2, "{r:?}");
+        assert_eq!(std::fs::read_to_string(hooks.join("post-merge")).unwrap(), "#!/bin/sh\nnpx lefthook run post-merge\n");
+        assert!(!hooks.join("post-checkout").exists(), "{r:?}");
+        let again = retire_git_hooks(dir.path());
+        assert_eq!(again.written, 0, "{again:?}");
+        assert!(again.notes.is_empty(), "{again:?}");
     }
 
     #[test]
-    fn only_posix_style_shells_count_as_shell_hooks() {
-        for ok in ["#!/bin/sh\n", "#!/usr/bin/env bash\n", "#!/usr/bin/env -S zsh\n", "#!/bin/busybox sh\n", "echo\n"] {
-            assert!(is_shell_hook(ok), "{ok}");
-        }
-        for no in ["#!/usr/bin/fish\n", "#!/usr/bin/env fish\n", "#!/usr/bin/env node\n", "#!/usr/bin/python3\n"] {
-            assert!(!is_shell_hook(no), "{no}");
-        }
+    fn a_block_under_a_hooks_path_inside_the_git_dir_is_found_too() {
+        let dir = git_repo();
+        assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(["config", "core.hooksPath", ".git/my-hooks"])
+            .env_remove("GIT_DIR").status().unwrap().success());
+        let hooks = dir.path().join(".git/my-hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        std::fs::write(hooks.join("post-merge"), format!("#!/bin/sh\n{OLD_BLOCK}echo mine\n")).unwrap();
+        assert_eq!(retire_git_hooks(dir.path()).written, 1);
+        assert_eq!(std::fs::read_to_string(hooks.join("post-merge")).unwrap(), "#!/bin/sh\necho mine\n");
+    }
+
+    #[test]
+    fn outside_a_git_repository_there_is_no_block_to_remove() {
+        let r = retire_git_hooks(root().path());
+        assert_eq!(r.written, 0);
+        assert!(r.notes.is_empty(), "{r:?}");
     }
 
     #[test]
@@ -1119,38 +1351,6 @@ mod tests {
         assert!(said_in_order("Command: zerograph\nArgs: --repo /a b mcp", "zerograph", &["--repo", "/a b", "mcp"]));
         assert!(!said_in_order("Args: mcp --repo /a b", "zerograph", &["--repo", "/a b", "mcp"]));
         assert!(!said_in_order("Command: zerograph\nArgs: --repo /a b2 mcp", "zerograph", &["--repo", "/a b", "mcp"]), "another root");
-    }
-
-    #[test]
-    fn a_hook_in_another_language_is_left_alone() {
-        let dir = git_repo();
-        let hook = dir.path().join(".git/hooks/post-merge");
-        std::fs::write(&hook, "#!/usr/bin/env node\nconsole.log(1)\n").unwrap();
-        let r = install_git_hooks(dir.path(), "zerograph").unwrap();
-        assert_eq!(r.written, 1, "only post-checkout: {r:?}");
-        assert_eq!(std::fs::read_to_string(&hook).unwrap(), "#!/usr/bin/env node\nconsole.log(1)\n");
-    }
-
-    #[test]
-    fn a_tracked_hooks_path_a_hook_manager_set_is_refused_and_one_inside_the_git_dir_is_used() {
-        let dir = git_repo();
-        let set = |value: &str| assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(["config", "core.hooksPath", value])
-            .env_remove("GIT_DIR").status().unwrap().success());
-        set(".husky");
-        let r = install_git_hooks(dir.path(), "zerograph").unwrap();
-        assert_eq!(r.written, 0, "{r:?}");
-        assert!(!dir.path().join(".husky/post-merge").exists());
-        set(".git/my-hooks");
-        install_git_hooks(dir.path(), "zerograph").unwrap();
-        assert!(dir.path().join(".git/my-hooks/post-merge").exists(), "a directory not made yet is still inside");
-    }
-
-    #[test]
-    fn outside_a_git_repository_nothing_is_written_and_it_says_so() {
-        let dir = root();
-        let r = install_git_hooks(dir.path(), "zerograph").unwrap();
-        assert_eq!(r.written, 0);
-        assert_eq!(r.notes.len(), 1, "{r:?}");
     }
 
     #[test]

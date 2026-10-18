@@ -66,7 +66,10 @@ editing the hook script later invalidates the hash, which is a feature and not a
 would fire in every other repository on the machine, which is not a side effect a `--repo` command
 gets to have. `install-agent --codex` therefore installs the repository-scoped half — the stanza and
 the skill — copies the hook script into `.codex/hooks/` so there is something to point at, and
-prints the JSON to add to `~/.codex/hooks.json`, for the reader to paste once if they want it.
+prints the JSON to add to `~/.codex/hooks.json`, for the reader to paste once if they want it. The
+path it prints is the main worktree's copy (the first entry of `git worktree list --porcelain`),
+written there when the install runs in a linked worktree and the main one has none, so removing a
+worktree does not leave every Codex session pointing at a missing file.
 
 Max, 2026-09-07: Codex gets the brief, the skill and the risk line, and **not** the Bash
 interceptor — its verdict is being read on Claude Code and is not carried over blind. The printed

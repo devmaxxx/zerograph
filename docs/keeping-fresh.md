@@ -62,11 +62,8 @@ as a first field, present only when it is behind, so an agent can read those fil
 ```
 
 The detached refresh writes its output to `.zerograph/background.log`. `zerograph update --detach`
-starts the same refresh by hand, and `install-agent` writes `post-merge` and `post-checkout` git
-hooks that run it, so a pull or a branch switch starts catching the store up before anyone asks. An
-existing hook keeps its own lines and gets the block appended between `# zerograph:begin` and
-`# zerograph:end`; `core.hooksPath` is honoured. A foreground `update` or `build` prints where its
-embed is every two seconds:
+starts the same refresh by hand. A foreground `update` or `build` prints where its embed is every two
+seconds:
 
 ```
 embedded 400/1683 (14.2 rows/s, ~90 s left)
@@ -90,9 +87,40 @@ embedded up to the last digits — batch padding makes two embeds of the same te
 not bit-identical — so answers do not move. There is no switch: a repository with one checkout, or
 siblings on another model, simply embeds everything.
 
+### The session hook
+
+`install-agent` writes no git hooks. Every read already refreshes, and `serve` catches up when it
+starts and then polls, so a git hook only bought a warm first read, at the price of a full embed on
+every `git worktree add` (hooks live in the common git directory, so the block fired in every
+worktree) and of a block a hook manager rewrote away. A re-run of `install-agent` takes out the
+`# zerograph:begin` … `# zerograph:end` block an earlier release wrote into `post-merge` and
+`post-checkout`, leaves the rest of each hook as it is, and deletes a hook that held nothing else.
+
+The agent's session hook does that job per checkout instead. At SessionStart:
+
+- **No index in this checkout** — a new worktree, typically — and the checkout asked for one (it
+  holds the hook `install-agent` writes, or a `zerograph.toml`, or its main worktree does): it starts `update --detach` at the
+  checkout's root and says in one line that a build is running. A checkout that asked for nothing
+  stays silent, which matters for Codex, whose one hook runs in every repository.
+- **An index** — it starts the resident `serve`, which catches the store up as it starts; with
+  `ZEROGRAPH_HOOK_SERVE=0` it starts `update --detach` instead, which writes nothing when nothing
+  moved.
+
+The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
+smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached
+`update` rather than killed at the timeout with its work lost.
+
+Each worktree keeps its own store, its own `vectors.f32` included. Copying a store as an APFS clone
+(`cp -c`) saves less than it seems: `graph.json`, `graph.bin`, the manifest and the vectors'
+metadata are rewritten whole through a temporary file and a rename, so the copy's first refresh
+gives them blocks of their own. `vectors.f32` grows in place and keeps its shared blocks only until
+it is rewritten whole — after a compaction, a model switch, or another process rewriting it. There
+is no delta format. The vectors a new worktree needs come instead from a sibling worktree's store,
+borrowed when its index is built rather than embedded again.
+
 ### Background priority
 
-The detached `update` that a reader, a git hook or the MCP `reindex` and `switch_model` tools start
+The detached `update` that a reader, the session hook or the MCP `reindex` and `switch_model` tools start
 runs at background priority, and so does `watch`. A command someone is waiting on — `ask`, `build`,
 `update` without `--detach`, `embed`, `model` — keeps normal priority, and so does `serve`: a
 question can be waiting behind its poll, and the poll re-reads only the files that changed.
@@ -136,7 +164,8 @@ so interrupting it cannot leave half a graph behind. An idle poll is the walk an
 21 ms of CPU on the development corpus, under a tenth of a percent of a core at the default
 cadence.
 
-Git hooks are the free alternative to a poller or a resident process, for a repository whose changes arrive by pull:
+Git hooks written by hand are the free alternative to a poller or a resident process, for a
+repository whose changes arrive by pull. They run in every worktree of the clone, a new one included:
 
 ```sh
 # .git/hooks/post-merge, .git/hooks/post-checkout, .git/hooks/post-commit

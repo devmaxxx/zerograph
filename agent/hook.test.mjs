@@ -33,10 +33,12 @@ function world({ store = true, answer = '', status = 0 } = {}) {
   const bin = join(root, 'bin');
   mkdirSync(bin, { recursive: true });
   const argvLog = join(root, 'argv.txt');
+  const budgetLog = join(root, 'budget.txt');
   const fake = join(bin, 'fake.mjs');
   writeFileSync(fake, [
     "import { appendFileSync, writeSync } from 'node:fs';",
     `appendFileSync(${JSON.stringify(argvLog)}, process.argv.slice(2).join(' ') + '\\n', 'utf8');`,
+    `appendFileSync(${JSON.stringify(budgetLog)}, process.argv[2] + ' ' + (process.env.ZEROGRAPH_READER_BUDGET ?? '-') + '\\n', 'utf8');`,
     `writeSync(1, ${JSON.stringify(answer + '\n')});`,
     `process.exit(${status});`,
   ].join('\n'), 'utf8');
@@ -48,7 +50,7 @@ function world({ store = true, answer = '', status = 0 } = {}) {
     ? `@echo off\r\n"${process.execPath}" "${fake}" %*\r\n`
     : `#!/bin/sh\nexec "${process.execPath}" "${fake}" "$@"\n`);
   if (!WIN) chmodSync(launcher, 0o755);
-  return { root, bin, launcher, argvLog };
+  return { root, bin, launcher, argvLog, budgetLog };
 }
 
 function fire(w, payload, env = {}, hook = HOOK) {
@@ -357,6 +359,93 @@ test('SessionStart starts a resident serve, and the switch turns it off', async 
   assert.equal(argv(off).filter((l) => l.includes('serve')).length, 0, argv(off).join(' | '));
 });
 
+test('a checkout that asked for an index and has none gets one built in the background from its first session', async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  mkdirSync(join(w.root, '.claude', 'hooks'), { recursive: true });
+  writeFileSync(join(w.root, '.claude', 'hooks', 'zerograph-hook.mjs'), '');
+  const sub = join(w.root, 'src');
+  mkdirSync(sub);
+  const c = context(fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: sub }));
+  assert.match(c, /being built in the background/);
+  const line = await waitFor(w, /update --detach/);
+  assert.equal(line, `--repo ${w.root} update --detach`, 'the checkout, not the subdirectory, and dense');
+  assert.equal(argv(w).filter((l) => / prime$| serve /.test(l)).length, 0, argv(w).join(' | '));
+});
+
+test('a checkout that never asked for an index is not built, so a machine-wide hook stays silent', async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }), null);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(argv(w), []);
+  for (const marker of [['zerograph.toml'], ['.codex', 'hooks', 'zerograph-hook.mjs']]) {
+    const o = world({ store: false });
+    mkdirSync(join(o.root, '.git'));
+    mkdirSync(join(o.root, ...marker.slice(0, -1)), { recursive: true });
+    writeFileSync(join(o.root, ...marker), '');
+    assert.match(context(fire(o, { hook_event_name: 'SessionStart', source: 'startup' })), /being built/, marker.join('/'));
+  }
+});
+
+test('a linked worktree whose main worktree holds the hook asked for an index too', async () => {
+  const w = world({ store: false });
+  const main = join(w.root, 'main');
+  mkdirSync(join(main, '.git', 'worktrees', 'wt'), { recursive: true });
+  writeFileSync(join(main, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+  mkdirSync(join(main, '.codex', 'hooks'), { recursive: true });
+  writeFileSync(join(main, '.codex', 'hooks', 'zerograph-hook.mjs'), '');
+  const wt = join(w.root, 'wt');
+  mkdirSync(wt);
+  writeFileSync(join(wt, '.git'), `gitdir: ${join(main, '.git', 'worktrees', 'wt')}\n`);
+  assert.match(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: wt })), /being built/);
+  assert.equal(await waitFor(w, /update --detach/), `--repo ${wt} update --detach`);
+});
+
+test('an opted-in checkout with no binary to start claims no build', { skip: WIN }, async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  writeFileSync(join(w.root, 'zerograph.toml'), '');
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here') }), null);
+});
+
+test('while the first session builds, a search is told the build is under way, not to start one', () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  writeFileSync(join(w.root, 'zerograph.toml'), '');
+  const c = context(fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } }));
+  assert.match(c, /being built in the background/);
+  assert.doesNotMatch(c, /zerograph build`/);
+});
+
+test('with serve off, a built index is caught up by a detached update instead', async () => {
+  const w = world({ answer: 'zerograph: 3 doc nodes' });
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { ZEROGRAPH_HOOK_SERVE: '0' });
+  assert.ok(await waitFor(w, /^--repo .* update --detach$/), argv(w).join(' | '));
+  const on = world({ answer: 'zerograph: 3 doc nodes' });
+  fire(on, { hook_event_name: 'SessionStart', source: 'startup' });
+  await waitFor(on, /serve --idle/);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(argv(on).filter((l) => l.includes('update')).length, 0, 'serve catches up as it starts');
+});
+
+test('every call the hook waits on refreshes in process for less than its timeout, or less when told', () => {
+  const budgets = (w) => readFileSync(w.budgetLog, 'utf8').trim().split('\n').filter((l) => l.startsWith('--repo')).map((l) => l.split(' ')[1]);
+  const env = { ZEROGRAPH_HOOK_SERVE: '0' };
+  const edit = { hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: 'src/a.ts' } };
+  for (const [set, want] of [[undefined, '2'], ['30', '2'], ['1', '1'], ['0', '0'], ['soon', '2']]) {
+    const w = world({ answer: '{}' });
+    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: set, REPOGRAPH_READER_BUDGET: undefined });
+    assert.deepEqual(budgets(w), [want], `set ${set}`);
+  }
+  for (const [line, want] of [['reader_budget = 0', '0'], ['reader_budget = 5 # generous', '2']]) {
+    const w = world({ answer: '{}' });
+    writeFileSync(join(w.root, 'zerograph.toml'), `${line}\n`);
+    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: undefined, REPOGRAPH_READER_BUDGET: undefined });
+    assert.deepEqual(budgets(w), [want], line);
+  }
+});
+
 test('SubagentStart carries the rule', () => {
   const w = world();
   const c = context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }));
@@ -478,7 +567,10 @@ test('the Agent prompt is extended only when the fallback is asked for', () => {
 test('a repository with no store gets one build notice and then silence', () => {
   const w = world({ store: false });
   const payload = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } };
-  assert.match(context(fire(w, payload)), /zerograph build/);
+  const notice = context(fire(w, payload));
+  assert.match(notice, /zerograph build/);
+  assert.match(notice, /worktree.*already built.*borrows/, 'a large repository is not told it costs a whole embed');
+  assert.doesNotMatch(notice, /couple of minutes/, 'a large repository takes far longer than that');
   assert.equal(fire(w, { ...payload, tool_input: { command: 'rg "another question here"' } }), null, 'once a session');
 });
 

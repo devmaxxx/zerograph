@@ -16,47 +16,34 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-/// The bytes a socket path may take, its terminator included: 104 on macOS (`sys/un.h`'s
-/// `sun_path[104]`), 108 on Linux and in Windows' `SOCKADDR_UN`. socket2 and std both refuse a
-/// path that needs the whole array, so a usable one is shorter than this.
-#[cfg(target_os = "macos")]
-const SUN_LEN: usize = 104;
-#[cfg(not(target_os = "macos"))]
-const SUN_LEN: usize = 108;
-
 /// Cyrillic and a space, and ASCII file names underneath it: git's default `core.quotepath`
 /// escapes a non-ASCII *file* name in its diff headers, which is a finding of its own and not
 /// this test's subject. The directory is what the socket, the walk and `git -C` are judged on.
 const REPO_DIR: &str = "Проект beauty crm";
 
-/// Where else to look when the platform's own temp directory leaves no room. `/tmp` is the
-/// shortest root every unix has, and on macOS a symlink to `/private/tmp`, which is what a bind
-/// sees — so the length is measured after canonicalizing. Windows' temp directory is short
-/// enough on its own, and there is no equivalent short root to fall back to.
-#[cfg(unix)]
-const SHORTER_ROOTS: &[&str] = &["/tmp"];
-#[cfg(not(unix))]
-const SHORTER_ROOTS: &[&str] = &[];
+/// A home of the tests' own, shared by every child of this binary so a client and its server agree
+/// on it: the socket lives under the user's cache, and a server a failed or killed test leaves
+/// behind would otherwise leave its file in the real one. Under `/tmp` on unix because a macOS
+/// temp directory is deep enough to push the socket past `sun_path` into the fallback.
+fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| if cfg!(unix) { tempfile::tempdir_in("/tmp") } else { tempfile::tempdir() }.unwrap()).path()
+}
 
-fn zerograph() -> Command { let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph")); c.env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS"); c }
+fn zerograph() -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph"));
+    c.env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS").env("HOME", test_home()).env("USERPROFILE", test_home());
+    c
+}
 
-/// A temp directory whose repository's socket path still fits `sun_path`. macOS hands out
-/// `/private/var/folders/…/T/` — around 57 bytes before anything of ours — and the name above
-/// plus `.zerograph/serve.sock` wants 46 more, which is over that platform's 104. So the root is
-/// chosen by the length it leaves rather than taken as given, and if none is short enough the
-/// test says the number instead of failing inside a bind.
-fn short_root() -> tempfile::TempDir {
-    let roots = std::iter::once(std::env::temp_dir()).chain(SHORTER_ROOTS.iter().map(PathBuf::from));
-    let mut longest = String::new();
-    for root in roots {
-        let Ok(dir) = tempfile::Builder::new().prefix("rg").tempdir_in(&root) else { continue };
-        let real = dir.path().canonicalize().unwrap_or_else(|_| dir.path().to_path_buf());
-        let sock = real.join(REPO_DIR).join(".zerograph").join("serve.sock");
-        let len = sock.to_string_lossy().len();
-        if len < SUN_LEN { return dir; }
-        longest = format!("{len} bytes at {}", sock.display());
-    }
-    panic!("no temp root leaves a socket path under {SUN_LEN} bytes: {longest}");
+/// Where the server for `repo` listens, in the binary's own words: `status --json` names the socket
+/// it checks, which is the one `serve` binds. The name is a hash of the checkout path, kept under
+/// the user's cache, so this Cyrillic path with its space is what the hash is taken of and no
+/// longer what has to fit in `sun_path`.
+fn socket_of(repo: &Path) -> PathBuf {
+    let status = run(repo, &["status", "--json"], None);
+    let v: serde_json::Value = serde_json::from_str(&status.out).unwrap();
+    PathBuf::from(v["serve"]["socket"].as_str().unwrap_or_else(|| panic!("status names no socket: {v}")))
 }
 
 /// `git` with an identity of its own and the machine's configuration kept out of it: a runner has
@@ -123,7 +110,7 @@ fn fake_claude(dir: &Path) {
 
 #[test]
 fn a_repository_under_a_cyrillic_directory_with_a_space_is_built_served_asked_reranked_and_diffed() {
-    let root = short_root();
+    let root = tempfile::Builder::new().prefix("rg").tempdir().unwrap();
     let repo = root.path().join(REPO_DIR);
     std::fs::create_dir_all(repo.join("docs")).unwrap();
     std::fs::write(repo.join("docs/pay.md"), "**FR-PAY-1 · MUST · Штраф за отмену**\n\nШтраф списывается сам (INV-1).\n\n**INV-1 · MUST · Деньги не сгорают**\n\nОтмена не сжигает деньги.\n").unwrap();
@@ -180,7 +167,7 @@ fn a_repository_under_a_cyrillic_directory_with_a_space_is_built_served_asked_re
 
     // Killed, which is what `Stop-Process` and a closed terminal both are: no exit runs, so the
     // socket file stays. The README says so, and the next `serve` is what sweeps it.
-    let sock = repo.join(".zerograph/serve.sock");
+    let sock = socket_of(&repo);
     server.kill().unwrap();
     let _ = server.wait();
     assert!(std::fs::symlink_metadata(&sock).is_ok(), "a killed server left no socket to sweep");

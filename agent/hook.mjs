@@ -14,7 +14,8 @@
  *                   carry it ever ran the tool.
  *
  * Contract: exit 0 always, stdout only when there is something to say, stderr only under
- * ZEROGRAPH_HOOK_DEBUG. Every call is --no-dense; every call but `changes` is --stale.
+ * ZEROGRAPH_HOOK_DEBUG. Every call it waits on is --no-dense, and every one but `changes` is --stale;
+ * what it starts and leaves running — a `serve`, an `update --detach` — is neither.
  */
 import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
@@ -28,6 +29,13 @@ const SEEDS = 3;
 const LINE_CUT = 160;
 const REMINDER_EVERY = 40;
 const TIMEOUT_MS = 5000;
+/**
+ * The seconds of in-process refresh a call gets, passed as `ZEROGRAPH_READER_BUDGET`. Under the
+ * binary's own 10 s a refresh of 5–10 s was killed at the timeout above with its work lost, and the
+ * next call started it again; at 2 s what does not fit goes to a detached `update`, and the other
+ * 3 s are the process start, the store load, the walk and the answer.
+ */
+const HOOK_BUDGET = 2;
 /** What the autostarted `serve` is told: leave after half an hour unasked, forget the model after five minutes. */
 const SERVE_IDLE = 1800;
 const SERVE_IDLE_MODEL = 300;   // measured on the 33.5k-row copy: 0.08 s resident, 0.77 s after a drop
@@ -54,9 +62,15 @@ for every claim; when nothing printed holds it, say so.
 Grep is still the right tool for a literal — an env var name, a string in a test, a config key.
 `;
 
+const BUILDING_NOTICE =
+  `zerograph: this checkout has no index yet, so one is being built in the background ` +
+  `(\`${COMMAND} status\` shows how far it has got); until it lands, search as usual.`;
+
 const BUILD_NOTICE =
-  `zerograph: this repository has no index yet. \`${COMMAND} build\` writes one in a couple of minutes ` +
-  'and answers by meaning afterwards; until then this notice is all it can say.';
+  `zerograph: this repository has no index yet. \`${COMMAND} build\` writes one in a few minutes on a ` +
+  'small repository and longer on a large one, though a worktree beside one already built borrows its ' +
+  'vectors instead of embedding them again. It answers by meaning afterwards; until then this notice ' +
+  'is all it can say.';
 
 function rule() {
   const beside = join(HERE, 'rule.txt');
@@ -125,10 +139,24 @@ function spawnable(bin, args) {
   return { file: `"${bin}"`, args: args.map((a) => `"${a}"`), opts: { shell: true } };
 }
 
+/**
+ * `HOOK_BUDGET`, or a smaller whole number of seconds the environment or the repository's
+ * `zerograph.toml` already sets. The variable outranks every file, so passing 2 would otherwise
+ * lift a repository's `reader_budget = 0` back to 2.
+ */
+function readerBudget(root) {
+  const set = String(env('READER_BUDGET') ?? '').trim();
+  let file = '';
+  try { file = readFileSync(join(root, 'zerograph.toml'), 'utf8').match(/^\s*reader_budget\s*=\s*(\d+)\s*(?:#.*)?$/m)?.[1] ?? ''; } catch {}
+  const smallest = [set, file].filter((v) => /^\d+$/.test(v)).map(Number).reduce((a, b) => Math.min(a, b), HOOK_BUDGET);
+  return String(smallest);
+}
+
 function run(root, args) {
   const { file, args: argv, opts } = spawnable(binary(root), ['--repo', root, '--no-dense', ...args]);
   const r = spawnSync(file, argv, {
-    encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true, ...opts,
+    encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
+    env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget(root) }, ...opts,
   });
   if (r.status !== 0) debug('exit', r.status, args.join(' '), (r.stderr || '').slice(0, 200));
   // Identifiers and headings in the answer are the repository's text, and it is about to enter an
@@ -154,6 +182,47 @@ function indexRoot(start) {
     if (built(d)) return d;
     if (existsSync(join(d, '.git')) || dirname(d) === d) return null;
   }
+}
+
+/** The checkout `start` is in: the nearest directory at or above it holding a `.git`, file or directory. */
+function checkoutRoot(start) {
+  for (let d = start; ; d = dirname(d)) {
+    if (existsSync(join(d, '.git'))) return d;
+    if (dirname(d) === d) return null;
+  }
+}
+
+/**
+ * Whether a checkout asked for an index: it carries the hook `install-agent` writes, or a
+ * `zerograph.toml`. Codex runs one copy of this hook in every repository a session opens, and a
+ * build started in each of them would be the cost a git hook used to pay on every worktree add.
+ */
+function optedIn(checkout) {
+  const asked = (dir) => ['.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs', 'zerograph.toml']
+    .some((p) => existsSync(join(dir, ...p.split('/'))));
+  const main = mainCheckout(checkout);
+  return asked(checkout) || (main !== null && asked(main));
+}
+
+/**
+ * The main worktree of a linked one, read off its `.git` file and the `commondir` beside it, or
+ * null. `install-agent --codex` puts the Codex hook there, so a linked worktree whose own tree does
+ * not carry it has still asked for an index.
+ */
+function mainCheckout(checkout) {
+  try {
+    const gitdir = readFileSync(join(checkout, '.git'), 'utf8').match(/^gitdir:\s*(.+?)\s*$/m)?.[1];
+    if (!gitdir) return null;
+    const linked = isAbsolute(gitdir) ? gitdir : join(checkout, gitdir);
+    const common = readFileSync(join(linked, 'commondir'), 'utf8').trim();
+    const commonDir = isAbsolute(common) ? common : join(linked, common);
+    return /^\.git$/.test(commonDir.split(/[\\/]/).filter(Boolean).pop() ?? '') ? dirname(commonDir) : null;
+  } catch { return null; }
+}
+
+/** Whether `binary` names something that will start: a local install, an explicit one, or PATH's. */
+function binaryFound(root) {
+  return binary(root) !== 'zerograph' || onPath();
 }
 
 /**
@@ -384,23 +453,53 @@ function brief(root) {
  * machine that is also running a build. `--idle-model` is what keeps that cheap between questions.
  */
 function autostartServe(root) {
-  if (env('HOOK_SERVE') === '0') return;
+  if (env('HOOK_SERVE') === '0') return false;
+  return detached(root, ['--repo', root, 'serve', '--idle', String(SERVE_IDLE), '--idle-model', String(SERVE_IDLE_MODEL)]);
+}
+
+/**
+ * Starts `zerograph <args>` and leaves it running. Whether the start was handed to the OS, which
+ * is not whether the binary was found: that failure arrives later, as an event.
+ */
+function detached(root, args) {
   try {
-    const { file, args, opts } = spawnable(binary(root),
-      ['--repo', root, 'serve', '--idle', String(SERVE_IDLE), '--idle-model', String(SERVE_IDLE_MODEL)]);
-    const child = spawn(file, args, { detached: true, stdio: 'ignore', windowsHide: true, ...opts });
+    const { file, args: argv, opts } = spawnable(binary(root), args);
+    const child = spawn(file, argv, { detached: true, stdio: 'ignore', windowsHide: true, ...opts });
     // A spawn that fails reports it as an event, not as a throw, and an unheard `error` event ends
     // this process — which would turn "no binary on PATH" into a hook that dies on stderr at every
     // session start. The listener is what keeps the contract: exit 0, and say nothing.
-    child.on('error', (e) => debug('serve', e.message));
+    child.on('error', (e) => debug(args[2], e.message));
     child.unref();
-  } catch (e) { debug('serve', e.message); }
+    return true;
+  } catch (e) { debug(args[2], e.message); return false; }
+}
+
+/**
+ * A detached `update`, at background priority, which walks the tree itself and writes nothing when
+ * nothing moved — so the hook never pays a walk to decide whether one is owed. Dense, as every
+ * refresh nobody waits on is: the background band keeps the embed out of the way.
+ */
+function startUpdate(root) {
+  return detached(root, ['--repo', root, 'update', '--detach']);
+}
+
+/**
+ * A checkout with no index of its own — a new worktree, typically — gets one built in the
+ * background from its first session, where a git hook used to start one on every `git worktree add`.
+ */
+function bootstrap(cwd) {
+  const checkout = cwd && checkoutRoot(cwd);
+  // A spawn reports a missing binary only later, as an event, so the notice would claim a build
+  // that never started.
+  if (!checkout || !optedIn(checkout) || !binaryFound(checkout)) return null;
+  return startUpdate(checkout) ? BUILDING_NOTICE : null;
 }
 
 const handlers = {
   SessionStart: (p, root) => {
-    if (!built(root)) return null;
-    autostartServe(root);
+    if (!built(root)) return bootstrap(p.cwd || root);
+    // The resident serve catches the store up as it starts; without one, a detached update does.
+    if (!autostartServe(root)) startUpdate(root);
     return brief(root);
   },
   SubagentStart: (p, root) => (built(root) ? rule() : null),
@@ -411,7 +510,10 @@ const handlers = {
       return { updatedInput: { ...(p.tool_input || {}), prompt: `${prompt}\n\n${rule()}` } };
     }
     if (!built(root)) {
-      return isWatchedCall(p.tool_name, p.tool_input) && once(key, 'build', 'once') ? BUILD_NOTICE : null;
+      if (!isWatchedCall(p.tool_name, p.tool_input) || !once(key, 'build', 'once')) return null;
+      // SessionStart already started the build there; a `build` on top of it would embed twice.
+      const checkout = p.cwd && checkoutRoot(p.cwd);
+      return checkout && optedIn(checkout) && binaryFound(checkout) ? BUILDING_NOTICE : BUILD_NOTICE;
     }
     return intercept(p, root, key) ?? reminder(p, key);
   },
