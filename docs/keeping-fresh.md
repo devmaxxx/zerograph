@@ -110,6 +110,12 @@ The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_B
 smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached
 `update` rather than killed at the timeout with its work lost.
 
+Each worktree keeps its own store, its own `vectors.f32` included. Copying a store as an APFS clone
+(`cp -c`) saves the disk only until the copy's first refresh: every store file is rewritten whole
+through a temporary file and a rename, so the first save gives the clone blocks of its own. The
+vectors a new worktree needs come instead from a sibling worktree's store, borrowed when its index
+is built rather than embedded again.
+
 ### Background priority
 
 The detached `update` that a reader, the session hook or the MCP `reindex` and `switch_model` tools start
