@@ -1,3 +1,4 @@
+use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -701,4 +702,52 @@ fn a_detached_server_answers_after_the_command_returns_and_stop_ends_it() {
     let log = std::fs::read_to_string(dir.path().join(".zerograph/serve.log")).unwrap();
     assert!(log.contains("terminated, exiting"), "{log}");
     assert!(std::fs::symlink_metadata(socket_of(dir.path())).is_err(), "{log}");
+}
+
+/// A 0.6.4 `serve` as `stop` meets one: bound at `.zerograph/serve.sock` inside the checkout,
+/// where that release put its socket, and leaving the way it did on the stop line — the
+/// confirmation, then the socket file gone with its exit. The first line it is sent comes back
+/// on the channel.
+fn serve_0_6_4(dir: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
+    let sock = dir.join(".zerograph/serve.sock");
+    assert!(sock.as_os_str().len() <= 100, "0.6.4 would have bound {} under the temp directory", sock.display());
+    let listener = transport::bind(&sock);
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let s = transport::accept(&listener);
+        let mut w = &s;
+        let _ = writeln!(w, "{{\"ack\":\"0.6.4\"}}");
+        let mut line = String::new();
+        let _ = BufReader::new(&s).read_line(&mut line);
+        let _ = writeln!(w, "{{\"stopped\":\"0.6.4\"}}");
+        // The exit takes a moment after the confirmation, as a real one does, so `stop` has to
+        // wait for the file rather than find it already gone.
+        std::thread::sleep(Duration::from_millis(300));
+        let _ = std::fs::remove_file(&sock);
+        let _ = tx.send(line);
+    });
+    rx
+}
+
+#[test]
+fn stop_ends_a_0_6_4_server_still_bound_inside_the_checkout() {
+    let dir = repo_with_docs();
+    let sent = serve_0_6_4(dir.path());
+    let out = stop(dir.path());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(out.status.success(), "{err}");
+    assert!(err.contains("serve has stopped"), "{err}");
+    assert_eq!(sent.recv_timeout(Duration::from_secs(10)).unwrap().trim(), r#"{"stop":true}"#);
+    assert!(std::fs::symlink_metadata(dir.path().join(".zerograph/serve.sock")).is_err());
+}
+
+/// The old server polls and writes without the writer lock, so a new one that started beside it
+/// would be two writers on one store.
+#[test]
+fn serve_stops_a_0_6_4_server_of_its_checkout_before_it_binds() {
+    let dir = repo_with_docs();
+    let sent = serve_0_6_4(dir.path());
+    let _server = serve(dir.path(), &["--every", "3600", "--idle", "60"]);
+    assert_eq!(sent.recv_timeout(Duration::from_secs(20)).expect("serve never sent the old server the stop line").trim(), r#"{"stop":true}"#);
+    ask_until_resident(dir.path(), &["штраф"]);
 }

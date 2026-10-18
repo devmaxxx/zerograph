@@ -203,6 +203,16 @@ fn socket_name(repo: &Path) -> String {
     format!("{h:016x}")
 }
 
+/// Where 0.6.4 bound the socket: `.zerograph/serve.sock` inside the checkout, or the temp
+/// directory's `zerograph-<hash>.sock` once that name would not fit in `sun_path`. A server of that
+/// release left running across the upgrade listens where no client of this one looks, and goes on
+/// polling and writing without the writer lock until its idle timeout. Windows served there too.
+fn legacy_socket_path(repo: &Path) -> PathBuf {
+    let in_repo = crate::store::dir_of(repo).join("serve.sock");
+    if in_repo.as_os_str().len() <= 100 { return in_repo; }
+    fallback_dir().join(format!("zerograph-{}.sock", socket_name(repo)))
+}
+
 /// Where a socket goes when home cannot hold one. `/tmp` is shared, and a name there that anyone
 /// can predict is a name another user can bind first and answer under, so on unix the socket sits
 /// in a directory named for the user, which `prepare_socket_dir` makes private. Windows' temp
@@ -393,11 +403,28 @@ pub struct Stopped { pub stopped: String }
 const STOP_WAIT: Duration = Duration::from_secs(10);
 
 /// Ends the server answering for this repository through its own exit — the one that removes the
-/// socket file — which a kill does not run on Windows. False when nothing answers here.
+/// socket file — which a kill does not run on Windows. A 0.6.4 server still bound at the old name
+/// is ended alongside. False when nothing answers at either.
 pub fn stop(repo: &Path) -> Result<bool> {
-    let path = socket_path(repo);
-    if !sys::present(&path) || !sys::ours(&path) { return Ok(false); }
-    let Ok(mut stream) = sys::connect(&path) else { return Ok(false) };
+    // Both before either error is raised: a current server that fails to leave is no reason to
+    // leave the old one writing.
+    let current = stop_at(&socket_path(repo));
+    let legacy = stop_legacy(repo);
+    Ok(current? | legacy?)
+}
+
+/// The two names coincide only when both fell back to the temp directory. That server is the one
+/// at the current name, already asked by `stop` and refused by `serve`'s own probe, and a server
+/// listening there may be this release's.
+fn stop_legacy(repo: &Path) -> Result<bool> {
+    let legacy = legacy_socket_path(repo);
+    if legacy == socket_path(repo) { return Ok(false); }
+    stop_at(&legacy)
+}
+
+fn stop_at(path: &Path) -> Result<bool> {
+    if !sys::present(path) || !sys::ours(path) { return Ok(false); }
+    let Ok(mut stream) = sys::connect(path) else { return Ok(false) };
     // A server busy with a rerank reads this line when it is done, so the wait is a rerank's.
     stream.set_read_timeout(Some(RERANK_TIMEOUT))?;
     stream.set_write_timeout(Some(IO_TIMEOUT))?;
@@ -412,8 +439,8 @@ pub fn stop(repo: &Path) -> Result<bool> {
         if serde_json::from_str::<Stopped>(&line).is_ok() { break; }
     }
     let start = Instant::now();
-    while sys::present(&path) && start.elapsed() < STOP_WAIT { std::thread::sleep(Duration::from_millis(50)); }
-    if sys::present(&path) { anyhow::bail!("serve said it is leaving, but {} is still there after {}s", path.display(), STOP_WAIT.as_secs()); }
+    while sys::present(path) && start.elapsed() < STOP_WAIT { std::thread::sleep(Duration::from_millis(50)); }
+    if sys::present(path) { anyhow::bail!("serve said it is leaving, but {} is still there after {}s", path.display(), STOP_WAIT.as_secs()); }
     Ok(true)
 }
 
@@ -477,6 +504,16 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     let _guard = Unlink(path.clone(), sys::id(&path));
     // After the guard exists, so a signal arriving between the two still finds something to run.
     catch_termination();
+    // The old server takes no writer lock, so it has to be gone before the watcher below writes.
+    // After the bind, because a busy one reads the stop line only once its rerank is done, and
+    // `--detach` gives up on a socket that has not answered within `DETACH_WAIT`. One that will
+    // not leave is reported rather than fatal: refusing to start would leave the checkout with
+    // only that server.
+    match stop_legacy(repo) {
+        Ok(true) => eprintln!("serve: stopped a 0.6.4 server at {}", legacy_socket_path(repo).display()),
+        Ok(false) => {}
+        Err(e) => eprintln!("serve: {e:#}"),
+    }
     // The accept blocks on a thread of its own and hands each connection over, one at a time —
     // the answer still happens here, on the one thread that holds the context. A rendezvous
     // channel is what keeps it to one: the next connection is accepted but not delivered until
@@ -802,6 +839,19 @@ mod tests {
         assert!(p.extension().is_some_and(|e| e == "sock"), "{}", p.display());
         assert_eq!(super::socket_path_under(Some(home), &repo), p, "a client that computes it again finds the same name");
         assert_ne!(super::socket_path_under(Some(home), &repo.join("x")), p, "another repository is another socket");
+    }
+
+    /// Where 0.6.4 bound, so a server of that release left running across the upgrade can still be
+    /// told to leave: inside the checkout while the name fits `sun_path`, the temp directory's
+    /// `zerograph-<hash>.sock` once it does not.
+    #[test]
+    fn the_socket_a_0_6_4_server_bound_is_where_that_release_put_it() {
+        let shallow = std::path::Path::new("/tmp/r");
+        assert_eq!(super::legacy_socket_path(shallow), std::path::Path::new("/tmp/r/.zerograph/serve.sock"));
+        let deep = std::path::Path::new("/tmp").join("a".repeat(120));
+        let p = super::legacy_socket_path(&deep);
+        assert_eq!(p.parent().unwrap(), super::fallback_dir(), "{}", p.display());
+        assert_eq!(p.file_name().unwrap().to_string_lossy(), format!("zerograph-{}.sock", super::socket_name(&deep)));
     }
 
     /// Through the platform's idea of home, as the model cache is: a Windows console sets no `$HOME`.

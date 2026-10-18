@@ -2,7 +2,7 @@
 
 ## Status
 
-0.6.4 is the version `main` carries. Its default globs read TypeScript and JavaScript, Kotlin, Java,
+0.6.5 is the version `main` carries. Its default globs read TypeScript and JavaScript, Kotlin, Java,
 C#, Rust, Python, Dart, Swift, GraphQL, SQL, Bicep, HCL, Shell, Vue, Lua, Go, C, C++, PHP, Ruby,
 Scala, Elixir and OCaml; every command below is
 implemented rather than planned:
