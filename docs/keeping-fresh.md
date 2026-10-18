@@ -24,7 +24,7 @@ quarter of the live rows are compacted away by the next refresh, which does rewr
 An upgrade is the one refresh that reads everything. The manifest records which generation of the
 extractor's grammar the graph beside it was read by, and where a newer generation is reading, a hash
 settles nothing: a file nobody has touched may hold a citation the older grammar never looked for.
-So the first `update`, `watch` poll or refreshing `ask` after such an upgrade says on stderr that it
+So the first `update`, `serve` poll or refreshing `ask` after such an upgrade says on stderr that it
 is re-reading the whole tree and why, writes the new generation forward, and leaves every update
 after it incremental again. A release that does not change the grammar costs no walk at all.
 
@@ -121,7 +121,7 @@ borrowed when its index is built rather than embedded again.
 ### Background priority
 
 The detached `update` that a reader, the session hook or the MCP `reindex` and `switch_model` tools start
-runs at background priority, and so does `watch`. A command someone is waiting on — `ask`, `build`,
+runs at background priority. A command someone is waiting on — `ask`, `build`,
 `update` without `--detach`, `embed`, `model` — keeps normal priority, and so does `serve`: a
 question can be waiting behind its poll, and the poll re-reads only the files that changed.
 
@@ -144,27 +144,10 @@ for an `update --no-dense` or a lexical `ask` before it. A hook written as `upda
 MCP `status` tool counts them as `owed`. Leave `--no-dense` out of the hooks: the background band
 is what keeps the embed out of the way.
 
-Readers that do not refresh themselves — an editor plugin, an MCP server — can be kept supplied by
-a poller instead:
+Readers that do not refresh themselves are covered already: every MCP tool refreshes before it
+answers, and a resident [`serve`](serve.md) polls the tree between questions.
 
-```bash
-zerograph watch                  # poll every 30 s, apply what changed, embed it
-zerograph watch --every 15       # a tighter cadence
-zerograph watch --batch 5        # save once five files are waiting, not on every one
-zerograph watch --no-dense       # lexical only, leaves the 1.4 GB model unopened
-```
-
-A refresh rewrites the whole graph, so `--batch` is there to spend that once on a burst of edits
-rather than once per file. Fewer than `--batch` files waiting are carried to the next poll, at most
-three times in a row, so a lone edit lands within four polls whatever the batch says;
-`ZEROGRAPH_TIMING=1` reports each deferral.
-
-It prints one line per refresh and exits on Ctrl-C; every store write is a temp file and a rename,
-so interrupting it cannot leave half a graph behind. An idle poll is the walk and nothing else —
-21 ms of CPU on the development corpus, under a tenth of a percent of a core at the default
-cadence.
-
-Git hooks written by hand are the free alternative to a poller or a resident process, for a
+Git hooks written by hand are the free alternative to a resident process, for a
 repository whose changes arrive by pull. They run in every worktree of the clone, a new one included:
 
 ```sh

@@ -8,7 +8,7 @@ download cached under `FASTEMBED_CACHE_DIR` if that is set, else `~/.cache/zerog
 (`%USERPROFILE%\.cache\zerograph\fastembed` on Windows; the layout is the hub client's, so a
 cache populated by an earlier release is reused as is — where the client links each file into its
 snapshot, or on a Windows account without symlink rights moves it there). Every
-command that touches the dense stage — `build`, `update`, `embed`, `watch`, `ask`,
+command that touches the dense stage — `build`, `update`, `embed`, `ask`,
 `bench`, `dump`, `serve` — reuses the cache; there are no further network calls once it is
 populated. `--no-dense` skips the download and the embedding stage everywhere.
 
@@ -18,8 +18,8 @@ and `ort` would parse them on the next cold cache. A cache filled by an earlier 
 commit is adopted without a download. A model trusted by name with `zerograph model <hub id>` has no
 measured commit and follows `main`.
 
-The model is a property of the store. `embed_model` names what `build`, `update`, `embed`
-and `watch` write vectors with; `vectors.json` records it, and `ask`, `bench` and `dump` open the
+The model is a property of the store. `embed_model` names what `build`, `update` and `embed`
+write vectors with; `vectors.json` records it, and `ask`, `bench` and `dump` open the
 recorded one — so a store keeps answering with the model that wrote it whatever the configuration
 says today, and a new default never silently reinterprets an index nobody re-embedded. The
 recorded name is a clone's text like any other, so it passes the same gate as a model

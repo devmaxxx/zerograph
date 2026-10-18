@@ -31,7 +31,7 @@ impl Timing {
 /// writer has no `Timing` to carry: `apply_diff` is shared by every refresh path, and threading
 /// one through each of them would be a signature change for a diagnostic. The clock starts at the
 /// first mark of the process, so the offsets read as phases only in a one-shot `build` or
-/// `update`; under `watch` or `serve` they keep counting from the first refresh.
+/// `update`; under `serve` they keep counting from the first refresh.
 pub(crate) fn mark(what: &str) {
     static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
     if !timing_on() { return; }
@@ -52,7 +52,7 @@ pub(crate) fn embedder_or_notice(no_dense: bool, model: &str, threads: usize, we
         .map_err(|err| format!("dense: model unavailable, continuing lexical-only ({err:#})"))
 }
 
-/// The same open for `watch` and `embed`, whose stderr is the reader's terminal.
+/// The same open for the writers, whose stderr is the reader's terminal.
 pub(crate) fn open_embedder(no_dense: bool, model: &str, threads: usize, weights: index::embed::Weights) -> Option<index::embed::Embedder> {
     embedder_or_notice(no_dense, model, threads, weights).unwrap_or_else(|notice| { eprintln!("{notice}"); None })
 }

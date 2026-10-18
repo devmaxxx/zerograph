@@ -173,6 +173,7 @@ pub struct ChunkBudget { pub chars: usize, pub max_rows: usize, pub ramp: usize 
 
 impl ChunkBudget {
     /// A fixed number of rows and no ramp: what a test or a one-chunk sync asks for.
+    #[cfg(test)]
     pub const fn rows(n: usize) -> Self { ChunkBudget { chars: usize::MAX, max_rows: n, ramp: 1 } }
 }
 
@@ -204,8 +205,8 @@ impl DenseIndex {
     }
 
     /// The model a store's rows belong to, read from `vectors.json` without loading the rows —
-    /// what a reader opens. The configured model takes effect at the next `build`, `update`,
-    /// `embed` or `watch`, which rewrites the index whole.
+    /// what a reader opens. The configured model takes effect at the next `build`, `update`
+    /// or `embed`, which rewrites the index whole.
     pub fn recorded_model(store: &Store) -> Result<Option<String>> {
         #[derive(serde::Deserialize)]
         struct Written { #[serde(default)] model: String }
@@ -332,6 +333,7 @@ impl DenseIndex {
     /// rows, and its next sync, matching against those alone, would embed the new ones twice.
     pub fn checkpointed(&mut self) { self.reindex(); }
 
+    #[cfg(test)]
     #[allow(clippy::type_complexity)]
     pub fn sync(&mut self, graph: &Graph, skip: &EmbedSkip, embed: &mut dyn FnMut(&[String]) -> Result<Vec<Vec<f32>>>) -> Result<usize> {
         self.sync_chunked(graph, skip, embed, ChunkBudget::rows(usize::MAX), &mut |_, _| Ok(()))

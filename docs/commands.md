@@ -8,7 +8,7 @@ Scala, Elixir and OCaml; every command below is
 implemented rather than planned:
 `build` (a full re-read that replaces the stored graph only when it saves, so one interrupted
 leaves the previous store answering) and `update` (incremental; a no-op `update` is a fixed point), `families`, `ask`, `explain`,
-`verify`, `impact`, `trace`, `changes`, `embed`, `watch`, `serve` (and `stop`), `status`, `mcp`, `prime`, `install-agent`,
+`verify`, `impact`, `trace`, `changes`, `embed`, `serve` (and `stop`), `status`, `mcp`, `prime`, `install-agent`,
 `import-legacy`, `dump` and `bench`. Two rerank the fused pool and both are opt-in: `ask --rerank`,
 which spends model tokens, and `ask --rerank-local` (zero tokens, a local cross-encoder, measured and
 rejected as a floor candidate). `bench` fails the process when a floor in [Bench](benchmarks.md#bench) is missed;
@@ -16,7 +16,7 @@ floors are keyed by the store's embedder, and a store under any other model is m
 graded. `enrich` was removed in 0.6.0: an older store's `questions.json` is no longer read.
 
 `--no-dense` skips the embedding stage everywhere it could apply — `build`, `update`,
-`embed`, `watch`, `serve`, `ask`, `bench`, `dump`. Without it, those commands use local embeddings
+`embed`, `serve`, `ask`, `bench`, `dump`. Without it, those commands use local embeddings
 once the model is cached (see [Embeddings](embeddings.md)).
 
 ## Use

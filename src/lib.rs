@@ -102,7 +102,7 @@ enum Cmd {
     },
     /// Answers `ask` from a resident process over a socket in `~/.cache/zerograph/sock`: the
     /// model, the vectors and the indexes open once. Refreshes before every answer the way `ask`
-    /// does, polls between them like `watch`, exits after `--idle` seconds without a question.
+    /// does, polls the tree between them, exits after `--idle` seconds without a question.
     Serve {
         #[arg(long, default_value_t = 30)] every: u64,
         #[arg(long, default_value_t = 1)] batch: usize,
@@ -123,17 +123,6 @@ enum Cmd {
         /// Prints the refresh line each time it moves until the running refresh ends, then its
         /// last line; fails when that line is an error.
         #[arg(long)] follow: bool,
-    },
-    /// Keeps the store in step with the tree for readers that do not refresh themselves —
-    /// editors, MCP servers. Polls, applies the same incremental update `ask` does, and embeds
-    /// what changed, at background priority. Ctrl-C stops it; every write is a rename, so there is
-    /// nothing to clean up.
-    Watch {
-        /// Seconds between polls.
-        #[arg(long, default_value_t = 30)] every: u64,
-        /// Files that have to be waiting before a poll refreshes; a smaller number of them is
-        /// carried to the next poll instead, at most three times in a row.
-        #[arg(long, default_value_t = 1)] batch: usize,
     },
     Explain {
         node: String,
@@ -250,7 +239,7 @@ impl Cmd {
             | Cmd::Prime { json, .. } | Cmd::Status { json, .. } | Cmd::Families { json, .. } | Cmd::Model { json, .. } => *json,
             // Listed rather than `_`, so a command that gains `--json` fails to compile here
             // until its errors are given the JSON form too.
-            Cmd::Build | Cmd::Update { .. } | Cmd::Serve { .. } | Cmd::Stop | Cmd::Watch { .. }
+            Cmd::Build | Cmd::Update { .. } | Cmd::Serve { .. } | Cmd::Stop
             | Cmd::InstallAgent { .. } | Cmd::Embed | Cmd::Bench { .. } | Cmd::Dump { .. }
             | Cmd::ImportLegacy { .. } | Cmd::Mcp => false,
         }
@@ -484,7 +473,7 @@ fn refresh_now(pending: usize, batch: usize, deferred: u32) -> bool {
     pending > 0 && (pending >= batch || deferred >= MAX_DEFERRALS)
 }
 
-pub(crate) enum Polled { Quiet, Deferred { pending: usize }, Refreshed(UpdateReport) }
+pub(crate) enum Polled { Quiet, Deferred, Refreshed(UpdateReport) }
 
 impl<'a> Watcher<'a> {
     fn open(repo: &'a std::path::Path, cfg: &'a config::Config) -> anyhow::Result<Watcher<'a>> {
@@ -534,7 +523,7 @@ impl<'a> Watcher<'a> {
                 self.manifest = walk::Manifest::from_entries(&entries);
                 self.seen = self.store.stamp("manifest.json");
             }
-            return Ok(if pending > 0 { Polled::Deferred { pending } } else { Polled::Quiet });
+            return Ok(if pending > 0 { Polled::Deferred } else { Polled::Quiet });
         }
         self.deferred = 0;
         // The resolver learns a family's files in its walk, so one built at `open` cannot resolve to
@@ -572,47 +561,6 @@ impl<'a> Watcher<'a> {
         self.seen = self.store.stamp("manifest.json");
         self.graph_at = r.graph_at;
         Ok(Polled::Refreshed(r))
-    }
-}
-
-/// Keeps the store in step with the tree for readers that do not refresh themselves.
-fn run_watch(repo: &std::path::Path, cfg: &config::Config, every: u64, batch: usize, no_dense: bool) -> anyhow::Result<()> {
-    let mut w = Watcher::open(repo, cfg)?;
-    let model = index::embed::writer_model(&cfg.embed_model);
-    let threads = index::embed::threads(cfg.resources);
-    let skip = index::dense::EmbedSkip::new(&cfg.embed_skip)?;
-    let verbose = ask::timing_on();
-    eprintln!("watch: {} every {every}s, batch {batch}; Ctrl-C to stop", repo.display());
-    if w.manifest.newer_grammar() { eprintln!("{}", w.manifest.newer_store_line()); }
-    loop {
-        let t = std::time::Instant::now();
-        match w.poll(batch)? {
-            Polled::Quiet => {}
-            Polled::Deferred { pending } => {
-                if verbose { eprintln!("watch: {pending} of {batch} pending, deferred {} of {MAX_DEFERRALS}", w.deferred); }
-            }
-            Polled::Refreshed(r) => {
-                let mut embedded = 0;
-                // Opened for this refresh and dropped with it. A watcher is idle between polls and
-                // nobody is waiting on one, so the half-second the model takes to open is not a
-                // cost anyone can see — while the 1.4 GB it holds is the whole of what `watch`
-                // takes from a person on a 16 GB laptop, and it used to hold it until exit.
-                if let Some(mut e) = ask::open_embedder(no_dense, &model, threads, index::embed::Weights::Mapped) {
-                    let mut idx = index::dense::DenseIndex::load(&w.store)?;
-                    idx.written_by(&model, e.dim()?);
-                    embedded = idx.sync(&w.graph, &skip, &mut |texts| e.embed(texts))?;
-                    idx.synced_against(w.graph_at);
-                    // Saved with nothing embedded as well: the refresh moved the graph, and the
-                    // claim is what tells the next reader it owes no rows.
-                    idx.save(&w.store)?;
-                }
-                println!("refresh: {} changed, {} removed, {} nodes, {} edges, {embedded} vectors in {:.1}s",
-                    r.changed, r.removed, r.nodes, r.edges, t.elapsed().as_secs_f32());
-                use std::io::Write;
-                std::io::stdout().flush()?;
-            }
-        }
-        std::thread::sleep(std::time::Duration::from_secs(every));
     }
 }
 
@@ -748,8 +696,8 @@ fn model_report(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<
         out.push_str(&format!("\nThe store names a model this machine has not trusted, so readers answer lexical-only\nuntil it is trusted or the store is re-embedded with {} — {}.\n", cfg.embed_model, config::trust_hint(m)));
     } else if recorded.as_deref().is_some_and(|m| !m.eq_ignore_ascii_case(&cfg.embed_model)) {
         out.push_str(&format!("\nThe two disagree. The store keeps answering with the model that wrote it; the\n\
-            configured one takes effect at the next `build`, `update`, `embed` or\n\
-            `watch` (an `ask` starts one when {} names the model), which drops\n\
+            configured one takes effect at the next `build`, `update` or `embed`\n\
+            (an `ask` starts one when {} names the model), which drops\n\
             every row the other model wrote and rewrites the index whole.\n", config::project_file_name(repo)));
     }
     out.push('\n');
@@ -1013,7 +961,7 @@ pub fn main() -> std::process::ExitCode {
 
 fn run(cli: Cli) -> anyhow::Result<()> {
     // First of all, before anything here starts a thread that would keep the old priority.
-    if cli.background || matches!(cli.cmd, Cmd::Watch { .. }) { priority::background_process(); }
+    if cli.background { priority::background_process(); }
     let repo = match &cli.repo {
         Some(repo) => plain(repo.canonicalize()?),
         None => repo_root(&std::env::current_dir()?.canonicalize()?),
@@ -1137,11 +1085,6 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let cfg = load_cfg()?;
             cap_pools(index::embed::threads(cfg.resources));
             serve::run(&repo, &cfg, every, batch, idle, idle_model, cli.no_dense)
-        }
-        Cmd::Watch { every, batch } => {
-            let cfg = load_cfg()?;
-            cap_pools(index::embed::threads(cfg.resources));
-            run_watch(&repo, &cfg, every, batch, cli.no_dense)
         }
         Cmd::Explain { node, json, stale } => {
             let (graph, behind) = graph_for(&repo, &load_cfg()?, stale, cli.no_dense)?;
@@ -1811,7 +1754,7 @@ mod tests {
         let mut w = Watcher::open(repo, &cfg).unwrap();
         std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
         for _ in 0..MAX_DEFERRALS {
-            assert!(matches!(w.poll(4).unwrap(), Polled::Deferred { pending: 1 }));
+            assert!(matches!(w.poll(4).unwrap(), Polled::Deferred));
         }
         let Polled::Refreshed(r) = w.poll(4).unwrap() else { panic!("the cap releases the edit") };
         assert_eq!((r.changed, r.removed), (1, 0));

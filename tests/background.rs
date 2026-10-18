@@ -1,5 +1,5 @@
 //! What runs at background priority and what does not, read from outside the process the way
-//! another program on the machine sees it: `watch` and a detached refresh are lowered.
+//! another program on the machine sees it: a detached refresh is lowered.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 
 mod common;
@@ -47,15 +47,10 @@ fn settled(mut child: Child) -> bool {
 }
 
 #[test]
-fn watch_runs_at_background_priority() {
-    let dir = built();
-    assert!(settled(start(dir.path(), &["watch", "--every", "3600"])));
-}
-
-#[test]
 fn the_flag_a_detached_refresh_is_started_with_lowers_the_process() {
     let dir = built();
     // `--background` on a command that would otherwise run in the foreground: the flag, not the
-    // command, is what a detached `update` or `model` is lowered by.
-    assert!(settled(start(dir.path(), &["--background", "watch", "--every", "3600"])));
+    // command, is what a detached `update` or `model` is lowered by. `serve` is the command here
+    // only because it stays up long enough to be read.
+    assert!(settled(start(dir.path(), &["--background", "serve", "--every", "3600", "--idle", "60"])));
 }

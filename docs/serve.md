@@ -8,12 +8,18 @@ since Windows 10 1803 and is protected the way your profile directory is:
 ```bash
 zerograph serve                  # ~/.cache/zerograph/sock/<hash>.sock, poll every 30 s, exit after 30 min idle
 zerograph serve --idle 86400     # a day rather than half an hour before it gives up
+zerograph serve --every 15       # poll the tree every 15 s rather than 30
+zerograph serve --batch 5        # save once five files are waiting, not on every one
 zerograph serve --idle-model 60  # forget the model after a minute unasked; the process stays
 zerograph serve --no-dense       # lexical only; a fused `ask` is told so and answers in its own process
 zerograph serve --detach         # in a process of its own, output in .zerograph/serve.log; returns once it listens
 zerograph stop                   # end the server answering here, socket file and all
 zerograph ask --no-serve отмена  # answer here even while one is listening
 ```
+
+A poll that applies an edit rewrites the whole graph, so `--batch` spends that once on a burst of
+edits rather than once per file. Fewer than `--batch` files waiting are carried to the next poll, at
+most three times in a row, so a lone edit lands within four polls whatever the batch says.
 
 Two idles, one clock. `--idle` ends the process; `--idle-model` (default 300 s) drops only the
 model weights and keeps everything that answers without them — the graph, the ids, the lexical
@@ -73,7 +79,7 @@ answer is byte-identical to a cold one across all 142 recorded questions, are in
 [the measurements](history.md#the-socket-path-and-the-same-bytes-either-way).
 
 The server refreshes before every answer with the same walk a one-shot `ask` does, and polls
-between them like `watch`, so its **graph** is never staler than a fresh process's; `--stale` skips
+the tree between them, so its **graph** is never staler than a fresh process's; `--stale` skips
 that walk and reads the stored graph as it is on disk. It answers one question at a time, and a
 second client waits rather than being turned away. Both reads are decided by `manifest.json`, so a
 running server does not see `embed` writing `vectors.*` — stop

@@ -4,7 +4,7 @@
 | --- | --- |
 | [install](install.md) | npm and cargo, what the npm package carries, coming from repograph, and the release workflow |
 | [commands](commands.md) | every command with examples, `--json` shapes, exit codes, `explain`, `verify`, `import-legacy`, `bench` |
-| [keeping fresh](keeping-fresh.md) | the self-healing `ask`, `reader_budget`, detached refreshes, the session hook, `watch`, git hooks |
+| [keeping fresh](keeping-fresh.md) | the self-healing `ask`, `reader_budget`, detached refreshes, the session hook, git hooks |
 | [serve](serve.md) | the resident process, its idles, socket path and measured latency |
 | [MCP server](mcp.md) | `zerograph mcp`, the tools it exposes, `install-agent --claude` |
 | [how it works](how-it-works.md) | how a question becomes an answer, what the graph records, the design notes |
