@@ -1230,10 +1230,19 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                     n => println!("{target:?}: wrote {n} files\n  {}", r.paths.join("\n  ")),
                 }
                 for note in &r.notes { println!("{target:?}: {note}"); }
+                // Per checkout: a local-scope server is keyed by the project's path, so a session in
+                // a worktree sees only what was registered for that worktree.
                 if target == install_agent::Target::Claude {
-                    let m = install_agent::register_mcp(&repo, &command, &install_agent::run_claude);
-                    for path in &m.paths { println!("Claude: registered the MCP server\n  {path}"); }
-                    for note in &m.notes { println!("Claude: {note}"); }
+                    let checkouts = install_agent::worktrees(&repo);
+                    for checkout in &checkouts {
+                        let at = match checkouts.len() { 1 => String::new(), _ => format!(" for {}", checkout.display()) };
+                        let m = install_agent::register_mcp(checkout, &command, &install_agent::run_claude);
+                        for path in &m.paths { println!("Claude: registered the MCP server{at}\n  {path}"); }
+                        for note in &m.notes { println!("Claude: {note}{at}"); }
+                    }
+                    if let Some(config) = install_agent::claude_config() {
+                        for note in &install_agent::prune_stale_mcp(&config).notes { println!("Claude: {note}"); }
+                    }
                 }
                 // Codex reads its hooks from `~/.codex/hooks.json`, which is the machine's and not
                 // this repository's. Printed for a person to paste; see `agent/codex.md`.

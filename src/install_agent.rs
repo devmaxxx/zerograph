@@ -577,6 +577,91 @@ fn retire_legacy_mcp(root: &Path, run: &dyn Fn(&Path, &[&str]) -> Option<std::pr
     }
 }
 
+/// The worktrees `git worktree list --porcelain` names, as (path, bare), main worktree first.
+fn parse_worktrees(porcelain: &str) -> Vec<(PathBuf, bool)> {
+    porcelain.split("\n\n").filter_map(|block| {
+        let path = block.lines().find_map(|l| l.strip_prefix("worktree "))?;
+        Some((PathBuf::from(path), block.lines().any(|l| l == "bare")))
+    }).collect()
+}
+
+fn listed_worktrees(root: &Path) -> Vec<(PathBuf, bool)> {
+    std::process::Command::new("git").arg("-C").arg(root).args(["worktree", "list", "--porcelain"])
+        .stdin(std::process::Stdio::null()).stderr(std::process::Stdio::null()).output().ok()
+        .filter(|o| o.status.success())
+        .map(|o| parse_worktrees(&String::from_utf8_lossy(&o.stdout)))
+        .unwrap_or_default()
+}
+
+/// Every checkout of the clone `root` belongs to that is still on disk, `root` among them, each
+/// canonical as `--repo` is. Claude Code keys a local-scope server by the project's path, so a
+/// server registered for one checkout is not there in a session opened in another.
+pub fn worktrees(root: &Path) -> Vec<PathBuf> {
+    let mut all: Vec<PathBuf> = listed_worktrees(root).into_iter()
+        .filter(|(_, bare)| !bare)
+        .filter_map(|(path, _)| path.canonicalize().ok())
+        .collect();
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if !all.contains(&root) { all.insert(0, root); }
+    all
+}
+
+/// The file Claude Code keeps its local-scope servers in: `.claude.json` in `CLAUDE_CONFIG_DIR`
+/// when that is set, in the home directory otherwise.
+pub fn claude_config() -> Option<PathBuf> {
+    match std::env::var_os("CLAUDE_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir).join(".claude.json")),
+        None => Some(std::env::home_dir()?.join(".claude.json")),
+    }
+}
+
+/// Whether a registered server is one `register_mcp` made: it runs `… --repo <path> mcp`.
+fn registered_by_us(server: &serde_json::Value) -> bool {
+    let Some(args) = server["args"].as_array() else { return false };
+    args.last().and_then(|a| a.as_str()) == Some("mcp") && args.iter().any(|a| a.as_str() == Some("--repo"))
+}
+
+/// Drops the server this tool registered for a checkout that is no longer on disk — a removed
+/// worktree, mostly — from Claude Code's `config` file. `claude mcp remove` cannot do it: it finds
+/// the project by its working directory, which is gone. Only our entry under either name goes, and
+/// only where the project's path is missing; everything else in the file is kept, though its keys
+/// come back in sorted order. The file is written beside itself and renamed over, with its
+/// permissions, and not at all when there is nothing to prune.
+pub fn prune_stale_mcp(config: &Path) -> Report {
+    let mut report = Report::default();
+    let Ok(text) = std::fs::read_to_string(config) else { return report };
+    let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
+        report.notes.push(format!("{} is not JSON, so no registration for a removed checkout was pruned from it", config.display()));
+        return report;
+    };
+    let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else { return report };
+    let mut pruned = Vec::new();
+    for (path, project) in projects.iter_mut() {
+        if Path::new(path).exists() { continue; }
+        let Some(servers) = project.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else { continue };
+        let before = servers.len();
+        servers.retain(|name, server| !([MCP_NAME, LEGACY_MCP_NAME].contains(&name.as_str()) && registered_by_us(server)));
+        if servers.len() < before { pruned.push(path.clone()); }
+    }
+    if pruned.is_empty() { return report; }
+    let written = serde_json::to_string_pretty(&root).map_err(anyhow::Error::from).and_then(|out| {
+        let tmp = config.with_extension("json.zerograph-tmp");
+        std::fs::write(&tmp, out + "\n")?;
+        if let Ok(meta) = std::fs::metadata(config) { std::fs::set_permissions(&tmp, meta.permissions())?; }
+        std::fs::rename(&tmp, config)?;
+        Ok(())
+    });
+    match written {
+        Ok(()) => {
+            report.written = 1;
+            report.paths.push(config.display().to_string());
+            for path in pruned { report.notes.push(format!("removed the MCP server registered for {path}, which is no longer on disk")); }
+        }
+        Err(e) => report.notes.push(format!("{} could not be rewritten ({e:#}); the MCP servers registered for {} stay", config.display(), pruned.join(", "))),
+    }
+    report
+}
+
 /// `word` as one shell word: bare when it has nothing the shell would split or expand, and
 /// single-quoted otherwise, so a path with a space still pastes as the one argument it is.
 fn shell_word(word: &str) -> String {
@@ -970,6 +1055,78 @@ mod tests {
             .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").status().unwrap().success();
         assert!(ok, "git init");
         dir
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let ok = std::process::Command::new("git").arg("-C").arg(dir).args(args)
+            .env_remove("GIT_DIR").env_remove("GIT_WORK_TREE").stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+            .status().unwrap().success();
+        assert!(ok, "git {args:?}");
+    }
+
+    #[test]
+    fn the_porcelain_listing_is_read_main_first_with_a_bare_clone_marked() {
+        let listed = parse_worktrees("worktree /a\nHEAD 1\nbranch refs/heads/main\n\nworktree /a b/wt\nHEAD 2\ndetached\n\nworktree /bare\nbare\n");
+        assert_eq!(listed, [(PathBuf::from("/a"), false), (PathBuf::from("/a b/wt"), false), (PathBuf::from("/bare"), true)]);
+        assert!(parse_worktrees("").is_empty());
+    }
+
+    #[test]
+    fn every_checkout_of_the_clone_is_found_from_any_of_them() {
+        let dir = git_repo();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        let (main, wt) = (main.canonicalize().unwrap(), wt.canonicalize().unwrap());
+        assert_eq!(worktrees(&wt), [main, wt]);
+        let lone = root();
+        assert_eq!(worktrees(lone.path()), [lone.path().canonicalize().unwrap()], "outside git, the checkout itself");
+    }
+
+    #[test]
+    fn a_registration_for_a_checkout_that_is_gone_is_pruned_and_every_other_entry_kept() {
+        let dir = root();
+        let live = dir.path().to_str().unwrap().to_string();
+        let gone = dir.path().join("removed-worktree").to_str().unwrap().to_string();
+        let ours = |p: &str| serde_json::json!({ "type": "stdio", "command": "pnpm", "args": ["exec", "zerograph", "--repo", p, "mcp"] });
+        let config = dir.path().join(".claude.json");
+        let before = serde_json::json!({
+            "numStartups": 3,
+            "projects": {
+                live.clone(): { "mcpServers": { "zerograph": ours(&live) } },
+                gone.clone(): { "allowedTools": ["x"], "mcpServers": { "zerograph": ours(&gone), "repograph": ours(&gone), "other": { "command": "x", "args": [] } } },
+                "/gone/hand-made": { "mcpServers": { "zerograph": { "command": "zerograph", "args": ["serve"] } } },
+            }
+        });
+        std::fs::write(&config, serde_json::to_string(&before).unwrap()).unwrap();
+        let r = prune_stale_mcp(&config);
+        assert_eq!(r.written, 1, "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains(&gone)), "{r:?}");
+        let after = read_json(&config);
+        assert_eq!(after["numStartups"], 3);
+        assert_eq!(after["projects"][&live], before["projects"][&live], "a checkout on disk keeps its server");
+        assert_eq!(after["projects"][&gone]["mcpServers"], serde_json::json!({ "other": { "command": "x", "args": [] } }));
+        assert_eq!(after["projects"][&gone]["allowedTools"], serde_json::json!(["x"]));
+        assert_eq!(after["projects"]["/gone/hand-made"], before["projects"]["/gone/hand-made"], "not one `register_mcp` made");
+        let text = std::fs::read_to_string(&config).unwrap();
+        assert_eq!(prune_stale_mcp(&config).written, 0, "nothing left to prune");
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), text, "and nothing rewritten");
+        assert_eq!(prune_stale_mcp(&dir.path().join("missing.json")).written, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_pruned_config_keeps_its_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = root();
+        let config = dir.path().join(".claude.json");
+        std::fs::write(&config, r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#).unwrap();
+        std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert_eq!(prune_stale_mcp(&config).written, 1);
+        assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
     }
 
     /// The block as the last release that wrote one spelled it.
