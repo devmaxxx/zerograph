@@ -111,10 +111,12 @@ smaller value the environment or the repository's `zerograph.toml` already sets)
 `update` rather than killed at the timeout with its work lost.
 
 Each worktree keeps its own store, its own `vectors.f32` included. Copying a store as an APFS clone
-(`cp -c`) saves the disk only until the copy's first refresh: every store file is rewritten whole
-through a temporary file and a rename, so the first save gives the clone blocks of its own. The
-vectors a new worktree needs come instead from a sibling worktree's store, borrowed when its index
-is built rather than embedded again.
+(`cp -c`) saves less than it seems: `graph.json`, `graph.bin`, the manifest and the vectors'
+metadata are rewritten whole through a temporary file and a rename, so the copy's first refresh
+gives them blocks of their own. `vectors.f32` grows in place and keeps its shared blocks only until
+it is rewritten whole — after a compaction, a model switch, or another process rewriting it. There
+is no delta format. The vectors a new worktree needs come instead from a sibling worktree's store,
+borrowed when its index is built rather than embedded again.
 
 ### Background priority
 

@@ -21,7 +21,20 @@ use std::time::{Duration, Instant};
 /// this test's subject. The directory is what the socket, the walk and `git -C` are judged on.
 const REPO_DIR: &str = "Проект beauty crm";
 
-fn zerograph() -> Command { let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph")); c.env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS"); c }
+/// A home of the tests' own, shared by every child of this binary so a client and its server agree
+/// on it: the socket lives under the user's cache, and a server a failed or killed test leaves
+/// behind would otherwise leave its file in the real one. Under `/tmp` on unix because a macOS
+/// temp directory is deep enough to push the socket past `sun_path` into the fallback.
+fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| if cfg!(unix) { tempfile::tempdir_in("/tmp") } else { tempfile::tempdir() }.unwrap()).path()
+}
+
+fn zerograph() -> Command {
+    let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph"));
+    c.env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS").env("HOME", test_home()).env("USERPROFILE", test_home());
+    c
+}
 
 /// Where the server for `repo` listens, in the binary's own words: `status --json` names the socket
 /// it checks, which is the one `serve` binds. The name is a hash of the checkout path, kept under

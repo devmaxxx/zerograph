@@ -39,8 +39,8 @@ The socket lives at `~/.cache/zerograph/sock/<hash>.sock`, the hash taken of the
 canonical path, in a directory `serve` makes private to you (mode `0700` on unix; a directory there
 that is open to others is refused). One place for every repository means every client finds it
 however deep the checkout sits and whatever `$TMPDIR` the client was started under — a shell and an
-editor's agent can disagree on that. Only when the path under your home would be longer than a Unix
-socket name may be (104 bytes on macOS, including the terminating NUL), or there is no home
+editor's agent can disagree on that. Only when the path under your home would be longer than 100 bytes — a
+margin under the Unix socket name limit, 104 bytes on macOS including the terminating NUL — or there is no home
 directory, does it go in a private directory of yours under the temporary directory as
 `zerograph-<uid>/zerograph-<hash>.sock` (the temporary directory itself on Windows, which is already
 per-user). Server and clients compute the name the same way, so nothing has to be told which one is
@@ -67,8 +67,8 @@ release does not find it: `ask` answers in its own process, or a new `serve` sta
 one, and the old one leaves at its own `--idle` timeout. To end it sooner, run the old binary's
 `zerograph stop`.
 
-The socket name is bounded by the platform's own limit — 104 bytes on macOS, 108 elsewhere — which
-is why the fallback exists; the arithmetic of a deep Windows path, and the check that a resident
+The socket name is bounded by the platform's own limit — 104 bytes on macOS, 108 elsewhere — so
+only a very deep home directory reaches the fallback; the arithmetic of a deep Windows path, and the check that a resident
 answer is byte-identical to a cold one across all 142 recorded questions, are in
 [the measurements](history.md#the-socket-path-and-the-same-bytes-either-way).
 

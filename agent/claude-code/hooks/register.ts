@@ -49,8 +49,11 @@ async function readLog($: Api, dir: string, since = -Infinity): Promise<LiveLog 
   const stat = await $.fs.stat(path).catch(() => undefined)
   if (!stat) return undefined
   if (stat.mtimeMs <= since) return { mtimeMs: stat.mtimeMs, run: undefined }
-  const [text, now] = await Promise.all([$.fs.read(path), $.clock.now()])
-  return { mtimeMs: stat.mtimeMs, run: readRun(text, stat.mtimeMs, now) }
+  // A log the read refuses (over 4 MiB, or a link to a device) must not stop the tick before
+  // the full report that would read it properly.
+  const text = await $.fs.read(path).catch(() => undefined)
+  if (text === undefined) return { mtimeMs: stat.mtimeMs, run: undefined }
+  return { mtimeMs: stat.mtimeMs, run: readRun(text, stat.mtimeMs, await $.clock.now()) }
 }
 
 async function fromLogs($: Api) {
@@ -101,7 +104,9 @@ async function tick($: Api, configured: string, isForced = false): Promise<void>
   const path = socketOf(last.report, dir)
   const socket = path ? await $.fs.stat(path).then(s => ({ mtimeMs: s.mtimeMs }), () => undefined) : undefined
   const live = overlay({ report: last.report, takenAt: last.takenAt }, { log, socket })
-  if (!isTaking) await update($, report, () => live)
+  // A full report taken while this tick read the files is newer than what the overlay was laid on.
+  if (isTaking || (await read($, full))?.takenAt !== last.takenAt) return
+  await update($, report, () => live)
 }
 
 export const register: Register = (on, options) => {

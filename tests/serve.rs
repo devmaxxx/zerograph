@@ -32,12 +32,22 @@ mod transport {
     pub fn accept(listener: &Listener) -> Stream { listener.accept().unwrap().0 }
 }
 
+/// A home of the tests' own, shared by every child of this binary so a client and its server agree
+/// on it: the socket lives under the user's cache, and a server a failed or killed test leaves
+/// behind would otherwise leave its file in the real one. Under `/tmp` on unix because a macOS
+/// temp directory is deep enough to push the socket past `sun_path` into the fallback.
+fn test_home() -> &'static std::path::Path {
+    static HOME: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| if cfg!(unix) { tempfile::tempdir_in("/tmp") } else { tempfile::tempdir() }.unwrap()).path()
+}
+
 /// Every child this file spawns, less the two variables the bench kit exports. `common::run`
 /// subtracts the same pair and says why; these tests do not go through it, because half of them
 /// spawn a copy of the binary from a path of their own — which is the case they exist for — and a
 /// shell left over from a measurement would answer them under other weights all the same.
 fn child(path: &std::path::Path) -> Command {
     let mut c = Command::new(path);
+    c.env("HOME", test_home()).env("USERPROFILE", test_home());
     c.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS");
     c
 }

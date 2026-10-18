@@ -237,7 +237,9 @@ jobs:
           }
           if ($answer -notmatch 'Штраф за отмену') { Fail "the resident process answered something else: $answer" }
           Stop-Process -Id $serve.Id
-          $sock = "$R\.zerograph\serve.sock"
+          # The socket is wherever `status` says it checked: under the home cache, not the checkout.
+          $sock = (& $exe --repo $R status --json | ConvertFrom-Json).serve.socket
+          if (-not $sock) { Fail "status --json named no socket" }
           if (-not (Get-Item -Force $sock -ErrorAction SilentlyContinue)) { Fail "a killed server left no socket for the next serve to sweep" }
           & $exe --repo $R --no-dense serve --idle 1
           if ($LASTEXITCODE -ne 0) { Fail "the next serve would not bind over the dead socket: $LASTEXITCODE" }
@@ -302,9 +304,11 @@ jobs:
             Copy-Item -Force $pkg "$pkg.new"
             Move-Item -Force "$pkg.new" $pkg
             if (-not $?) { throw "the package's binary was locked by the running server" }
+            $sock = (npx zerograph --repo $R status --json | ConvertFrom-Json).serve.socket
+            if (-not $sock) { throw "status --json through the launcher named no socket" }
             npx zerograph --repo $R stop
             if ($LASTEXITCODE -ne 0) { throw "stop through the launcher failed: $LASTEXITCODE" }
-            if (Get-Item -Force "$R\.zerograph\serve.sock" -ErrorAction SilentlyContinue) { throw "stop left the socket behind" }
+            if (Get-Item -Force $sock -ErrorAction SilentlyContinue) { throw "stop left the socket behind" }
           }
           Pop-Location
 

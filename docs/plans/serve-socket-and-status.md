@@ -109,3 +109,12 @@ Choices made during the flow:
   full report; otherwise the full report has already taken the lock's word and stands.
 - `serve.running` comes from the socket only when the socket is newer than the full report, so a
   dead server's leftover socket does not read as serving forever.
+- Review findings taken: the Windows CI and npm-launcher steps read the socket from
+  `status --json`; the clone paragraph says `vectors.f32` grows in place; a log the mod cannot read
+  no longer blocks the full report; an overlay read before a newer full report is not written;
+  integration test children get a home of their own under `/tmp`; the `serve.md` margin wording.
+- Review findings not taken: the unit tests that play a server still bind in the real cache
+  (their `Bound` guard removes the file, and `try_ask` has no seam for another home); the
+  tautological `socket_path` test and `/zerograph`'s second walk (nits, on-demand cost); "unknown"
+  in place of "not running" for a fallback with no reported socket (that path serves only a
+  zerograph without `status`, whose socket is `<store>/serve.sock`).
