@@ -41,7 +41,9 @@ fn settled(mut child: Child) -> bool {
         std::thread::sleep(Duration::from_millis(50));
         seen = lowered(child.id());
     }
-    child.kill().unwrap();
+    // A TERM rather than a kill: `serve` unlinks its socket on the way out, and a killed one
+    // would leave the file behind in the real cache directory.
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
     let _ = child.wait();
     seen
 }

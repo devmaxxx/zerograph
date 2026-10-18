@@ -315,6 +315,8 @@ impl DenseIndex {
             store.write_atomic("vectors.f32", &le_bytes(&self.vectors))?;
         }
         self.persisted = self.ids.len();
+        // What was borrowed is saved now; a later sync asks the siblings again.
+        self.borrowed = false;
         self.stamp = store.stamp("vectors.f32");
         store.write_atomic("vectors.json", &serde_json::to_vec(self)?)
     }
@@ -340,11 +342,14 @@ impl DenseIndex {
             0 => Default::default(),
             _ => self.live.iter().map(|&i| (self.ids[i].clone(), self.hashes[i].clone())).collect(),
         };
+        // Once per pair: the sync after this keeps one row per (id, hash) and would leave a
+        // second copy as a hole.
         let mut todo = Vec::new();
+        let mut seen = std::collections::HashSet::new();
         for n in graph.nodes.values() {
             for text in skip.rows(n) {
-                let hash = blake3::hash(text.as_bytes()).to_hex().to_string();
-                if !held.contains(&(n.id.clone(), hash.clone())) { todo.push((n.id.clone(), hash)); }
+                let pair = (n.id.clone(), blake3::hash(text.as_bytes()).to_hex().to_string());
+                if !held.contains(&pair) && seen.insert(pair.clone()) { todo.push(pair); }
             }
         }
         let hashes: Vec<String> = todo.iter().map(|(_, h)| h.clone()).collect();
@@ -370,7 +375,7 @@ impl DenseIndex {
     /// sync appended join the scan beside the ones they will replace, which is the state a
     /// checkpoint saved to disk loads into. Without it a resident reader would scan only the old
     /// rows, and its next sync, matching against those alone, would embed the new ones twice.
-    pub fn checkpointed(&mut self) { self.reindex(); }
+    pub fn checkpointed(&mut self) { self.borrowed = false; self.reindex(); }
 
     #[cfg(test)]
     #[allow(clippy::type_complexity)]

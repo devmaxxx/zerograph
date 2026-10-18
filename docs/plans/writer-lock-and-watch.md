@@ -56,8 +56,9 @@
 - L2 (#221, owner): delete `watch`, its docs and `/.fastembed_cache` in `.gitignore`; breaking,
   said under "Breaking" in the PR and in the next release notes.
 - L3 (follow-up from #225, owner): count only rows neither local nor borrowable, by borrowing
-  before the count. The base lacked #225, so `origin/main` was merged in first; the merge had two
-  conflicts (`docs/keeping-fresh.md`, `src/lib.rs`) and was clean to resolve, so L3 is done.
+  before the count. The base lacked #225, so `origin/main` was merged in first (two conflicts,
+  both kept). The base was then rebased onto a #226 that already contains `origin/main`, so the
+  branch was moved onto it without the merge commit; L3 is done.
 - Watcher lock placement: considered locking only around `apply_diff` vs. the whole poll; chose a
   try-lock at the start of the poll, before the reload and the walk, held to the poll's end — a
   cycle that cannot lock does not read a store mid-rewrite either, and the next poll reads it back.
@@ -67,3 +68,11 @@
   (`Barred`) reports its count unchanged, since the holder is the one that will borrow.
 - Historical bench results and dated plans that mention `watch` are left as written.
 - Release notes: 0.6.4 is tagged, so the lines go into a new `docs/releases/0.6.5.md`.
+- `model <id>` takes the lock only when a store stands and `--no-embed` is off (review): taking it
+  creates the store directory, and a failed switch must leave the project as it was.
+- A `serve` poll that finds the lock held reads back what the holder saved and counts the files it
+  is behind by (`Polled::Busy`); an answer then says so, as a one-shot `ask` that finds it held does.
+- Review findings not taken: an `ask` test of the budget gate with borrowable rows, and a CLI test
+  that `embed`/`model` wait. Both paths open a real embedding model (download, seconds per run),
+  and `Context` has no fake embedder; `borrow_owed` is tested on the index and the waiting on
+  `wait_for_writer`, the one helper both commands call.

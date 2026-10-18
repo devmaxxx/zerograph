@@ -80,7 +80,9 @@ answer is byte-identical to a cold one across all 142 recorded questions, are in
 [the measurements](history.md#the-socket-path-and-the-same-bytes-either-way).
 
 The server refreshes before every answer with the same walk a one-shot `ask` does, and polls
-the tree between them, so its **graph** is never staler than a fresh process's; `--stale` skips
+the tree between them, so its **graph** is never staler than a fresh process's — and when another
+refresh holds the store, it answers as a one-shot would, from what that refresh has saved, and says
+how many files it is behind by; `--stale` skips
 that walk and reads the stored graph as it is on disk. It answers one question at a time, and a
 second client waits rather than being turned away. Both reads are decided by `manifest.json`, so a
 running server does not see `embed` writing `vectors.*` — stop

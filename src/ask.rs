@@ -538,6 +538,9 @@ impl Context {
         Ok(())
     }
 
+    /// A line for this answer's client, said beside the ones the answer itself collects.
+    pub(crate) fn note(&self, line: String) { self.notices.borrow_mut().push(line); }
+
     /// Notices `ask` used to print on stderr for this answer (refresh lines, dense fallbacks), drained.
     pub fn notices(&mut self) -> Vec<String> { std::mem::take(&mut self.notices.borrow_mut()) }
 
