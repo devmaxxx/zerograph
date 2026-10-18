@@ -68,9 +68,9 @@ const BUILDING_NOTICE =
 
 const BUILD_NOTICE =
   `zerograph: this repository has no index yet. \`${COMMAND} build\` writes one in a few minutes on a ` +
-  'small repository and longer on a large one, though a worktree beside one already built borrows its ' +
-  'vectors instead of embedding them again. It answers by meaning afterwards; until then this notice ' +
-  'is all it can say.';
+  'small repository and longer on a large one, though rows another checkout on this machine already ' +
+  'embedded come from its vector cache instead of being embedded again. It answers by meaning ' +
+  'afterwards; until then this notice is all it can say.';
 
 function rule() {
   const beside = join(HERE, 'rule.txt');
