@@ -1629,6 +1629,31 @@ mod tests {
         assert_eq!(std::fs::read(repo.join(".zerograph/manifest.json")).unwrap(), manifest_bytes);
     }
 
+    /// A newer release's `update` can save between the reader's load and its lock. What the
+    /// reader then writes under the lock would carry this build's grammar over the newer store,
+    /// whether the tree moved (a refresh) or not (the stamps).
+    #[test]
+    fn an_ask_never_restamps_a_newer_store_saved_between_its_load_and_its_lock() {
+        for edited in [true, false] {
+            let dir = doc_repo(ONE);
+            let (repo, cfg) = (dir.path().to_path_buf(), config::Config::default());
+            built(&repo, &cfg);
+            if edited { std::fs::write(repo.join("docs/a.md"), TWO).unwrap(); }
+            let newer = repo.clone();
+            ask::BEFORE_LOCK.with(|h| *h.borrow_mut() = Some(Box::new(move || {
+                let store = store::Store::new(&newer);
+                let (graph, manifest) = store.load().unwrap();
+                store.save(&graph, &walk::Manifest { grammar: walk::GRAMMAR + 1, release: "9.9.9".into(), ..manifest }).unwrap();
+            })));
+            let store = store::Store::new(&repo);
+            let read = ask::graph_for_ask(&repo, &cfg, &store, false, &ask::Timing::new(), &refresh::Budget::unlimited()).unwrap();
+            let written = store.load_manifest().unwrap();
+            assert_eq!(written.grammar, walk::GRAMMAR + 1, "edited={edited}: the newer store was stamped over");
+            assert!(read.refreshed.is_none() && matches!(read.writer, ask::Writer::Barred), "edited={edited}");
+            assert!(read.note.is_some_and(|n| n.contains(&format!("generation {}", walk::GRAMMAR + 1))), "edited={edited}");
+        }
+    }
+
     /// `status` sends a reader with an unreadable manifest to `build`, so `build` must not be the
     /// command that refuses to parse it.
     #[test]
