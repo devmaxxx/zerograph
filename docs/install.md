@@ -106,6 +106,12 @@ It asks `zerograph` on `PATH`, then the project's `node_modules/.bin`, then `tar
 `target/debug`; the `binary` option in `/config` names another one. A zerograph without `status`
 shows nothing on the line, and `/zerograph` falls back to the tail of `background.log`.
 
+The marketplace pins the mod to a release tag and the mod carries that release's version, so it
+moves with zerograph: `claude plugin update zerograph` then `/reload-plugins` takes the mod of the
+latest release, and nothing merged to `main` reaches an install before its tag. A version bump
+changes `Cargo.toml`, `agent/claude-code/.claude-plugin/plugin.json` and the `ref` in
+`.claude-plugin/marketplace.json` together; CI fails when they disagree.
+
 ## Windows notes
 
 Install through npm; nothing else is required. What can still trip a Windows user:

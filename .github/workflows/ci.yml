@@ -66,6 +66,16 @@ jobs:
         run: python3 -m unittest discover -s bench/compare
       - if: runner.os == 'Linux' && !cancelled()
         run: python3 -m unittest discover -s bench/history
+      # The marketplace hands out the Claude Code mod as it stood at the tag it names, so the mod's
+      # version and that tag move with the crate's: a bump that left either behind would keep
+      # every install on the previous release's mod.
+      - if: runner.os == 'Linux' && !cancelled()
+        run: |
+          crate=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          mod=$(jq -r .version agent/claude-code/.claude-plugin/plugin.json)
+          ref=$(jq -r '.plugins[] | select(.name == "zerograph") | .source.ref' .claude-plugin/marketplace.json)
+          [ "$mod" = "$crate" ] || { echo "::error::agent/claude-code is at $mod, Cargo.toml at $crate"; exit 1; }
+          [ "$ref" = "v$crate" ] || { echo "::error::the marketplace pins $ref, Cargo.toml is at $crate"; exit 1; }
 
       # The agent hook is JavaScript and ships with the binary that installs it, so it is tested on
       # the same three platforms: a hook that throws on Windows is a hook that fires on nobody.

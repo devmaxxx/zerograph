@@ -7,7 +7,12 @@
   "plugins": [
     {
       "name": "zerograph",
-      "source": "./agent/claude-code"
+      "source": {
+        "source": "git-subdir",
+        "url": "devmaxxx/zerograph",
+        "path": "agent/claude-code",
+        "ref": "v0.6.4"
+      }
     }
   ]
 }
