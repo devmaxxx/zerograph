@@ -1154,12 +1154,12 @@ mod tests {
         git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
         let wt = dir.path().join("wt");
         git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
-        let (main, wt) = (main.canonicalize().unwrap(), wt.canonicalize().unwrap());
+        let (main, wt) = (canonical(&main).unwrap(), canonical(&wt).unwrap());
         assert_eq!(worktrees(&wt), [main.clone(), wt.clone()]);
         assert_eq!(main_worktree(&wt), Some(main.clone()));
         assert_eq!(main_worktree(&main), Some(main));
         let lone = root();
-        assert_eq!(worktrees(lone.path()), [lone.path().canonicalize().unwrap()], "outside git, the checkout itself");
+        assert_eq!(worktrees(lone.path()), [canonical(lone.path()).unwrap()], "outside git, the checkout itself");
         assert_eq!(main_worktree(lone.path()), None);
     }
 
@@ -1216,7 +1216,7 @@ mod tests {
         git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
         let wt = dir.path().join("wt");
         git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
-        let (main, wt) = (main.canonicalize().unwrap(), wt.canonicalize().unwrap());
+        let (main, wt) = (canonical(&main).unwrap(), canonical(&wt).unwrap());
         let registries = std::cell::RefCell::new(std::collections::BTreeMap::<PathBuf, std::cell::RefCell<std::collections::BTreeMap<String, String>>>::new());
         let adds = std::cell::RefCell::new(Vec::<(PathBuf, Vec<String>)>::new());
         let calls = std::cell::RefCell::new(Vec::new());
@@ -1272,7 +1272,7 @@ mod tests {
         git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
         let wt = dir.path().join("wt");
         git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
-        let main = main.canonicalize().unwrap();
+        let main = canonical(&main).unwrap();
         let (path, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
         assert_eq!(path, main.join(".codex/hooks/zerograph-hook.mjs"));
         assert_eq!(r.written, 2, "{r:?}");
@@ -1290,7 +1290,7 @@ mod tests {
         assert_eq!(from_main, path, "the main worktree names its own copy");
         assert_eq!(r.written, 0);
         let lone = root();
-        assert_eq!(codex_hook(lone.path(), "zerograph").unwrap().0, lone.path().canonicalize().unwrap().join(".codex/hooks/zerograph-hook.mjs"));
+        assert_eq!(codex_hook(lone.path(), "zerograph").unwrap().0, canonical(lone.path()).unwrap().join(".codex/hooks/zerograph-hook.mjs"));
     }
 
     /// The block as the last release that wrote one spelled it.
