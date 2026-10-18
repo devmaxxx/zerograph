@@ -357,6 +357,46 @@ test('SessionStart starts a resident serve, and the switch turns it off', async 
   assert.equal(argv(off).filter((l) => l.includes('serve')).length, 0, argv(off).join(' | '));
 });
 
+test('a checkout that asked for an index and has none gets one built in the background from its first session', async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  mkdirSync(join(w.root, '.claude', 'hooks'), { recursive: true });
+  writeFileSync(join(w.root, '.claude', 'hooks', 'zerograph-hook.mjs'), '');
+  const sub = join(w.root, 'src');
+  mkdirSync(sub);
+  const c = context(fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: sub }));
+  assert.match(c, /being built in the background/);
+  const line = await waitFor(w, /update --detach/);
+  assert.equal(line, `--repo ${w.root} update --detach`, 'the checkout, not the subdirectory, and dense');
+  assert.equal(argv(w).filter((l) => / prime$| serve /.test(l)).length, 0, argv(w).join(' | '));
+});
+
+test('a checkout that never asked for an index is not built, so a machine-wide hook stays silent', async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }), null);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(argv(w), []);
+  for (const marker of [['zerograph.toml'], ['.codex', 'hooks', 'zerograph-hook.mjs']]) {
+    const o = world({ store: false });
+    mkdirSync(join(o.root, '.git'));
+    mkdirSync(join(o.root, ...marker.slice(0, -1)), { recursive: true });
+    writeFileSync(join(o.root, ...marker), '');
+    assert.match(context(fire(o, { hook_event_name: 'SessionStart', source: 'startup' })), /being built/, marker.join('/'));
+  }
+});
+
+test('with serve off, a built index is caught up by a detached update instead', async () => {
+  const w = world({ answer: 'zerograph: 3 doc nodes' });
+  fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { ZEROGRAPH_HOOK_SERVE: '0' });
+  assert.ok(await waitFor(w, /^--repo .* update --detach$/), argv(w).join(' | '));
+  const on = world({ answer: 'zerograph: 3 doc nodes' });
+  fire(on, { hook_event_name: 'SessionStart', source: 'startup' });
+  await waitFor(on, /serve --idle/);
+  await new Promise((r) => setTimeout(r, 200));
+  assert.equal(argv(on).filter((l) => l.includes('update')).length, 0, 'serve catches up as it starts');
+});
+
 test('SubagentStart carries the rule', () => {
   const w = world();
   const c = context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }));

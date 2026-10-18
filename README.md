@@ -39,7 +39,7 @@ npm install -g zerograph                   # or: pnpm add -D zerograph
 echo .zerograph/ >> .gitignore             # the graph is built per checkout
 zerograph build                            # first run downloads the embedding model (~200 MB)
 zerograph ask cancellation policy          # stays fresh with your edits, no update to run
-zerograph install-agent --claude           # optional: MCP server + git hooks for your agent
+zerograph install-agent --claude           # optional: MCP server + session hooks for your agent
 ```
 
 Prebuilt for macOS arm64, Linux x64 and Windows x64. Defaults read markdown and code in 24

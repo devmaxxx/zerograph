@@ -79,8 +79,9 @@ What zerograph reads from the old install:
   used in place until one under `~/.cache/zerograph/` exists.
 - **The environment.** Every `REPOGRAPH_*` variable is read while its `ZEROGRAPH_*` name is unset;
   a `ZEROGRAPH_*` that is set, even to nothing, wins.
-- **Agents and git hooks.** The install in step 3 replaces the old instructions stanza, settings
-  entries and git hook blocks rather than adding second ones, deletes
+- **Agents and git hooks.** The install in step 3 replaces the old instructions stanza and settings
+  entries rather than adding second ones, takes the `post-merge`/`post-checkout` block an earlier
+  release wrote out of the git hooks (deleting a hook that held nothing else), deletes
   `.claude/hooks/repograph-hook.mjs`, and removes the local-scope Claude Code MCP server registered
   as `repograph` once `zerograph` is registered (one in another scope is named, with the command
   that removes it). Codex's old script stays until `~/.codex/hooks.json` points at

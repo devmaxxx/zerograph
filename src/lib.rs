@@ -1250,10 +1250,8 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                              install_agent::codex_hooks_block(&abs.display().to_string()));
                 }
             }
-            // Once whatever the harnesses: git runs these, not the agent.
-            let r = install_agent::install_git_hooks(&repo, &command)?;
-            if r.written > 0 { println!("git: wrote {} hooks\n  {}", r.written, r.paths.join("\n  ")); }
-            for note in &r.notes { println!("git: {note}"); }
+            // Once whatever the harnesses: an earlier release wrote these, and nothing writes them now.
+            for note in &install_agent::retire_git_hooks(&repo).notes { println!("git: {note}"); }
             Ok(())
         }
         Cmd::Prime { json } => {
