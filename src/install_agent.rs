@@ -545,7 +545,8 @@ fn split_words(command: &str) -> Vec<String> {
 /// the server's working directory is the harness's choice. `run` is how `claude` is invoked: a
 /// test passes its own, and `None` from it means the binary is not on PATH. A registration that
 /// already says this is left alone, which is what makes a re-run write nothing; one that says
-/// something else (another command, another repository) is removed and made again. A missing
+/// something else (another command, another repository) is removed from the local scope and made
+/// again; one in another scope is left and the local one added beside it. A missing
 /// `claude` is a note and not a failure, since the files this install wrote are useful without it.
 pub fn register_mcp(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> Option<std::process::Output>) -> Report {
     let mut report = Report::default();
@@ -568,9 +569,12 @@ pub fn register_mcp(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> 
             retire_legacy_mcp(root, run, &mut report);
             return report;
         }
-        if !run(root, &["mcp", "remove", MCP_NAME]).is_some_and(|o| o.status.success()) {
-            report.notes.push(format!("the registered MCP server differs and `claude mcp remove {MCP_NAME}` failed; run it, then `{by_hand}`"));
-            return report;
+        // Only the local scope is this install's: without `-s` the CLI removes whichever scope
+        // holds the name, so a user-level entry would go machine-wide and a tracked `.mcp.json`
+        // entry would go in every worktree, leaving each one dirty. A local entry added beside
+        // one in another scope wins in this project, and the other stays as its owner left it.
+        if !run(root, &["mcp", "remove", MCP_NAME, "-s", "local"]).is_some_and(|o| o.status.success()) {
+            report.notes.push(format!("a `{MCP_NAME}` MCP server registered in another scope differs from this one and was left alone; the local one added beside it answers in this project, and `claude mcp remove {MCP_NAME} -s user` (or `-s project`) takes the other out if it is stale"));
         }
     }
     let mut args = vec!["mcp", "add", MCP_NAME, "--", program.as_str()];
@@ -957,8 +961,48 @@ mod tests {
         assert!(second.notes[0].contains("already registered"));
         let moved = register_mcp(Path::new("/work/other"), "pnpm exec zerograph", &claude);
         assert_eq!(moved.written, 1, "another repository replaces the entry");
-        assert!(calls.borrow().iter().any(|c| c[..2] == ["mcp", "remove"]));
+        let removals: Vec<_> = calls.borrow().iter().filter(|c| c[1] == "remove").cloned().collect();
+        assert_eq!(removals, [["mcp", "remove", "zerograph", "-s", "local"]], "only the local scope");
         assert!(registry.borrow()["zerograph"].contains("/work/other"));
+    }
+
+    /// A `claude` that keeps each scope's entries apart, as the CLI does: `get` shows the entry
+    /// that wins (local over project over user), `remove` without `-s` takes whichever scope
+    /// holds the name, and `add` writes the local scope.
+    #[cfg(unix)]
+    fn scoped_claude(calls: &std::cell::RefCell<Vec<Vec<String>>>, registry: &std::cell::RefCell<std::collections::BTreeMap<(u8, String), String>>, args: &[&str]) -> Option<std::process::Output> {
+        const LOCAL: u8 = 0;
+        calls.borrow_mut().push(args.iter().map(|a| a.to_string()).collect());
+        let winner = |name: &str| registry.borrow().iter().find(|((_, n), _)| n == name).map(|(k, v)| (k.clone(), v.clone()));
+        Some(match args {
+            ["mcp", "get", name] => match winner(name) { Some((_, shown)) => exited(0, &shown), None => exited(1, "") },
+            ["mcp", "remove", name, "-s", "local"] => match registry.borrow_mut().remove(&(LOCAL, name.to_string())) { Some(_) => exited(0, ""), None => exited(1, "") },
+            ["mcp", "remove", name] => match winner(name) { Some((k, _)) => { registry.borrow_mut().remove(&k); exited(0, "") } None => exited(1, "") },
+            ["mcp", "add", name, "--", program, rest @ ..] => {
+                registry.borrow_mut().insert((LOCAL, name.to_string()), format!("{name}:\n  Command: {program}\n  Args: {}\n", rest.join(" ")));
+                exited(0, "")
+            }
+            _ => exited(1, ""),
+        })
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_differing_server_in_another_scope_is_left_and_the_local_one_added_beside_it() {
+        const USER: u8 = 2;
+        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
+        let registry = std::cell::RefCell::new(std::collections::BTreeMap::new());
+        let theirs = "zerograph:\n  Command: zerograph\n  Args: --repo /elsewhere mcp\n".to_string();
+        registry.borrow_mut().insert((USER, "zerograph".to_string()), theirs.clone());
+        let claude = |_: &Path, args: &[&str]| scoped_claude(&calls, &registry, args);
+        let r = register_mcp(Path::new("/work/proj"), "zerograph", &claude);
+        assert_eq!(r.written, 1, "{:?}", r.notes);
+        assert_eq!(registry.borrow().get(&(USER, "zerograph".to_string())), Some(&theirs), "the user-scope entry is untouched");
+        assert!(registry.borrow()[&(0, "zerograph".to_string())].contains("/work/proj"));
+        assert!(calls.borrow().iter().filter(|c| c[1] == "remove").all(|c| c.ends_with(&["-s".to_string(), "local".to_string()])), "{:?}", calls.borrow());
+        assert_eq!(r.notes.iter().filter(|n| n.contains("another scope")).count(), 1, "{:?}", r.notes);
+        let again = register_mcp(Path::new("/work/proj"), "zerograph", &claude);
+        assert_eq!(again.written, 0, "the local entry now wins, and says this: {:?}", again.notes);
     }
 
     #[cfg(unix)]

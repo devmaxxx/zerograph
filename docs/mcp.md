@@ -10,7 +10,9 @@ every checkout of the clone that `git worktree list` names, each with its own `-
 is keyed by the project's path, so a session opened in a worktree sees only what was registered for
 that worktree; a worktree added later gets its server from the next `install-agent` run. A
 registration that already says the same is left alone, and the command to run by hand is printed
-where `claude` is not on `PATH`.
+where `claude` is not on `PATH`. One that says something else is replaced only in the local scope: a
+differing `zerograph` in the user scope or a tracked `.mcp.json` is left as its owner wrote it, the
+local one is added beside it and wins in that project, and the run says so in one note.
 
 The same run prunes `~/.claude.json` (or `.claude.json` in `CLAUDE_CONFIG_DIR`): a `zerograph` server
 it registered for a checkout that is no longer on disk — a removed worktree — is taken out, and so is
