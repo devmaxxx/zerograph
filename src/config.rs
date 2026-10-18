@@ -496,7 +496,10 @@ pub fn trusted_spelling(model: &str) -> Option<String> {
     let model = model.trim();
     let listed = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()
         .and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty() && l.eq_ignore_ascii_case(model)).map(str::to_string));
-    crate::index::embed::measured(model).map(|m| m.model.to_string())
+    let default = crate::index::embed::DEFAULT_MODEL;
+    // The default's export has no row of its own, and a store it wrote must still open.
+    model.eq_ignore_ascii_case(default).then(|| default.to_string())
+        .or_else(|| crate::index::embed::measured(model).map(|m| m.model.to_string()))
         .or_else(|| trust_path().and_then(listed))
         .or_else(|| legacy_machine_path().map(|p| p.with_file_name("trusted-models")).and_then(listed))
 }
@@ -847,7 +850,7 @@ mod tests {
     fn the_embed_model_defaults_to_gemma_and_reads_from_the_file() {
         with_machine(None, || {
             let dir = tempfile::tempdir().unwrap();
-            assert_eq!(Config::load(dir.path()).unwrap().embed_model, "onnx-community/embeddinggemma-300m-ONNX");
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, "onnx-community/embeddinggemma-300m-ONNX:q4");
             std::fs::write(dir.path().join("zerograph.toml"), "embed_model = \"BAAI/bge-m3\"\n").unwrap();
             assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::DEFAULT_MODEL, "not catalogued, not trusted");
             assert!(!names_embed_model(dir.path()), "a refused name is not a switch owed");

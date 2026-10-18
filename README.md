@@ -36,7 +36,7 @@ Sources: [the three-tool run](docs/bench/2026-09-04-three-graphs-results.md) and
 ```bash
 npm install -g zerograph                   # or: pnpm add -D zerograph
 echo .zerograph/ >> .gitignore             # the graph is built per checkout
-zerograph build                            # first run downloads the embedding model (~1.2 GB)
+zerograph build                            # first run downloads the embedding model (~200 MB)
 zerograph ask cancellation policy          # stays fresh with your edits, no update to run
 zerograph install-agent --claude           # optional: MCP server + git hooks for your agent
 ```

@@ -772,7 +772,7 @@ fn switch_model(repo: &std::path::Path, cfg: &config::Config, id: &str, no_embed
     let store = store::Store::new(repo);
     let recorded = index::dense::DenseIndex::recorded_model(&store)?;
     let id = spelling(id, recorded.as_deref());
-    let (was, now) = (recorded.as_deref().and_then(index::embed::measured), index::embed::measured(id));
+    let (was, now) = (recorded.as_deref().and_then(index::embed::figures), index::embed::figures(id));
     eprintln!("model: {} → {id}", recorded.as_deref().unwrap_or(&cfg.embed_model));
     match now {
         Some(m) => {

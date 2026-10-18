@@ -128,7 +128,7 @@ fn floors_for(model: Option<&str>) -> Floors {
     match model {
         None => Floors::Small,
         Some(m) if m == crate::index::embed::UNNAMED_MODEL => Floors::Small,
-        Some(m) if m == crate::index::embed::DEFAULT_MODEL => Floors::Gemma,
+        Some(m) if m == crate::index::embed::DEFAULT_MODEL || m == crate::index::embed::GEMMA => Floors::Gemma,
         Some(_) => Floors::None,
     }
 }

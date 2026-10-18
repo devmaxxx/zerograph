@@ -100,7 +100,7 @@ Install through npm; nothing else is required. What can still trip a Windows use
   through Explorer shows "Windows protected your PC"; npm, pnpm, `curl` and `gh release download`
   never do. `Unblock-File .\zerograph.exe` clears it. [Verifying a download](#verifying-a-download)
   proves the file is ours.
-- **Defender.** It scans the model as it lands (about 1.2 GB for the default) and the store on every
+- **Defender.** It scans the model as it lands (about 200 MB for the default) and the store on every
   write; the first download prints the `Add-MpPreference -ExclusionPath` line, which is optional. A
   heuristic false positive is restored from Protection History.
 - **Serve.** `zerograph serve --detach` starts one with no window, `zerograph stop` ends it and

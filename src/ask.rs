@@ -629,13 +629,14 @@ mod tests {
         CACHE.get_or_init(|| {
             let dir = tempfile::tempdir().unwrap();
             let model = index::embed::writer_model(index::embed::DEFAULT_MODEL);
-            let root = dir.path().join(format!("models--{model}").replace('/', "--"));
+            let (hub, variant) = index::embed::hub_and_variant(&model);
+            let root = dir.path().join(format!("models--{hub}").replace('/', "--"));
             let rev = index::embed::revision(&model).unwrap_or("abc");
             let snap = root.join("snapshots").join(rev);
             std::fs::create_dir_all(root.join("refs")).unwrap();
             std::fs::create_dir_all(snap.join("onnx")).unwrap();
             std::fs::write(root.join("refs/main"), rev).unwrap();
-            std::fs::File::create(snap.join("onnx/model.onnx")).unwrap().set_len(64 << 20).unwrap();
+            std::fs::File::create(snap.join(index::embed::variant_file("onnx/model.onnx", variant))).unwrap().set_len(64 << 20).unwrap();
             std::fs::write(snap.join("tokenizer.json"), "{}").unwrap();
             std::fs::write(snap.join("config.json"), r#"{"pad_token_id": 1}"#).unwrap();
             std::fs::write(snap.join("tokenizer_config.json"), r#"{"pad_token": "<pad>"}"#).unwrap();

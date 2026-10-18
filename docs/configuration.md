@@ -15,7 +15,7 @@ in full, not an empty config:
 | `rerank_command`     | **machine file only** — headless `claude -p --model {model}` with thinking off, see [Spending tokens on purpose](rerank.md) |
 | `rerank_model`       | `haiku` — whatever goes in `rerank_command`'s `{model}`                                     |
 | `reranker_dir`       | directory of the exported cross-encoder for `--rerank-local`; empty = `~/.cache/zerograph/reranker`. Machine file only: a repository's is ignored, like the commands |
-| `embed_model`        | `onnx-community/embeddinggemma-300m-ONNX`; the model the vectors are written with — nine were measured and `zerograph model` switches it, see [Embeddings](embeddings.md) |
+| `embed_model`        | `onnx-community/embeddinggemma-300m-ONNX:q4`; the model the vectors are written with — nine were measured and `zerograph model` switches it, see [Embeddings](embeddings.md) |
 | `embed_skip`         | `[]` — globs whose files get no vectors but keep their nodes, edges and lexical rows, see [Files without vectors](configuration.md#files-without-vectors) |
 | `mcp_reranks`        | `25` — rerank commands one MCP server process starts (one that fails or times out counts, an exact id that never asks the model does not) before it answers `rerank: true` from the fused order with a line saying so; `0` turns rerank over MCP off. Machine file only: the agent decides each call and the tokens are the reader's, see [MCP](mcp.md) |
 | `reader_budget`      | `10` — seconds a reader may spend refreshing before it answers from the store as it stands and leaves the rest to a detached `update`; `0` never refreshes inline. The machine file may set it; `ZEROGRAPH_READER_BUDGET` overrides, see [Keeping it fresh](keeping-fresh.md#keeping-it-fresh) |
