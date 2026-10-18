@@ -53,8 +53,8 @@ zerograph status --json                     # the same facts as one object, each
 The machine's vector cache, which every checkout reads before it embeds, reports and trims itself:
 
 ```bash
-zerograph cache status                      # where it is, its cap, rows and bytes per model
-zerograph cache prune                       # trim to 80% of vector_cache_max, least recently used first; empty it when the cap is 0
+zerograph cache status                      # where it is, its cap, rows and bytes per model and revision
+zerograph cache prune                       # trim to 80% of vector_cache_max, least recently used first; empty it when the cap is 0; always drops repeated, torn and older-format rows
 ```
 
 Under the refresh line come the lines the current run wrote besides its progress meters — its result
