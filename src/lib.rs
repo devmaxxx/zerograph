@@ -506,7 +506,23 @@ impl<'a> Watcher<'a> {
     /// Whatever the tree has moved since the last poll, applied and saved once `batch` files are
     /// waiting. An `ask` or an `update` writing the store meanwhile is picked up rather than
     /// overwritten, which is why the manifest stamp is checked before the graph in hand is used.
+    ///
+    /// A poll is a writer, so it holds the writer lock from before the reload to its end, and a
+    /// poll that finds the lock held skips its cycle whole: the holder is a refresh writing this
+    /// store, and the next poll reads back what it wrote.
     fn poll(&mut self, batch: usize) -> anyhow::Result<Polled> {
+        self.reloaded = false;
+        // Before the lock as well as after the reload: taking the lock writes into the store,
+        // and this build may write nothing into a newer one.
+        if self.manifest.newer_grammar() { return Ok(Polled::Quiet); }
+        let _lock = match self.store.try_lock_writer() {
+            Ok(Some(lock)) => Some(lock),
+            Ok(None) => return Ok(Polled::Quiet),
+            Err(_) if self.store.has_link() => return Ok(Polled::Quiet),
+            // A store that cannot be locked at all — a read-only checkout — is polled as it
+            // always was, and a write that fails says so.
+            Err(_) => None,
+        };
         self.reloaded = self.reload_if_moved()?;
         // Read-only for as long as a newer release's store stands here: nothing to walk for.
         if self.manifest.newer_grammar() { return Ok(Polled::Quiet); }
@@ -561,6 +577,18 @@ impl<'a> Watcher<'a> {
         self.seen = self.store.stamp("manifest.json");
         self.graph_at = r.graph_at;
         Ok(Polled::Refreshed(r))
+    }
+}
+
+/// The writer lock for a command someone is waiting on: taken at once when it is free, else
+/// waited for, with a line saying why nothing is happening yet.
+fn wait_for_writer(store: &store::Store, who: &str) -> anyhow::Result<store::WriterLock> {
+    match store.try_lock_writer()? {
+        Some(lock) => Ok(lock),
+        None => {
+            eprintln!("{who}: waiting for the refresh already running");
+            store.lock_writer()
+        }
     }
 }
 
@@ -982,14 +1010,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             cap_pools(index::embed::threads(cfg.resources));
             // Held to the end of the embed: a reader that finds it held answers from the store as
             // it stands rather than racing this process to the same rows.
-            let store = store::Store::new(&repo);
-            let _lock = match store.try_lock_writer()? {
-                Some(lock) => lock,
-                None => {
-                    eprintln!("update: waiting for the refresh already running");
-                    store.lock_writer()?
-                }
-            };
+            let _lock = wait_for_writer(&store::Store::new(&repo), "update")?;
             eprintln!("{}", refresh::RUN_MARKER);
             let r = run_update(&repo, &cfg, wipe)?;
             println!("changed {} removed {} nodes {} edges {}", r.changed, r.removed, r.nodes, r.edges);
@@ -1007,14 +1028,17 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             // `build` it writes a `vectors.*` pair that makes `DenseIndex::present` true over
             // no rows. `build` and `update` over a tree that yields nothing keep
             // writing their empty graph and exiting 0.
-            let (graph, _) = store::Store::new(&repo).load()?;
-            if graph.nodes.is_empty() { anyhow::bail!("graph is empty — run `zerograph build`"); }
+            let store = store::Store::new(&repo);
+            if store.load()?.0.nodes.is_empty() { anyhow::bail!("graph is empty — run `zerograph build`"); }
             if cli.no_dense {
                 // Otherwise this exits 0 having printed nothing at all, which reads exactly
                 // like an embed that found every row already in place.
                 println!("dense: nothing embedded, --no-dense is set");
                 Ok(())
             } else {
+                // After the check above, which must not create the store a missing build leaves
+                // absent: taking the lock makes the directory.
+                let _lock = wait_for_writer(&store, "embed")?;
                 embed_all(&repo, cli.no_dense, &cfg)
             }
         }
@@ -1025,6 +1049,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 None if json => { print!("{}", model_json(&repo, &cfg)?); Ok(()) }
                 None => { print!("{}", model_report(&repo, &cfg)?); Ok(()) }
                 Some(id) => {
+                    // Before the model is fetched, not after: the switch rewrites every row, and
+                    // a reader or `status` should see it running from the start.
+                    let _lock = wait_for_writer(&store::Store::new(&repo), "model")?;
                     eprintln!("{}", refresh::RUN_MARKER);
                     switch_model(&repo, &cfg, &id, no_embed, cli.no_dense).map(|()| eprintln!("{}", refresh::RUN_FINISHED))
                 }
@@ -1723,6 +1750,22 @@ mod tests {
         assert_eq!((r.changed, r.removed), (1, 0));
         assert!(store::Store::new(repo).load().unwrap().0.nodes.contains_key("FR-PAY-23"));
         assert!(matches!(w.poll(1).unwrap(), Polled::Quiet));
+    }
+
+    #[test]
+    fn a_poll_skips_its_cycle_while_a_refresh_holds_the_writer_lock() {
+        let dir = doc_repo(ONE);
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        built(repo, &cfg);
+        let mut w = Watcher::open(repo, &cfg).unwrap();
+        std::fs::write(repo.join("docs/a.md"), TWO).unwrap();
+        let before = std::fs::read(repo.join(".zerograph/graph.json")).unwrap();
+        let held = store::Store::new(repo).try_lock_writer().unwrap().expect("nobody holds it yet");
+        assert!(matches!(w.poll(1).unwrap(), Polled::Quiet), "the edit waits for the holder");
+        assert_eq!(std::fs::read(repo.join(".zerograph/graph.json")).unwrap(), before, "nothing was written under the holder");
+        drop(held);
+        let Polled::Refreshed(r) = w.poll(1).unwrap() else { panic!("the edit is refreshed once the lock is free") };
+        assert_eq!((r.changed, r.removed), (1, 0));
     }
 
     #[test]

@@ -137,6 +137,12 @@ The price is wall time when the machine is busy: the band waits for the cores no
 which is the point, and a foreground `update` that finds a background one holding the store waits
 for it. `ask` never waits on it: it answers from the store as it stands and says so.
 
+Every writer holds the store's `writer.lock` while it writes: `build`, `update`, `embed`,
+`model <id>`, a refreshing `ask` and each `serve` poll. That lock is how `status` knows a refresh is
+running and how two writers stay out of each other's files. `build`, `update`, `embed` and
+`model <id>` wait for a refresh that holds it, saying so on stderr; a `serve` poll that finds it
+held skips that cycle and reads back what the holder wrote on the next one.
+
 A dense `update` embeds every row the store is owed, whoever left it owed: the rows are matched to
 the stored graph by hash, not to what that run re-read, so one over a tree nothing moved still pays
 for an `update --no-dense` or a lexical `ask` before it. A hook written as `update --no-dense

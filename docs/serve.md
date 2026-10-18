@@ -19,7 +19,8 @@ zerograph ask --no-serve отмена  # answer here even while one is listening
 
 A poll that applies an edit rewrites the whole graph, so `--batch` spends that once on a burst of
 edits rather than once per file. Fewer than `--batch` files waiting are carried to the next poll, at
-most three times in a row, so a lone edit lands within four polls whatever the batch says.
+most three times in a row, so a lone edit lands within four polls whatever the batch says. A poll
+that finds a refresh holding the store's writer lock skips its cycle.
 
 Two idles, one clock. `--idle` ends the process; `--idle-model` (default 300 s) drops only the
 model weights and keeps everything that answers without them — the graph, the ids, the lexical
