@@ -1,5 +1,5 @@
 //! Background priority for the writes zerograph starts on its own: the detached `update` a reader,
-//! a git hook or the MCP server hands a refresh to, and `watch`. Nobody waits on either, and a
+//! the session hook or the MCP server hands a refresh to, and `watch`. Nobody waits on either, and a
 //! build, a test run or an editor running beside them should not wait because of them. A command
 //! someone typed and is waiting on — `ask`, `build`, `update` without `--detach`, `embed`, `model`
 //! — keeps the priority it was started with, and so does `serve`, whose poll a question can be

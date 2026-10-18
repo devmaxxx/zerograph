@@ -388,6 +388,36 @@ test('a checkout that never asked for an index is not built, so a machine-wide h
   }
 });
 
+test('a linked worktree whose main worktree holds the hook asked for an index too', async () => {
+  const w = world({ store: false });
+  const main = join(w.root, 'main');
+  mkdirSync(join(main, '.git', 'worktrees', 'wt'), { recursive: true });
+  writeFileSync(join(main, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+  mkdirSync(join(main, '.codex', 'hooks'), { recursive: true });
+  writeFileSync(join(main, '.codex', 'hooks', 'zerograph-hook.mjs'), '');
+  const wt = join(w.root, 'wt');
+  mkdirSync(wt);
+  writeFileSync(join(wt, '.git'), `gitdir: ${join(main, '.git', 'worktrees', 'wt')}\n`);
+  assert.match(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: wt })), /being built/);
+  assert.equal(await waitFor(w, /update --detach/), `--repo ${wt} update --detach`);
+});
+
+test('an opted-in checkout with no binary to start claims no build', { skip: WIN }, async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  writeFileSync(join(w.root, 'zerograph.toml'), '');
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here') }), null);
+});
+
+test('while the first session builds, a search is told the build is under way, not to start one', () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  writeFileSync(join(w.root, 'zerograph.toml'), '');
+  const c = context(fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } }));
+  assert.match(c, /being built in the background/);
+  assert.doesNotMatch(c, /zerograph build`/);
+});
+
 test('with serve off, a built index is caught up by a detached update instead', async () => {
   const w = world({ answer: 'zerograph: 3 doc nodes' });
   fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { ZEROGRAPH_HOOK_SERVE: '0' });
@@ -405,8 +435,14 @@ test('every call the hook waits on refreshes in process for less than its timeou
   const edit = { hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: 'src/a.ts' } };
   for (const [set, want] of [[undefined, '2'], ['30', '2'], ['1', '1'], ['0', '0'], ['soon', '2']]) {
     const w = world({ answer: '{}' });
-    fire(w, edit, set === undefined ? env : { ...env, ZEROGRAPH_READER_BUDGET: set });
+    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: set, REPOGRAPH_READER_BUDGET: undefined });
     assert.deepEqual(budgets(w), [want], `set ${set}`);
+  }
+  for (const [line, want] of [['reader_budget = 0', '0'], ['reader_budget = 5 # generous', '2']]) {
+    const w = world({ answer: '{}' });
+    writeFileSync(join(w.root, 'zerograph.toml'), `${line}\n`);
+    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: undefined, REPOGRAPH_READER_BUDGET: undefined });
+    assert.deepEqual(budgets(w), [want], line);
   }
 });
 

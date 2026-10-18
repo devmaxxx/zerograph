@@ -79,7 +79,7 @@ enum Cmd {
     Build,
     Update {
         /// Starts the update in a process of its own, at background priority, and returns at once;
-        /// its output goes to `.zerograph/background.log`. What the git hooks `install-agent` writes run.
+        /// its output goes to `.zerograph/background.log`. What the session hook and a reader start.
         #[arg(long)] detach: bool,
     },
     Ask {
@@ -959,7 +959,7 @@ fn git_toplevel(cwd: &std::path::Path) -> Option<PathBuf> {
 /// which std puts back itself wherever a call needs it; carried around instead it is four bytes
 /// of the socket name's budget and a prefix in every message.
 #[cfg(windows)]
-fn plain(p: PathBuf) -> PathBuf {
+pub(crate) fn plain(p: PathBuf) -> PathBuf {
     let Some(s) = p.to_str() else { return p };
     match s.strip_prefix(r"\\?\") {
         Some(rest) if rest.starts_with(r"UNC\") => PathBuf::from(format!(r"\\{}", &rest[4..])),
@@ -969,7 +969,7 @@ fn plain(p: PathBuf) -> PathBuf {
 }
 
 #[cfg(unix)]
-fn plain(p: PathBuf) -> PathBuf { p }
+pub(crate) fn plain(p: PathBuf) -> PathBuf { p }
 
 /// A determination the command was asked to make and made: no call path within the depth, a
 /// bench suite that answered every case and missed a floor. Carried to `main` as an error because
@@ -1233,10 +1233,9 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 // Per checkout: a local-scope server is keyed by the project's path, so a session in
                 // a worktree sees only what was registered for that worktree.
                 if target == install_agent::Target::Claude {
-                    let checkouts = install_agent::worktrees(&repo);
-                    for checkout in &checkouts {
-                        let at = match checkouts.len() { 1 => String::new(), _ => format!(" for {}", checkout.display()) };
-                        let m = install_agent::register_mcp(checkout, &command, &install_agent::run_claude);
+                    let registered = install_agent::register_mcp_everywhere(&repo, &command, &install_agent::run_claude);
+                    for (checkout, m) in &registered {
+                        let at = match registered.len() { 1 => String::new(), _ => format!(" for {}", checkout.display()) };
                         for path in &m.paths { println!("Claude: registered the MCP server{at}\n  {path}"); }
                         for note in &m.notes { println!("Claude: {note}{at}"); }
                     }

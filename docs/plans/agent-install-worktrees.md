@@ -24,7 +24,7 @@ server or a refresh started without `--repo` find the checkout it runs in.
 ## Files to change
 - `src/install_agent.rs` — git-hook installer gone; `retire_git_hooks` removes an earlier block;
   `worktrees`/`main_worktree` read `git worktree list --porcelain`; `prune_stale_mcp` drops entries
-  for checkouts that no longer exist; `install_codex_hook` puts the Codex hook in the main worktree.
+  for checkouts that no longer exist; `codex_hook` puts the Codex hook in the main worktree.
 - `src/lib.rs` — `install-agent` registers the MCP server in every worktree, prunes, retires the git
   block, and prints the Codex hook path from the main worktree.
 - `agent/hook.mjs` — SessionStart bootstraps a missing index and catches up a behind one; every

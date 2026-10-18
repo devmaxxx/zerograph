@@ -99,7 +99,7 @@ worktree) and of a block a hook manager rewrote away. A re-run of `install-agent
 The agent's session hook does that job per checkout instead. At SessionStart:
 
 - **No index in this checkout** — a new worktree, typically — and the checkout asked for one (it
-  holds the hook `install-agent` writes, or a `zerograph.toml`): it starts `update --detach` at the
+  holds the hook `install-agent` writes, or a `zerograph.toml`, or its main worktree does): it starts `update --detach` at the
   checkout's root and says in one line that a build is running. A checkout that asked for nothing
   stays silent, which matters for Codex, whose one hook runs in every repository.
 - **An index** — it starts the resident `serve`, which catches the store up as it starts; with
@@ -107,7 +107,7 @@ The agent's session hook does that job per checkout instead. At SessionStart:
   moved.
 
 The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
-smaller value already set): a refresh that would not finish inside that is left to a detached
+smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached
 `update` rather than killed at the timeout with its work lost.
 
 ### Background priority

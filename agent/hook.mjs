@@ -137,17 +137,24 @@ function spawnable(bin, args) {
   return { file: `"${bin}"`, args: args.map((a) => `"${a}"`), opts: { shell: true } };
 }
 
-/** `HOOK_BUDGET`, or a smaller whole number of seconds the environment already sets. */
-function readerBudget() {
+/**
+ * `HOOK_BUDGET`, or a smaller whole number of seconds the environment or the repository's
+ * `zerograph.toml` already sets. The variable outranks every file, so passing 2 would otherwise
+ * lift a repository's `reader_budget = 0` back to 2.
+ */
+function readerBudget(root) {
   const set = String(env('READER_BUDGET') ?? '').trim();
-  return /^\d+$/.test(set) && Number(set) < HOOK_BUDGET ? set : String(HOOK_BUDGET);
+  let file = '';
+  try { file = readFileSync(join(root, 'zerograph.toml'), 'utf8').match(/^\s*reader_budget\s*=\s*(\d+)\s*(?:#.*)?$/m)?.[1] ?? ''; } catch {}
+  const smallest = [set, file].filter((v) => /^\d+$/.test(v)).map(Number).reduce((a, b) => Math.min(a, b), HOOK_BUDGET);
+  return String(smallest);
 }
 
 function run(root, args) {
   const { file, args: argv, opts } = spawnable(binary(root), ['--repo', root, '--no-dense', ...args]);
   const r = spawnSync(file, argv, {
     encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
-    env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget() }, ...opts,
+    env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget(root) }, ...opts,
   });
   if (r.status !== 0) debug('exit', r.status, args.join(' '), (r.stderr || '').slice(0, 200));
   // Identifiers and headings in the answer are the repository's text, and it is about to enter an
@@ -189,8 +196,31 @@ function checkoutRoot(start) {
  * build started in each of them would be the cost a git hook used to pay on every worktree add.
  */
 function optedIn(checkout) {
-  return ['.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs', 'zerograph.toml']
-    .some((p) => existsSync(join(checkout, ...p.split('/'))));
+  const asked = (dir) => ['.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs', 'zerograph.toml']
+    .some((p) => existsSync(join(dir, ...p.split('/'))));
+  const main = mainCheckout(checkout);
+  return asked(checkout) || (main !== null && asked(main));
+}
+
+/**
+ * The main worktree of a linked one, read off its `.git` file and the `commondir` beside it, or
+ * null. `install-agent --codex` puts the Codex hook there, so a linked worktree whose own tree does
+ * not carry it has still asked for an index.
+ */
+function mainCheckout(checkout) {
+  try {
+    const gitdir = readFileSync(join(checkout, '.git'), 'utf8').match(/^gitdir:\s*(.+?)\s*$/m)?.[1];
+    if (!gitdir) return null;
+    const linked = isAbsolute(gitdir) ? gitdir : join(checkout, gitdir);
+    const common = readFileSync(join(linked, 'commondir'), 'utf8').trim();
+    const commonDir = isAbsolute(common) ? common : join(linked, common);
+    return /^\.git$/.test(commonDir.split(/[\\/]/).filter(Boolean).pop() ?? '') ? dirname(commonDir) : null;
+  } catch { return null; }
+}
+
+/** Whether `binary` names something that will start: a local install, an explicit one, or PATH's. */
+function binaryFound(root) {
+  return binary(root) !== 'zerograph' || onPath();
 }
 
 /**
@@ -457,7 +487,9 @@ function startUpdate(root) {
  */
 function bootstrap(cwd) {
   const checkout = cwd && checkoutRoot(cwd);
-  if (!checkout || !optedIn(checkout)) return null;
+  // A spawn reports a missing binary only later, as an event, so the notice would claim a build
+  // that never started.
+  if (!checkout || !optedIn(checkout) || !binaryFound(checkout)) return null;
   return startUpdate(checkout) ? BUILDING_NOTICE : null;
 }
 
@@ -476,7 +508,10 @@ const handlers = {
       return { updatedInput: { ...(p.tool_input || {}), prompt: `${prompt}\n\n${rule()}` } };
     }
     if (!built(root)) {
-      return isWatchedCall(p.tool_name, p.tool_input) && once(key, 'build', 'once') ? BUILD_NOTICE : null;
+      if (!isWatchedCall(p.tool_name, p.tool_input) || !once(key, 'build', 'once')) return null;
+      // SessionStart already started the build there; a `build` on top of it would embed twice.
+      const checkout = p.cwd && checkoutRoot(p.cwd);
+      return checkout && optedIn(checkout) && binaryFound(checkout) ? BUILDING_NOTICE : BUILD_NOTICE;
     }
     return intercept(p, root, key) ?? reminder(p, key);
   },

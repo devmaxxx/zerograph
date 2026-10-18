@@ -228,7 +228,7 @@ pub fn codex_hooks_block(hook_abs: &str) -> String {
 /// left as it is. A bare clone, or no git, is `root`'s own copy.
 pub fn codex_hook(root: &Path, command: &str) -> Result<(PathBuf, Report)> {
     let mut report = Report::default();
-    let here = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let here = canonical(root).unwrap_or_else(|| root.to_path_buf());
     let home = main_worktree(root).unwrap_or_else(|| here.clone());
     let hooks = home.join(Target::Codex.dir()).join("hooks");
     let path = hooks.join("zerograph-hook.mjs");
@@ -387,7 +387,7 @@ pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
     let merged = merged_instructions(&existing, command);
     // Never written through a link, and not an error either: `CLAUDE.md` linked to `AGENTS.md` is
     // common, and failing here would abort an install that has already rewritten the settings and
-    // removed the old hook, before the MCP server and the git hooks are reached.
+    // removed the old hook, before the MCP server is reached.
     match merged != existing && is_symlink(&instructions) {
         true => report.notes.push(format!(
             "{} is a symlink, so the stanza was not written through it; `install-agent --codex` writes it \
@@ -624,11 +624,23 @@ fn listed_worktrees(root: &Path) -> Vec<(PathBuf, bool)> {
 pub fn worktrees(root: &Path) -> Vec<PathBuf> {
     let mut all: Vec<PathBuf> = listed_worktrees(root).into_iter()
         .filter(|(_, bare)| !bare)
-        .filter_map(|(path, _)| path.canonicalize().ok())
+        .filter_map(|(path, _)| canonical(&path))
         .collect();
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = canonical(root).unwrap_or_else(|| root.to_path_buf());
     if !all.contains(&root) { all.insert(0, root); }
     all
+}
+
+/// The path as `--repo` resolves it, without the `\\?\` prefix `canonicalize` puts on a Windows
+/// path: Claude Code keys a project by the path as written, and an earlier registration said it
+/// without one.
+fn canonical(path: &Path) -> Option<PathBuf> {
+    path.canonicalize().ok().map(crate::plain)
+}
+
+/// [`register_mcp`] once in every checkout [`worktrees`] names, each answer beside its checkout.
+pub fn register_mcp_everywhere(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> Option<std::process::Output>) -> Vec<(PathBuf, Report)> {
+    worktrees(root).into_iter().map(|checkout| { let r = register_mcp(&checkout, command, run); (checkout, r) }).collect()
 }
 
 /// The main worktree of the clone `root` belongs to: the one that stays while linked worktrees
@@ -636,7 +648,7 @@ pub fn worktrees(root: &Path) -> Vec<PathBuf> {
 pub fn main_worktree(root: &Path) -> Option<PathBuf> {
     let (path, bare) = listed_worktrees(root).into_iter().next()?;
     if bare { return None; }
-    path.canonicalize().ok()
+    canonical(&path)
 }
 
 /// The file Claude Code keeps its local-scope servers in: `.claude.json` in `CLAUDE_CONFIG_DIR`
@@ -662,6 +674,9 @@ fn registered_by_us(server: &serde_json::Value) -> bool {
 /// permissions, and not at all when there is nothing to prune.
 pub fn prune_stale_mcp(config: &Path) -> Report {
     let mut report = Report::default();
+    // Written through a link to where it points, so a dotfile manager's link stays one.
+    let config = &config.canonicalize().unwrap_or_else(|_| config.to_path_buf());
+    let Ok(seen) = std::fs::metadata(config) else { return report };
     let Ok(text) = std::fs::read_to_string(config) else { return report };
     let Ok(mut root) = serde_json::from_str::<serde_json::Value>(&text) else {
         report.notes.push(format!("{} is not JSON, so no registration for a removed checkout was pruned from it", config.display()));
@@ -670,20 +685,16 @@ pub fn prune_stale_mcp(config: &Path) -> Report {
     let Some(projects) = root.get_mut("projects").and_then(|p| p.as_object_mut()) else { return report };
     let mut pruned = Vec::new();
     for (path, project) in projects.iter_mut() {
-        if Path::new(path).exists() { continue; }
+        // Only a path known to be gone: one that cannot be looked at now (a mount that is down, a
+        // directory without permission) may still be there.
+        if !matches!(Path::new(path).try_exists(), Ok(false)) { continue; }
         let Some(servers) = project.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else { continue };
         let before = servers.len();
         servers.retain(|name, server| !([MCP_NAME, LEGACY_MCP_NAME].contains(&name.as_str()) && registered_by_us(server)));
         if servers.len() < before { pruned.push(path.clone()); }
     }
     if pruned.is_empty() { return report; }
-    let written = serde_json::to_string_pretty(&root).map_err(anyhow::Error::from).and_then(|out| {
-        let tmp = config.with_extension("json.zerograph-tmp");
-        std::fs::write(&tmp, out + "\n")?;
-        if let Ok(meta) = std::fs::metadata(config) { std::fs::set_permissions(&tmp, meta.permissions())?; }
-        std::fs::rename(&tmp, config)?;
-        Ok(())
-    });
+    let written = serde_json::to_string_pretty(&root).map_err(anyhow::Error::from).and_then(|out| replace_config(config, &seen, &(out + "\n")));
     match written {
         Ok(()) => {
             report.written = 1;
@@ -693,6 +704,36 @@ pub fn prune_stale_mcp(config: &Path) -> Report {
         Err(e) => report.notes.push(format!("{} could not be rewritten ({e:#}); the MCP servers registered for {} stay", config.display(), pruned.join(", "))),
     }
     report
+}
+
+/// Puts `text` in place of `config`, unless the file changed since it was read as `seen`: a Claude
+/// Code session writes the same file, and its write must not be lost to ours. The new copy is
+/// created with the old one's permissions from the start, since the file holds account data, under
+/// a name no other run picks, and removed when anything fails.
+fn replace_config(config: &Path, seen: &std::fs::Metadata, text: &str) -> Result<()> {
+    use std::io::Write;
+    let name = config.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    let tmp = config.with_file_name(format!(".{name}.zerograph-{}", std::process::id()));
+    let mut open = std::fs::OpenOptions::new();
+    open.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        open.mode(seen.permissions().mode() & 0o777);
+    }
+    let result = (|| -> Result<()> {
+        let mut file = open.open(&tmp)?;
+        file.write_all(text.as_bytes())?;
+        file.sync_all()?;
+        let now = std::fs::metadata(config)?;
+        if now.len() != seen.len() || now.modified().ok() != seen.modified().ok() {
+            anyhow::bail!("it changed while being read, so it is left for the next run");
+        }
+        std::fs::rename(&tmp, config)?;
+        Ok(())
+    })();
+    if result.is_err() { let _ = std::fs::remove_file(&tmp); }
+    result
 }
 
 /// `word` as one shell word: bare when it has nothing the shell would split or expand, and
@@ -1163,6 +1204,63 @@ mod tests {
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
         assert_eq!(prune_stale_mcp(&config).written, 1);
         assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_agent_registers_the_server_in_every_checkout_each_with_its_own_repo() {
+        let dir = git_repo();
+        let main = dir.path().join("main");
+        std::fs::create_dir(&main).unwrap();
+        git(&main, &["init", "-q"]);
+        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
+        let wt = dir.path().join("wt");
+        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
+        let (main, wt) = (main.canonicalize().unwrap(), wt.canonicalize().unwrap());
+        let registries = std::cell::RefCell::new(std::collections::BTreeMap::<PathBuf, std::cell::RefCell<std::collections::BTreeMap<String, String>>>::new());
+        let adds = std::cell::RefCell::new(Vec::<(PathBuf, Vec<String>)>::new());
+        let calls = std::cell::RefCell::new(Vec::new());
+        let claude = |cwd: &Path, args: &[&str]| {
+            if args.get(1) == Some(&"add") { adds.borrow_mut().push((cwd.to_path_buf(), args.iter().map(|a| a.to_string()).collect())); }
+            let mut all = registries.borrow_mut();
+            let registry = all.entry(cwd.to_path_buf()).or_default();
+            fake_claude(&calls, registry, args)
+        };
+        let done = register_mcp_everywhere(&wt, "zerograph", &claude);
+        assert_eq!(done.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(), [main.clone(), wt.clone()]);
+        let adds = adds.into_inner();
+        assert_eq!(adds.len(), 2, "{adds:?}");
+        for (cwd, args) in &adds {
+            let repo = args.iter().position(|a| a == "--repo").map(|i| PathBuf::from(&args[i + 1]));
+            assert_eq!(repo.as_ref(), Some(cwd), "each checkout's server reads that checkout: {args:?}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_config_changed_while_pruning_is_left_for_the_next_run() {
+        let dir = root();
+        let config = dir.path().join(".claude.json");
+        let stale = r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#;
+        std::fs::write(&config, stale).unwrap();
+        let seen = std::fs::metadata(&config).unwrap();
+        std::fs::write(&config, format!("{stale} ")).unwrap();
+        assert!(replace_config(&config, &seen, "{}\n").is_err());
+        assert_eq!(std::fs::read_to_string(&config).unwrap(), format!("{stale} "), "Claude Code's write is kept");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1, "no copy left beside it");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_config_is_pruned_through_its_link() {
+        let dir = root();
+        let real = dir.path().join("dotfiles.json");
+        std::fs::write(&real, r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#).unwrap();
+        let link = dir.path().join(".claude.json");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        assert_eq!(prune_stale_mcp(&link).written, 1);
+        assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
+        assert_eq!(read_json(&real)["projects"]["/gone/wt"]["mcpServers"], serde_json::json!({}));
     }
 
     #[test]
