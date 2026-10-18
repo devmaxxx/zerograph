@@ -88,9 +88,9 @@ function debug(...args) {
 }
 
 /**
- * Whether a `zerograph` the machine's own PATH resolves exists, so that it can win over the
- * repository's. A relative entry (`.`, `node_modules/.bin`) resolves against the repository the
- * hook runs in, so it is the repository's file and not the machine's.
+ * Whether a `zerograph` the machine's own PATH resolves exists. A relative entry (`.`,
+ * `node_modules/.bin`) resolves against the repository the hook runs in, so it is the repository's
+ * file and not the machine's.
  */
 function onPath() {
   const names = process.platform === 'win32' ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph'];
@@ -98,22 +98,13 @@ function onPath() {
 }
 
 /**
- * `ZEROGRAPH_BIN`, then PATH, then the package's own bin, and nothing else: a hook that installed
- * things would not be a hook. The repository's `node_modules/.bin` comes after PATH because it is
- * the repository's own file, and a cloned repository that ships one would otherwise run its
- * binary the moment a session starts in it. npm, pnpm and yarn all write the same trio under `node_modules/.bin` — an
- * extensionless shell script, a `.cmd` and a `.ps1` — and on Windows the `.cmd` is the one that
- * starts. The extensionless shim is worse than nothing there: returning it spawns a file
- * `CreateProcess` cannot read, where falling through finds whatever `zerograph.exe` an installer
- * put on PATH.
+ * `ZEROGRAPH_BIN`, then PATH, and nothing else. The checkout is never asked: the hook runs
+ * machine-wide in every repository a session opens, and one that commits a `zerograph.toml` and an
+ * executable `node_modules/.bin/zerograph` would have that file started the moment a session began.
+ * A project-local install names its binary through `ZEROGRAPH_BIN`.
  */
-function binary(root) {
-  const named = env('BIN');
-  if (named) return named;
-  if (onPath()) return 'zerograph';
-  const local = join(root, 'node_modules', '.bin', 'zerograph');
-  const shim = process.platform === 'win32' ? `${local}.cmd` : local;
-  return existsSync(shim) ? shim : 'zerograph';
+function binary() {
+  return env('BIN') || 'zerograph';
 }
 
 /**
@@ -128,7 +119,7 @@ function binary(root) {
  * quotes and the command line has no escape for it — only a batch file's own `%%` — so a repository
  * under a directory that pairs two `%` around an environment variable's name is asked about by the
  * expanded path. And `spawnSync`'s timeout kills the interpreter rather than its child, so a wedged
- * `zerograph` outlives the five seconds this hook waits. Both need a local install on Windows to
+ * `zerograph` outlives the five seconds this hook waits. Both need a `ZEROGRAPH_BIN` naming a `.cmd` to
  * reach at all; neither is worth the shell it would take to avoid, and neither is silent about it.
  */
 function spawnable(bin, args) {
@@ -153,7 +144,7 @@ function readerBudget(root) {
 }
 
 function run(root, args) {
-  const { file, args: argv, opts } = spawnable(binary(root), ['--repo', root, '--no-dense', ...args]);
+  const { file, args: argv, opts } = spawnable(binary(), ['--repo', root, '--no-dense', ...args]);
   const r = spawnSync(file, argv, {
     encoding: 'utf8', timeout: TIMEOUT_MS, stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
     env: { ...process.env, ZEROGRAPH_READER_BUDGET: readerBudget(root) }, ...opts,
@@ -220,9 +211,9 @@ function mainCheckout(checkout) {
   } catch { return null; }
 }
 
-/** Whether `binary` names something that will start: a local install, an explicit one, or PATH's. */
-function binaryFound(root) {
-  return binary(root) !== 'zerograph' || onPath();
+/** Whether `binary` names something that will start: an explicit one, or PATH's. */
+function binaryFound() {
+  return binary() !== 'zerograph' || onPath();
 }
 
 /**
@@ -463,7 +454,7 @@ function autostartServe(root) {
  */
 function detached(root, args) {
   try {
-    const { file, args: argv, opts } = spawnable(binary(root), args);
+    const { file, args: argv, opts } = spawnable(binary(), args);
     const child = spawn(file, argv, { detached: true, stdio: 'ignore', windowsHide: true, ...opts });
     // A spawn that fails reports it as an event, not as a throw, and an unheard `error` event ends
     // this process — which would turn "no binary on PATH" into a hook that dies on stderr at every
@@ -491,7 +482,7 @@ function bootstrap(cwd) {
   const checkout = cwd && checkoutRoot(cwd);
   // A spawn reports a missing binary only later, as an event, so the notice would claim a build
   // that never started.
-  if (!checkout || !optedIn(checkout) || !binaryFound(checkout)) return null;
+  if (!checkout || !optedIn(checkout) || !binaryFound()) return null;
   return startUpdate(checkout) ? BUILDING_NOTICE : null;
 }
 
@@ -513,7 +504,7 @@ const handlers = {
       if (!isWatchedCall(p.tool_name, p.tool_input) || !once(key, 'build', 'once')) return null;
       // SessionStart already started the build there; a `build` on top of it would embed twice.
       const checkout = p.cwd && checkoutRoot(p.cwd);
-      return checkout && optedIn(checkout) && binaryFound(checkout) ? BUILDING_NOTICE : BUILD_NOTICE;
+      return checkout && optedIn(checkout) && binaryFound() ? BUILDING_NOTICE : BUILD_NOTICE;
     }
     return intercept(p, root, key) ?? reminder(p, key);
   },

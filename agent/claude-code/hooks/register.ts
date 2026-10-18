@@ -13,25 +13,16 @@ const full = atom({ plugin: 'zerograph', key: 'full' } as const, null)
 
 type Api = Parameters<Hook<'session.start'>>[0]
 
-// The configured binary, else where a project keeps one: on PATH, through pnpm's bin
-// directory (how a JS repository pins it), or built in place (zerograph's own checkout).
-async function candidates($: Api, configured: string): Promise<string[]> {
-  if (configured) return [configured]
-  const root = await $.session.root()
-  const local = [`${root}/node_modules/.bin/zerograph`, `${root}/target/release/zerograph`, `${root}/target/debug/zerograph`]
-  const present = await Promise.all(local.map(p => $.fs.exists(p)))
-  return ['zerograph', ...local.filter((_, i) => present[i])]
-}
-
-// `undefined` when no zerograph found has `status`, or each failed.
+// The configured binary, else PATH's, and never one under the checkout: a cloned repository that
+// ships an executable `node_modules/.bin/zerograph` or `target/*/zerograph` would have it run the
+// moment a session opened in it. A project-local install is named in the `binary` option.
+// `undefined` when that zerograph has no `status`, or it failed.
 async function runStatus($: Api, configured: string, json: boolean): Promise<string | undefined> {
   const cwd = await $.session.root()
-  for (const bin of await candidates($, configured)) {
-    const argv = json ? [bin, 'status', '--json'] : [bin, 'status']
-    const ran = await $.process.run(argv, { cwd, timeoutMs: 20_000 }).catch(() => undefined)
-    if (ran?.exitCode === 0 && ran.stdout.trim()) return ran.stdout
-  }
-  return undefined
+  const bin = configured || 'zerograph'
+  const argv = json ? [bin, 'status', '--json'] : [bin, 'status']
+  const ran = await $.process.run(argv, { cwd, timeoutMs: 20_000 }).catch(() => undefined)
+  return ran?.exitCode === 0 && ran.stdout.trim() ? ran.stdout : undefined
 }
 
 // A store built before the rename still sits under `.repograph` until a write moves it.

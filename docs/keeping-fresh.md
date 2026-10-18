@@ -106,6 +106,13 @@ The agent's session hook does that job per checkout instead. At SessionStart:
   `ZEROGRAPH_HOOK_SERVE=0` it starts `update --detach` instead, which writes nothing when nothing
   moved.
 
+The hook runs the binary `ZEROGRAPH_BIN` names, else the `zerograph` on `PATH`, and never one
+inside the checkout: a cloned repository that commits a `zerograph.toml` and an executable
+`node_modules/.bin/zerograph` would otherwise have that file started as soon as a session opened
+in it. A project-local install (`pnpm add -D zerograph`) puts no `zerograph` on `PATH`, so set
+`ZEROGRAPH_BIN` to its absolute path in the environment the agent starts from, or install
+globally; without either the hook stays silent.
+
 The hook's own reads wait at most 5 s, so each one runs with `ZEROGRAPH_READER_BUDGET=2` (or a
 smaller value the environment or the repository's `zerograph.toml` already sets): a refresh that would not finish inside that is left to a detached
 `update` rather than killed at the timeout with its work lost.

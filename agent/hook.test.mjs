@@ -219,49 +219,23 @@ test('a milestone or task id goes whole, and neither an escape nor a leading das
   assert.ok(!argv(w)[0].includes('--rerank'), `ask would read it as its paid flag: ${argv(w)[0]}`);
 });
 
-test('the local shim the hook picks is one this platform can start', () => {
+test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH_BIN (or the old REPOGRAPH_BIN) and PATH', () => {
   const w = world();
-  const bin = join(w.root, 'node_modules', '.bin');
-  mkdirSync(bin, { recursive: true });
-  const named = process.env.ZEROGRAPH_BIN;
-  const old = process.env.REPOGRAPH_BIN;
-  const path = process.env.PATH;
-  delete process.env.ZEROGRAPH_BIN;                 // this is the resolution when nothing names it
-  delete process.env.REPOGRAPH_BIN;
-  process.env.PATH = join(w.root, 'empty-path');    // a machine with no zerograph of its own
-  try {
-    assert.equal(binary(w.root), 'zerograph', 'nothing installed locally: PATH answers');
-
-    // The trio npm, pnpm and yarn write, in the order they appear: the shell script first.
-    writeFileSync(join(bin, 'zerograph'), '#!/bin/sh\n');
-    assert.equal(binary(w.root), WIN ? 'zerograph' : join(bin, 'zerograph'),
-      'the extensionless shim is not a fallback on Windows: CreateProcess cannot read it, and PATH can');
-
-    writeFileSync(join(bin, 'zerograph.cmd'), '@echo off\r\n');
-    assert.equal(binary(w.root), join(bin, WIN ? 'zerograph.cmd' : 'zerograph'));
-  } finally {
-    if (named !== undefined) process.env.ZEROGRAPH_BIN = named;
-    if (old !== undefined) process.env.REPOGRAPH_BIN = old;
-    process.env.PATH = path;
+  // Everything a cloned repository could ship where a local install or a build would put one.
+  const shipped = [['node_modules', '.bin'], ['target', 'release'], ['target', 'debug']];
+  for (const dir of shipped) {
+    mkdirSync(join(w.root, ...dir), { recursive: true });
+    for (const name of ['zerograph', 'zerograph.cmd', 'zerograph.exe']) writeFileSync(join(w.root, ...dir, name), '#!/bin/sh\n');
   }
-});
-
-test('a zerograph on PATH wins over the repository\'s own node_modules shim, and ZEROGRAPH_BIN (or the old REPOGRAPH_BIN) over both', () => {
-  const w = world();
-  const local = join(w.root, 'node_modules', '.bin');
-  mkdirSync(local, { recursive: true });
-  writeFileSync(join(local, WIN ? 'zerograph.cmd' : 'zerograph'), '#!/bin/sh\n');
-  const onPath = join(w.root, 'on-path');
-  mkdirSync(onPath, { recursive: true });
-  writeFileSync(join(onPath, WIN ? 'zerograph.exe' : 'zerograph'), '');
   const named = process.env.ZEROGRAPH_BIN;
   const old = process.env.REPOGRAPH_BIN;
   const path = process.env.PATH;
   delete process.env.ZEROGRAPH_BIN;
   delete process.env.REPOGRAPH_BIN;
-  process.env.PATH = `${onPath}${delimiter}${path}`;
+  // A relative entry resolves against the checkout, so it is the checkout's file too.
+  process.env.PATH = ['node_modules/.bin', '.', join(w.root, 'empty-path')].join(delimiter);
   try {
-    assert.equal(binary(w.root), 'zerograph', 'the clone ships a shim; the machine\'s binary is the one that runs');
+    assert.equal(binary(w.root), 'zerograph', 'the bare name, which PATH alone resolves');
     process.env.REPOGRAPH_BIN = '/opt/repograph';
     assert.equal(binary(w.root), '/opt/repograph', 'a profile written before the rename still names the binary');
     process.env.ZEROGRAPH_BIN = '/opt/zerograph';
@@ -271,6 +245,21 @@ test('a zerograph on PATH wins over the repository\'s own node_modules shim, and
     if (old === undefined) delete process.env.REPOGRAPH_BIN; else process.env.REPOGRAPH_BIN = old;
     process.env.PATH = path;
   }
+});
+
+test('a cloned repository that ships an executable node_modules/.bin/zerograph never gets it started', { skip: WIN }, async () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  writeFileSync(join(w.root, 'zerograph.toml'), '');
+  const shim = join(w.root, 'node_modules', '.bin');
+  mkdirSync(shim, { recursive: true });
+  copyFileSync(w.launcher, join(shim, 'zerograph'));
+  chmodSync(join(shim, 'zerograph'), 0o755);
+  const env = { PATH: join(w.root, 'nothing-here') };
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null, 'no binary of its own: no build claimed');
+  fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } }, env);
+  await new Promise((r) => setTimeout(r, 300));
+  assert.deepEqual(argv(w), [], 'the shipped shim ran');
 });
 
 test('the hook keeps its session state in a directory private to the user', { skip: WIN }, () => {
