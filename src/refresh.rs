@@ -144,27 +144,36 @@ pub(crate) fn reap(mut child: std::process::Child) -> Alive {
 /// this run's lines from those a killed run left.
 pub(crate) const RUN_MARKER: &str = "refresh: started";
 
-/// Starts `zerograph <args>` in a process of its own and returns without waiting. It inherits
-/// none of this process's standard streams: a caller reading this reader's output through a pipe
-/// would otherwise wait for the refresh to close it too, which is the wait this exists to remove.
+/// Starts `zerograph <args>` in a process of its own, at background priority, and returns without
+/// waiting. It inherits none of this process's standard streams: a caller reading this reader's
+/// output through a pipe would otherwise wait for the refresh to close it too, which is the wait
+/// this exists to remove.
 pub(crate) fn spawn_detached(repo: &Path, no_dense: bool, args: &[&str]) -> anyhow::Result<Alive> {
-    spawn_detached_logging(repo, no_dense, args, "background.log")
+    spawn_detached_logging(repo, no_dense, true, args, "background.log")
 }
 
 /// `spawn_detached` into a log of its own name: a detached `serve` runs for hours, and its lines
 /// in `background.log` would sit between a refresh's marker and the progress read back after it.
-pub(crate) fn spawn_detached_logging(repo: &Path, no_dense: bool, args: &[&str], log: &str) -> anyhow::Result<Alive> {
+/// `background` is false for that `serve`: a question can be waiting behind anything it does.
+pub(crate) fn spawn_detached_logging(repo: &Path, no_dense: bool, background: bool, args: &[&str], log: &str) -> anyhow::Result<Alive> {
     let log = log_named(repo, log)?;
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--repo").arg(repo);
-    if no_dense { cmd.arg("--no-dense"); }
     // No `current_dir`: `--repo` may be relative, and a child started inside it would resolve it
     // a second time.
-    cmd.args(args)
+    cmd.args(child_args(repo, no_dense, background, args))
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log);
     Ok(reap(detach(&mut cmd)?))
+}
+
+/// The child's command line: the global flags first, then the command.
+fn child_args(repo: &Path, no_dense: bool, background: bool, args: &[&str]) -> Vec<std::ffi::OsString> {
+    let mut out: Vec<std::ffi::OsString> = vec!["--repo".into(), repo.into()];
+    if no_dense { out.push("--no-dense".into()); }
+    if background { out.push("--background".into()); }
+    out.extend(args.iter().map(|a| a.into()));
+    out
 }
 
 #[cfg(test)]
@@ -274,6 +283,16 @@ mod tests {
         std::os::unix::fs::symlink(&outside, &log).unwrap();
         assert!(log_file(dir.path()).is_err());
         assert_eq!(std::fs::read_to_string(&outside).unwrap(), "victim\n");
+    }
+
+    #[test]
+    fn a_detached_refresh_runs_at_background_priority_and_a_detached_server_does_not() {
+        let has = |background| child_args(Path::new("r"), false, background, &["update"]).iter().any(|a| a == "--background");
+        assert!(has(true));
+        assert!(!has(false));
+        let parsed = <crate::Cli as clap::Parser>::try_parse_from(
+            std::iter::once("zerograph".into()).chain(child_args(Path::new("r"), true, true, &["update"]))).unwrap();
+        assert!(parsed.background && parsed.no_dense, "the child parses the flags it is given");
     }
 
     #[test]

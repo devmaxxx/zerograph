@@ -65,6 +65,32 @@ embed is every two seconds:
 embedded 400/1683 (14.2 rows/s, ~90 s left)
 ```
 
+### Background priority
+
+The detached `update` that a reader, a git hook or the MCP `reindex` and `switch_model` tools start
+runs at background priority, and so does `watch`. A command someone is waiting on — `ask`, `build`,
+`update` without `--detach`, `embed`, `model` — keeps normal priority, and so does `serve`: a
+question can be waiting behind its poll, and the poll re-reads only the files that changed.
+
+| platform | what the process gets |
+| --- | --- |
+| macOS | the `PRIO_DARWIN_BG` band: CPU and disk I/O throttled |
+| Linux | nice 19 and the idle I/O class, set before any thread starts so every pool inherits them |
+| Windows | `PROCESS_MODE_BACKGROUND_BEGIN` |
+
+The embed under it is still bounded by [`resources`](configuration.md#resources), 40% of the logical
+cores by default. A platform that refuses the call costs a line in the run's log and nothing else.
+The price is wall time when the machine is busy: the band waits for the cores nothing else wants,
+which is the point, and a foreground `update` that finds a background one holding the store waits
+for it. `ask` never waits on it: it answers from the store as it stands and says so.
+
+A dense `update` embeds every row the store is owed, whoever left it owed: the rows are matched to
+the stored graph by hash, not to what that run re-read, so one over a tree nothing moved still pays
+for an `update --no-dense` or a lexical `ask` before it. A hook written as `update --no-dense
+--detach` never does, and a fused `ask` misses the rows it leaves until something dense runs — the
+MCP `status` tool counts them as `owed`. Leave `--no-dense` out of the hooks: the background band
+is what keeps the embed out of the way.
+
 Readers that do not refresh themselves — an editor plugin, an MCP server — can be kept supplied by
 a poller instead:
 

@@ -13,11 +13,16 @@ use serde::Deserialize;
 use std::path::{Path, PathBuf};
 use tokenizers::{PaddingParams, PaddingStrategy, Tokenizer, TruncationParams};
 
-/// What a writer embeds with when the repository names no model: embeddinggemma-300m, the
-/// cheapest of the four that read 21/30 where the small one reads 15/30
-/// (docs/adr/ADR-003-gemma-is-the-default.md). `bench` holds floors for the small model's two
-/// arms and for this model's dense arm.
-pub const DEFAULT_MODEL: &str = "onnx-community/embeddinggemma-300m-ONNX";
+/// What a writer embeds with when the repository names no model: `GEMMA`'s 4-bit export. A sixth
+/// of fp32's download (197 MB against 1,235 MB) and three fifths of its peak RSS, at fp32's wall
+/// time and with no paraphrase lost on the suite (docs/adr/ADR-005-gemma-q4-is-the-default.md).
+/// `bench` holds floors for the small model's two arms and for gemma's dense arm, either export.
+pub const DEFAULT_MODEL: &str = "onnx-community/embeddinggemma-300m-ONNX:q4";
+
+/// embeddinggemma-300m's fp32 export: the cheapest of the four that read 21/30 where the small
+/// one reads 15/30 (docs/adr/ADR-003-gemma-is-the-default.md), the default until 0.6.4, and the
+/// catalogue's control row — the default's figures are this model's, measured on fp32.
+pub const GEMMA: &str = "onnx-community/embeddinggemma-300m-ONNX";
 
 /// What a store that records no model at all was written with. Pinned to the name rather than to
 /// `DEFAULT_MODEL`, which has held both models and may move again: every store written before the
@@ -190,6 +195,33 @@ fn profile(model: &str) -> Profile {
     }
 }
 
+/// The hub repository a model id names and the export in it the id picks: `<hub id>:<variant>`
+/// reads `onnx/model_<variant>.onnx` where the bare id reads `onnx/model.onnx` — the file names
+/// onnx-community publishes quantised exports under (`q4`, `quantized`, `fp16`, …), and the
+/// `dtype` transformers.js chooses them by. A hub id never holds a colon, so the suffix cannot be
+/// mistaken for part of one. The variant is part of the model's name everywhere else — the store
+/// records it, and a change of variant re-embeds — because its vectors are not fp32's.
+pub(crate) fn hub_and_variant(model: &str) -> (&str, Option<&str>) {
+    match model.rsplit_once(':') {
+        Some((hub, v)) if !v.is_empty() && v.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') => (hub, Some(v)),
+        _ => (model, None),
+    }
+}
+
+/// The graph file a variant reads, beside the one the profile names.
+pub(crate) fn variant_file(onnx: &str, variant: Option<&str>) -> String {
+    match (variant, onnx.strip_suffix(".onnx")) {
+        (Some(v), Some(stem)) => format!("{stem}_{v}.onnx"),
+        _ => onnx.to_string(),
+    }
+}
+
+/// The files a model needs beside its graph. A variant's own external data is found by size, as
+/// any graph's is; the fp32 graph's data file (`model.onnx_data`, 2 GB for Qwen3) is not its.
+fn beside_for(profile: &Profile, variant: Option<&str>) -> Vec<&'static str> {
+    profile.beside.iter().copied().filter(|f| variant.is_none() || !f.starts_with(profile.onnx)).collect()
+}
+
 /// Whether a model falls through to e5's recipe — its pooling, its `query: `/`passage: ` tags —
 /// because nothing in `profile` recognised the id. True for the e5 models themselves, and for
 /// every id this binary has never heard of: the guess costs recall rather than a crash, and a
@@ -229,7 +261,7 @@ pub struct Measured {
 /// candidates were measured the same way and are not listed here: the readings document holds
 /// them, and a catalogue is a thing to choose from rather than the record of what was tried.
 pub const MEASURED: &[Measured] = &[
-    Measured { model: DEFAULT_MODEL, dim: 768, paraphrase: 21, embed_s: 733, vectors_mb: 103, cache: "1.2G", licence: "Gemma", revision: "5090578d9565bb06545b4552f76e6bc2c93e4a66" },
+    Measured { model: GEMMA, dim: 768, paraphrase: 21, embed_s: 733, vectors_mb: 103, cache: "1.2G", licence: "Gemma", revision: "5090578d9565bb06545b4552f76e6bc2c93e4a66" },
     Measured { model: UNNAMED_MODEL, dim: 384, paraphrase: 15, embed_s: 144, vectors_mb: 51, cache: "578M", licence: "MIT", revision: "614241f622f53c4eeff9890bdc4f31cfecc418b3" },
     Measured { model: RECOMMENDED, dim: 1024, paraphrase: 21, embed_s: 1944, vectors_mb: 137, cache: "2.1G", licence: "Apache-2.0", revision: "ac6544c8a46e00af67e330e85a9028c66b8cfd9a" },
 ];
@@ -256,13 +288,20 @@ pub fn measured(model: &str) -> Option<&'static Measured> {
     MEASURED.iter().find(|m| m.model.eq_ignore_ascii_case(model))
 }
 
+/// The figures a switch quotes for an id: its catalogue row, else the default's export's — which
+/// has no row of its own and is quoted at its model's, as `control` is.
+pub fn figures(model: &str) -> Option<&'static Measured> {
+    measured(model).or_else(|| model.trim().eq_ignore_ascii_case(DEFAULT_MODEL).then(control))
+}
+
 /// The commit a catalogued model is fetched at; `None` for a model the reader trusted by name,
 /// which follows the hub's `main` because nobody here has measured a commit of it.
-pub fn revision(model: &str) -> Option<&'static str> { measured(model).map(|m| m.revision) }
+pub fn revision(model: &str) -> Option<&'static str> { measured(hub_and_variant(model).0).map(|m| m.revision) }
 
-/// The row every other row is quoted against. The default is in the list — a test holds it there —
-/// so the fallback is unreachable and is written only because an index is not a proof.
-fn control() -> &'static Measured { measured(DEFAULT_MODEL).unwrap_or(&MEASURED[0]) }
+/// The row every other row is quoted against: the default's hub id, since an export is quoted at
+/// its model's figures. That row is in the list — a test holds it there — so the fallback is
+/// unreachable and is written only because an index is not a proof.
+fn control() -> &'static Measured { measured(hub_and_variant(DEFAULT_MODEL).0).unwrap_or(&MEASURED[0]) }
 
 /// The catalogue as a terminal prints it, 78 columns at the widest so that an 80-column window
 /// folds nothing: a column is dropped rather than wrapped, and the memory, the cold-ask and the
@@ -273,7 +312,7 @@ pub fn catalogue(on: Option<&str>) -> String {
     };
     let mut s = row(" ", "hub id", "dim", "para", "embed", "licence");
     for m in MEASURED {
-        let mark = if on.is_some_and(|o| o.eq_ignore_ascii_case(m.model)) { "→" } else { " " };
+        let mark = if on.is_some_and(|o| hub_and_variant(o).0.eq_ignore_ascii_case(m.model)) { "→" } else { " " };
         let cost = format!("{:.1}×", m.times_the_default());
         s.push_str(&row(mark, m.model, &m.dim.to_string(), &format!("{}/{PARAPHRASE_CASES}", m.paraphrase), &cost, m.licence));
     }
@@ -281,11 +320,12 @@ pub fn catalogue(on: Option<&str>) -> String {
         against the default's {} s on the bench fixture. One run each, so anything\n\
         within four hits of the default is noise. The six candidates this table does\n\
         not list are in docs/bench/2026-09-22-embedders-results.md.\n\n\
-        Four models tied at 21/30 and the default is the cheapest of them. A widened\n\
+        The default reads gemma's 4-bit export, `:q4`, quoted at gemma's figures.\n\
+        Four models tied at 21/30 and gemma is the cheapest of them. A widened\n\
         arm of 60 paraphrase cases separated them:\n\
-        {RECOMMENDED} took 39/60 against the default's 35/60,\n\
+        {RECOMMENDED} took 39/60 against gemma's 35/60,\n\
         under Apache-2.0 rather than Gemma's terms, for 2.7× the embed and 137 MB of\n\
-        vectors for the default's 103 MB.\n", control().embed_s));
+        vectors for gemma's 103 MB.\n", control().embed_s));
     s
 }
 
@@ -332,7 +372,8 @@ fn fetch_from(cache: &Path, endpoint: Option<&str>, model: &str) -> Result<Files
     let mut builder = hf_hub::api::sync::ApiBuilder::new().with_cache_dir(cache.to_path_buf()).with_progress(true);
     if let Some(e) = endpoint { builder = builder.with_endpoint(e.to_string()); }
     let api = builder.build()?;
-    let name = model.to_string();
+    let (hub, variant) = hub_and_variant(model);
+    let name = hub.to_string();
     if !cache.join(format!("models--{}", name.replace('/', "--"))).exists() { scan_hint(cache); }
     let repo = match revision(&name) {
         Some(rev) => {
@@ -344,15 +385,16 @@ fn fetch_from(cache: &Path, endpoint: Option<&str>, model: &str) -> Result<Files
     };
     let get = |f: &str| repo.get(f).with_context(|| format!("fetch {name}/{f}"));
     let profile = profile(&name);
-    let model = get(profile.onnx)?;
+    let onnx = variant_file(profile.onnx, variant);
+    let model = get(&onnx)?;
     // The larger models keep their weights beside the graph; the session resolves the file by
     // its relative name, so it has to be fetched into the same snapshot. External data is legal
     // at any graph size and the model is the reader's to choose, so 64 MB is a margin rather
     // than a proof: a file that small cannot be holding 448 MB of weights itself, and the small
     // model's does, so it clears the margin by a factor of seven and never pays the lookup.
     let len = std::fs::metadata(&model).map(|m| m.len()).unwrap_or(0);
-    if keeps_weights_beside(len) { let _ = repo.get(&format!("{}_data", profile.onnx)); }
-    for f in profile.beside { get(f)?; }
+    if keeps_weights_beside(len) { let _ = repo.get(&format!("{onnx}_data")); }
+    for f in beside_for(&profile, variant) { get(f)?; }
     let tokenizer = get("tokenizer.json")?;
     let config: serde_json::Value = serde_json::from_slice(&std::fs::read(get("config.json")?)?)?;
     let tok_config: serde_json::Value = serde_json::from_slice(&std::fs::read(get("tokenizer_config.json")?)?)?;
@@ -413,14 +455,15 @@ pub fn threads(level: Resources) -> usize {
     threads_from(level, std::thread::available_parallelism().map_or(0, |n| n.get()))
 }
 
-/// Halves, sixths and 30% of the logical cores, with one thread as the floor. A level counts
+/// Halves, sixths and 40% of the logical cores, with one thread as the floor. A level counts
 /// threads that are busy for the whole embed, not threads that wait: the ORT session runs the
 /// caller plus `n - 1` intra-op workers, rayon's `n` tokenizer threads run between forwards while
 /// the caller waits on them, and nothing else on a writer's path runs alongside either (no
 /// inter-op pool outside parallel execution, a single-threaded walk and parse). So `n` threads
-/// read as `n` cores: four on twelve measured 394% at peak against the 360% that is 30% of the
-/// machine, and three measured 301% for about 30% more wall
-/// (docs/bench/2026-10-09-bound-build-results.md).
+/// read as `n` cores: four on twelve measured 394% at peak and three 301%, at about 30% more wall
+/// for the three (docs/bench/2026-10-09-bound-build-results.md). `balanced` was 30% from then
+/// until 2026-10-17, which bought that wall back as three threads; at 40% it is the four again,
+/// 480% of the machine's 1,200%.
 /// Turning ORT's spin-wait off gave nothing back at either count — the workers are computing,
 /// not spinning — so the thread count is the only lever.
 ///
@@ -434,12 +477,12 @@ pub fn threads(level: Resources) -> usize {
 /// threads contending for six cores cost more than they add, so `full` takes the shape that is
 /// both faster and cheaper in threads.
 ///
-/// On six logical cores or fewer `balanced` and `low` meet at one thread, which is more than 30%
-/// of a machine of three cores or fewer: a writer cannot run on less than one.
+/// On four logical cores or fewer `balanced` and `low` meet at one thread, which is more than 40%
+/// of a machine of two cores or fewer: a writer cannot run on less than one.
 fn threads_from(level: Resources, cores: usize) -> usize {
     match level {
         Resources::Full => (cores / 2).max(1),
-        Resources::Balanced => (cores * 3 / 10).max(1),
+        Resources::Balanced => (cores * 4 / 10).max(1),
         Resources::Low => (cores / 6).max(1),
     }
 }
@@ -689,6 +732,23 @@ mod tests {
     }
 
     #[test]
+    fn a_variant_suffix_picks_the_export_and_keeps_the_models_recipe_and_pin() {
+        assert_eq!(hub_and_variant("onnx-community/embeddinggemma-300m-ONNX:q4"), ("onnx-community/embeddinggemma-300m-ONNX", Some("q4")));
+        assert_eq!(hub_and_variant(DEFAULT_MODEL), (GEMMA, Some("q4")));
+        assert_eq!(hub_and_variant(GEMMA), (GEMMA, None));
+        assert_eq!(hub_and_variant("a/b:"), ("a/b:", None), "an empty variant is no variant");
+        assert_eq!(hub_and_variant("a/b:../x"), ("a/b:../x", None), "a variant is a word, never a path");
+        assert_eq!(variant_file("onnx/model.onnx", Some("quantized")), "onnx/model_quantized.onnx");
+        assert_eq!(variant_file("onnx/model.onnx", None), "onnx/model.onnx");
+        let qwen = Profile { beside: &["onnx/model.onnx_data", "onnx/Constant_7_attr__value"], ..E5 };
+        assert_eq!(beside_for(&qwen, None), ["onnx/model.onnx_data", "onnx/Constant_7_attr__value"]);
+        assert_eq!(beside_for(&qwen, Some("q4")), ["onnx/Constant_7_attr__value"]);
+        assert_eq!(profile(DEFAULT_MODEL), profile(GEMMA), "the prefixes and pooling are the model's, not the export's");
+        assert_eq!(revision(DEFAULT_MODEL), revision(GEMMA), "and so is the commit it is fetched at");
+        assert!(measured(DEFAULT_MODEL).is_none(), "a variant has figures of its own, or none");
+    }
+
+    #[test]
     fn cls_takes_the_first_position_and_last_token_the_last_attended_one() {
         // One text of three positions, the third padded.
         let hidden = [1.0, 0.0,  0.0, 2.0,  9.0, 9.0];
@@ -718,7 +778,7 @@ mod tests {
             let is_e5 = m.model.to_ascii_lowercase().contains("multilingual-e5");
             assert!(!reads_as_e5(m.model) || is_e5, "{} falls through to the e5 profile", m.model);
         }
-        assert!(measured(DEFAULT_MODEL).is_some(), "the control is the row every other is quoted against");
+        assert!(measured(GEMMA).is_some(), "the control is the row every other is quoted against");
         assert!(measured(RECOMMENDED).is_some(), "the recommendation is one of the measured rows");
         assert_eq!(control().embed_s, 733);
     }
@@ -735,7 +795,8 @@ mod tests {
         assert_eq!(marked.len(), 1, "one row marked, whatever case the store recorded: {marked:?}");
         assert!(marked[0].contains("Snowflake/snowflake-arctic-embed-l-v2.0"), "{}", marked[0]);
         assert!(catalogue(None).lines().all(|l| !l.starts_with('→')));
-        assert!(catalogue(Some("someone/unmeasured")).contains(DEFAULT_MODEL));
+        assert!(catalogue(Some("someone/unmeasured")).contains(GEMMA));
+        assert!(catalogue(Some(DEFAULT_MODEL)).lines().any(|l| l.starts_with('→') && l.contains(GEMMA)), "a store on the default's export marks its model's row");
     }
 
     /// One table, three copies: this list, docs/embeddings.md's and the readings'. A figure corrected
@@ -769,10 +830,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn the_defaults_export_is_quoted_at_its_models_figures_and_no_other_variant_is() {
+        assert_eq!(figures(DEFAULT_MODEL).map(|m| m.model), Some(GEMMA));
+        assert_eq!(figures(&DEFAULT_MODEL.to_ascii_uppercase()).map(|m| m.model), Some(GEMMA));
+        assert!(figures(&format!("{RECOMMENDED}:q4")).is_none(), "a variant of another model has no figures here");
+        assert!(figures(&format!("{GEMMA}:fp16")).is_none());
+    }
+
     /// The cost a switch quotes is a ratio, so the control's own row has to read as 1.
     #[test]
     fn the_embed_cost_is_quoted_against_the_default() {
-        assert_eq!(measured(DEFAULT_MODEL).unwrap().times_the_default(), 1.0);
+        assert_eq!(measured(GEMMA).unwrap().times_the_default(), 1.0);
         let best = measured(RECOMMENDED).unwrap();
         assert!((best.times_the_default() - 2.65).abs() < 0.01, "{}", best.times_the_default());
     }
@@ -892,9 +961,9 @@ mod tests {
     #[test]
     fn each_level_takes_its_fraction_of_the_cores_and_never_reaches_zero() {
         assert_eq!(threads_from(Resources::Full, 12), 6);
-        assert_eq!(threads_from(Resources::Balanced, 12), 3, "360% is 30% of twelve cores");
+        assert_eq!(threads_from(Resources::Balanced, 12), 4, "480% is 40% of twelve cores");
         assert_eq!(threads_from(Resources::Low, 12), 2);
-        assert_eq!(threads_from(Resources::Balanced, 8), 2);
+        assert_eq!(threads_from(Resources::Balanced, 8), 3);
         assert_eq!(threads_from(Resources::Low, 8), 1);
         assert_eq!(threads_from(Resources::Full, 4), 2);
         assert_eq!(threads_from(Resources::Balanced, 4), 1, "the two named-down levels meet on a small box");
@@ -904,11 +973,11 @@ mod tests {
     }
 
     #[test]
-    fn balanced_is_the_most_threads_that_stay_within_thirty_percent() {
+    fn balanced_is_the_most_threads_that_stay_within_forty_percent() {
         for cores in 1..=256 {
             let n = threads_from(Resources::Balanced, cores);
-            assert!(n * 10 <= cores * 3 || n == 1, "{n} threads on {cores} cores is over 30%");
-            assert!((n + 1) * 10 > cores * 3, "{cores} cores leave room for more than {n} threads under 30%");
+            assert!(n * 10 <= cores * 4 || n == 1, "{n} threads on {cores} cores is over 40%");
+            assert!((n + 1) * 10 > cores * 4, "{cores} cores leave room for more than {n} threads under 40%");
         }
     }
 
@@ -919,7 +988,7 @@ mod tests {
             let balanced = threads_from(Resources::Balanced, cores);
             let full = threads_from(Resources::Full, cores);
             assert!(low <= balanced && balanced <= full, "{cores} cores: low {low}, balanced {balanced}, full {full}");
-            if cores >= 7 {
+            if cores >= 6 {
                 assert!(low < balanced && balanced < full, "{cores} cores leave room for three distinct levels: {low}, {balanced}, {full}");
             }
         }
@@ -974,6 +1043,17 @@ mod fetch_tests {
         assert!(files.model.ends_with("onnx/model.onnx"));
         assert_eq!(files.pad_token, "<pad>");
         assert_eq!(files.pad_id, 1);
+    }
+
+    #[test]
+    fn a_variant_reads_its_own_export_from_the_pinned_commit_of_the_hub_id() {
+        let dir = tempfile::tempdir().unwrap();
+        cache_with_model_of(dir.path(), EXTERNAL_DATA_STUB);
+        let snap = dir.path().join("models--intfloat--multilingual-e5-small/snapshots").join(revision(UNNAMED_MODEL).unwrap());
+        std::fs::File::create(snap.join("onnx/model_q4.onnx")).unwrap().set_len(EXTERNAL_DATA_STUB).unwrap();
+        let files = fetch_from(dir.path(), Some("http://127.0.0.1:9"), "intfloat/multilingual-e5-small:q4").unwrap();
+        assert!(files.model.ends_with("onnx/model_q4.onnx"), "{}", files.model.display());
+        assert!(fetch_from(dir.path(), Some("http://127.0.0.1:9"), "intfloat/multilingual-e5-small:fp16").is_err(), "a variant the cache lacks is fetched, not swapped for fp32");
     }
 
     #[test]

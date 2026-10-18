@@ -13,6 +13,9 @@ const HOOK: &str = include_str!("../agent/hook.mjs");
 const RULE: &str = include_str!("../agent/rule.txt");
 const STANZA: &str = include_str!("../agent/stanza.md");
 const SKILL: &str = include_str!("../agent/skill/SKILL.md");
+/// The skill as 0.6.0–0.6.3 wrote it, under the name `repo-query`: what an upgrade may remove.
+const LEGACY_SKILL: &str = include_str!("../agent/skill/repo-query.md");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 const SCOUT: &str = include_str!("../agent/subagent.md");
 
 /// Where the surface is being installed. The two harnesses read different files for the same four
@@ -244,6 +247,62 @@ fn retire_legacy_hook(path: &Path, local_settings: &Path, report: &mut Report) {
     report.notes.push(format!("removed {}, the hook from before the rename; zerograph-hook.mjs replaces it", path.display()));
 }
 
+/// The skill under `skills/zerograph/`, stamped with the release that wrote it — the
+/// `metadata.version` the Agent Skills format keeps for that — so a re-run by the same release
+/// writes nothing and one by another says what it replaced. The `repo-query` skill an earlier
+/// release wrote goes with it, when it is still the text that release wrote.
+fn write_skill(skills: &Path, command: &str, report: &mut Report) -> Result<()> {
+    let path = skills.join("zerograph").join("SKILL.md");
+    let before = std::fs::read_to_string(&path).ok().and_then(|t| skill_version(&t).map(String::from));
+    let written = report.written;
+    write_if_changed(&path, &skill(command), report)?;
+    if let Some(old) = before.filter(|v| v != VERSION && report.written > written) {
+        report.notes.push(format!("{}: rewritten from zerograph {old} to {VERSION}", path.display()));
+    }
+    retire_legacy_skill(&skills.join("repo-query"), report);
+    Ok(())
+}
+
+fn skill(command: &str) -> String { with_command(SKILL, command).replace("{{version}}", VERSION) }
+
+/// The release a generated skill names in its front matter.
+fn skill_version(text: &str) -> Option<&str> {
+    let front = text.strip_prefix("---\n")?.split("\n---\n").next()?;
+    front.lines().skip_while(|l| *l != "metadata:").find_map(|l| l.trim().strip_prefix("version:")).map(|v| v.trim().trim_matches('"'))
+}
+
+/// Whether `text` is `template` with `{{command}}` resolved to one command throughout, whatever
+/// command the install that wrote it was given.
+fn generated_from(template: &str, text: &str) -> bool {
+    let mut parts = template.split("{{command}}");
+    let (Some(head), Some(next)) = (parts.next(), parts.next()) else { return template == text };
+    let Some(rest) = text.strip_prefix(head) else { return false };
+    let Some(end) = rest.find(next) else { return false };
+    with_command(template, &rest[..end]) == text
+}
+
+/// Removes the `repo-query` skill an earlier release wrote, now that `zerograph` replaces it. Only
+/// a directory holding nothing but the `SKILL.md` that release generated is ours: an edited one, or
+/// one with files of its own, is a team's skill under that name, and is left and named.
+fn retire_legacy_skill(dir: &Path, report: &mut Report) {
+    let Ok(meta) = std::fs::symlink_metadata(dir) else { return };
+    let file = dir.join("SKILL.md");
+    let only_skill = meta.is_dir() && std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries.filter_map(|e| e.ok()).all(|e| e.file_name() == "SKILL.md" && e.file_type().is_ok_and(|t| t.is_file()))
+    });
+    let ours = only_skill && std::fs::read_to_string(&file).is_ok_and(|t| generated_from(LEGACY_SKILL, &t));
+    if !ours {
+        report.notes.push(format!("{} is not the skill an earlier zerograph wrote, so it was left; the `zerograph` skill beside it replaces it", dir.display()));
+        return;
+    }
+    if let Err(e) = std::fs::remove_file(&file).and_then(|_| std::fs::remove_dir(dir)) {
+        report.notes.push(format!("{} could not be removed ({e}); the `zerograph` skill replaces it, so remove it by hand", dir.display()));
+        return;
+    }
+    report.written += 1;
+    report.notes.push(format!("removed {}, the skill's name before 0.6.4; `zerograph` replaces it", dir.display()));
+}
+
 /// Installs the surface for one harness under `root`. Returns what it actually wrote: a second run
 /// writes nothing, which is how a caller can tell an upgrade from a no-op.
 pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
@@ -253,7 +312,7 @@ pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
     let prior_hook = std::fs::read_to_string(&hook_file).unwrap_or_default();
     write_if_changed(&hook_file, &hook(command), &mut report)?;
     write_if_changed(&base.join("hooks").join("rule.txt"), &with_command(RULE, command), &mut report)?;
-    write_if_changed(&base.join("skills").join("repo-query").join("SKILL.md"), &with_command(SKILL, command), &mut report)?;
+    write_skill(&base.join("skills"), command, &mut report)?;
     if target == Target::Claude {
         write_if_changed(&base.join("agents").join("repo-scout.md"), &with_command(SCOUT, command), &mut report)?;
     }
@@ -1099,12 +1158,56 @@ mod tests {
         let dir = root();
         let first = install(dir.path(), Target::Claude, "zerograph").unwrap();
         assert!(first.written > 0, "{first:?}");
-        for rel in [".claude/hooks/zerograph-hook.mjs", ".claude/skills/repo-query/SKILL.md",
+        for rel in [".claude/hooks/zerograph-hook.mjs", ".claude/skills/zerograph/SKILL.md",
                     ".claude/agents/repo-scout.md", ".claude/settings.json", ".claude/CLAUDE.md"] {
             assert!(dir.path().join(rel).exists(), "{rel} was not written");
         }
         let second = install(dir.path(), Target::Claude, "zerograph").unwrap();
         assert_eq!(second.written, 0, "a second install is a no-op: {second:?}");
+    }
+
+    #[test]
+    fn the_skill_names_the_release_that_wrote_it_and_another_release_says_it_replaced_it() {
+        let dir = root();
+        install(dir.path(), Target::Claude, "zerograph").unwrap();
+        let path = dir.path().join(".claude/skills/zerograph/SKILL.md");
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.starts_with("---\nname: zerograph\n"), "the name is the directory's: {text}");
+        assert_eq!(skill_version(&text), Some(VERSION));
+        std::fs::write(&path, text.replace(&format!("version: \"{VERSION}\""), "version: \"0.0.1\"")).unwrap();
+        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
+        assert_eq!(r.written, 1, "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains(&format!("rewritten from zerograph 0.0.1 to {VERSION}"))), "{r:?}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+    }
+
+    /// The skill was `repo-query` until 0.6.4. What a release wrote under that name goes, under
+    /// either harness and whatever command it was installed with; a skill a team keeps under the
+    /// name stays.
+    #[test]
+    fn the_repo_query_skill_an_earlier_release_wrote_is_removed_and_one_a_team_edited_is_kept() {
+        for target in [Target::Claude, Target::Codex] {
+            let dir = root();
+            let old = dir.path().join(target.dir()).join("skills/repo-query");
+            std::fs::create_dir_all(&old).unwrap();
+            std::fs::write(old.join("SKILL.md"), with_command(LEGACY_SKILL, "pnpm exec zerograph")).unwrap();
+            let r = install(dir.path(), target, "zerograph").unwrap();
+            assert!(!old.exists(), "{target:?}: {r:?}");
+            assert!(r.notes.iter().any(|n| n.contains("removed") && n.contains("repo-query")), "{r:?}");
+            assert!(dir.path().join(target.dir()).join("skills/zerograph/SKILL.md").exists());
+        }
+        let dir = root();
+        let old = dir.path().join(".claude/skills/repo-query");
+        std::fs::create_dir_all(&old).unwrap();
+        let edited = with_command(LEGACY_SKILL, "zerograph") + "\nOur own rule.\n";
+        std::fs::write(old.join("SKILL.md"), &edited).unwrap();
+        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
+        assert_eq!(std::fs::read_to_string(old.join("SKILL.md")).unwrap(), edited);
+        assert!(r.notes.iter().any(|n| n.contains("repo-query") && n.contains("left")), "{r:?}");
+        std::fs::write(old.join("SKILL.md"), with_command(LEGACY_SKILL, "zerograph")).unwrap();
+        std::fs::write(old.join("notes.md"), "ours\n").unwrap();
+        install(dir.path(), Target::Claude, "zerograph").unwrap();
+        assert!(old.join("notes.md").exists() && old.join("SKILL.md").exists(), "a directory with files of its own is a team's");
     }
 
     /// An installer that rewrote a repository's settings file would be a worse citizen than no
@@ -1201,7 +1304,7 @@ mod tests {
         let dir = root();
         install(dir.path(), Target::Codex, "zerograph").unwrap();
         assert!(dir.path().join(".codex/hooks/zerograph-hook.mjs").exists(), "something to point at");
-        assert!(dir.path().join(".codex/skills/repo-query/SKILL.md").exists());
+        assert!(dir.path().join(".codex/skills/zerograph/SKILL.md").exists());
         let stanza = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
         assert!(stanza.contains("zerograph ask <words>"), "{stanza}");
         assert!(!dir.path().join(".codex/AGENTS.md").exists(), "nothing reads that path");
@@ -1234,16 +1337,16 @@ mod tests {
     #[test]
     fn the_command_reaches_every_file_either_harness_installs() {
         for (target, texts) in [
-            (Target::Claude, &[".claude/hooks/rule.txt", ".claude/skills/repo-query/SKILL.md",
+            (Target::Claude, &[".claude/hooks/rule.txt", ".claude/skills/zerograph/SKILL.md",
                                ".claude/agents/repo-scout.md", ".claude/CLAUDE.md"][..]),
-            (Target::Codex, &[".codex/hooks/rule.txt", ".codex/skills/repo-query/SKILL.md", "AGENTS.md"][..]),
+            (Target::Codex, &[".codex/hooks/rule.txt", ".codex/skills/zerograph/SKILL.md", "AGENTS.md"][..]),
         ] {
             let dir = root();
             install(dir.path(), target, "pnpm exec zerograph").unwrap();
             for rel in texts {
                 let text = std::fs::read_to_string(dir.path().join(rel)).unwrap();
                 assert!(text.contains("`pnpm exec zerograph "), "{rel} names the command: {text}");
-                assert!(!text.contains("`zerograph ") && !text.contains("{{command}}"), "{rel} still names the bare binary: {text}");
+                assert!(!text.contains("`zerograph ") && !text.contains("{{command}}") && !text.contains("{{version}}"), "{rel} still names the bare binary: {text}");
             }
             let script = std::fs::read_to_string(dir.path().join(target.dir()).join("hooks/zerograph-hook.mjs")).unwrap();
             assert!(script.contains("\nconst COMMAND = \"pnpm exec zerograph\";\n"), "{target:?}: the hook's hints read one declaration");

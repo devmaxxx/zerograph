@@ -1,6 +1,8 @@
 ---
-name: repo-query
+name: zerograph
 description: Use when you need to find where something lives, what calls it, or what a change would break in a repository that carries a zerograph index — before grepping for a concept or reading files to orient yourself.
+metadata:
+  version: "{{version}}"
 ---
 
 # Asking the graph
@@ -45,6 +47,23 @@ instead of a person*.
 answer — an edited file is re-extracted in milliseconds. Pass `--stale` when you want the answer
 now and can live one edit behind. Nothing here needs a build step in your loop; `{{command}} build` is
 for a repository that has no index at all.
+
+The rest keeps itself fresh: the git hooks start `{{command}} update --detach` after a pull or a
+branch switch, a `serve` polls between questions, and a reader whose refresh would not fit hands it
+to a detached update. The detached update runs at background priority and yields to builds, tests
+and editors.
+
+- **Owed vectors.** A lexical-only write (`--no-dense`) leaves rows without vectors, and a
+  paraphrase misses them until they are embedded. The MCP `status` tool prints `vectors: N rows,
+  M owed`; on the CLI a fused `ask` says `dense: M vectors pending`, and `--json` carries
+  `stale.vectors`.
+- **Pay them with `{{command}} update --detach`**: it embeds every owed row, whoever left it, in
+  the background. Not a foreground `{{command}} embed` inside your turn.
+- **A full re-embed** — `{{command}} model <id>`, or `embed` on a store with no vectors — is a long
+  job. Start it detached (the MCP `switch_model` tool) or in the background, never in a turn that
+  waits on it.
+- **`embed_model` in `zerograph.toml` pins the model**, so a release that changes the built-in
+  default cannot re-embed the store behind the team's back.
 
 ## Verify before you believe
 

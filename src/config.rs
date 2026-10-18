@@ -56,13 +56,20 @@ pub struct Config {
     /// default, priced for a first build nobody has tuned yet, and the only model `bench` holds
     /// floors for; a store under any other model is measured and not graded.
     pub embed_model: String,
+    /// Files whose nodes get no vectors: they keep their nodes, their edges and their place in the
+    /// lexical index, so `impact`, `trace`, `changes` and a lexical `ask` still see them, and a
+    /// paraphrase does not. For what is read but never asked about in prose — generated code,
+    /// migrations, mocks — which `skip` would take out of the graph as well. A row such a file
+    /// already holds is dropped by the next writer, and the rows of every other file are kept.
+    pub embed_skip: Vec<String>,
     /// How much of the machine a run may take: `"low"`, `"balanced"` (the default) or `"full"`.
     /// It describes the machine rather than the corpus — the same repository wants every core on
     /// a CI box and a quiet laptop's spare ones — so the global file may set it, unlike
     /// `embed_model`, whose value is a property of the vectors on disk. It is a straight trade
     /// with no free side: on a whole-store `build` of the bench fixture the three levels read
-    /// 403.4 s at 580% peak CPU, 674.3 s at 301% and 970.2 s at 201%
-    /// (docs/bench/2026-10-09-bound-build-results.md). `ZEROGRAPH_RESOURCES` overrides it for
+    /// 403.4 s at 580% peak CPU, 521.1 s at 396% and 970.2 s at 201%
+    /// (docs/bench/2026-10-09-bound-build-results.md, `balanced`'s four threads read there as
+    /// the "before" row). `ZEROGRAPH_RESOURCES` overrides it for
     /// one run.
     pub resources: crate::index::embed::Resources,
     /// Seconds a reader (`ask`, `impact`, `trace`, `changes`, `explain`) may spend bringing the
@@ -164,6 +171,7 @@ impl Default for Config {
             file: PROJECT_FILE,
             reranker_dir: String::new(),
             embed_model: crate::index::embed::DEFAULT_MODEL.into(),
+            embed_skip: Vec::new(),
             resources: crate::index::embed::Resources::default(),
             reader_budget: READER_BUDGET,
             mcp_reranks: MCP_RERANKS,
@@ -342,6 +350,9 @@ impl Config {
         // would join two globs into one that matches nothing and the build would say nothing.
         if let Some(g) = globs_from_env("CODE_GLOBS")? { cfg.code_globs = g; }
         if let Some(g) = globs_from_env("TEXT_GLOBS")? { cfg.text_globs = g; }
+        // Refused here rather than at the first embed: a reader catching up its rows would
+        // otherwise find out mid-answer, and every reader's answer would carry the error.
+        crate::index::dense::EmbedSkip::new(&cfg.embed_skip).with_context(|| format!("parse {}", path.display()))?;
         cfg.resources = crate::index::embed::resources_from_env(cfg.resources, crate::env("RESOURCES").as_deref(), &crate::env_name("RESOURCES"))?;
         if let Some(v) = crate::env("READER_BUDGET").filter(|v| !v.trim().is_empty()) {
             cfg.reader_budget = v.trim().parse().with_context(|| format!("{}={v:?} is not a whole number of seconds", crate::env_name("READER_BUDGET")))?;
@@ -357,6 +368,8 @@ impl Config {
                     cfg.embed_model = crate::index::embed::DEFAULT_MODEL.into();
                 }
             }
+        } else if kept_on_fp32(repo) {
+            cfg.embed_model = crate::index::embed::GEMMA.into();
         }
         Ok(cfg)
     }
@@ -485,9 +498,20 @@ pub fn trusted_spelling(model: &str) -> Option<String> {
     let model = model.trim();
     let listed = |p: std::path::PathBuf| std::fs::read_to_string(p).ok()
         .and_then(|t| t.lines().map(str::trim).find(|l| !l.is_empty() && l.eq_ignore_ascii_case(model)).map(str::to_string));
-    crate::index::embed::measured(model).map(|m| m.model.to_string())
+    let default = crate::index::embed::DEFAULT_MODEL;
+    // The default's export has no row of its own, and a store it wrote must still open.
+    model.eq_ignore_ascii_case(default).then(|| default.to_string())
+        .or_else(|| crate::index::embed::measured(model).map(|m| m.model.to_string()))
         .or_else(|| trust_path().and_then(listed))
         .or_else(|| legacy_machine_path().map(|p| p.with_file_name("trusted-models")).and_then(listed))
+}
+
+/// Whether the store holds rows gemma's fp32 export wrote, the default before its q4 export. The
+/// two recall the same at the same embed time, so a store fp32 already wrote keeps it rather than
+/// pay a download and a whole re-embed for nothing it can measure; naming `:q4` moves it.
+fn kept_on_fp32(repo: &Path) -> bool {
+    crate::index::dense::DenseIndex::recorded_model(&crate::store::Store::new(repo)).ok().flatten()
+        .is_some_and(|m| m.eq_ignore_ascii_case(crate::index::embed::GEMMA))
 }
 
 /// Records `model` as one this machine's reader chose; `None` when nothing needed writing.
@@ -836,7 +860,7 @@ mod tests {
     fn the_embed_model_defaults_to_gemma_and_reads_from_the_file() {
         with_machine(None, || {
             let dir = tempfile::tempdir().unwrap();
-            assert_eq!(Config::load(dir.path()).unwrap().embed_model, "onnx-community/embeddinggemma-300m-ONNX");
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, "onnx-community/embeddinggemma-300m-ONNX:q4");
             std::fs::write(dir.path().join("zerograph.toml"), "embed_model = \"BAAI/bge-m3\"\n").unwrap();
             assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::DEFAULT_MODEL, "not catalogued, not trusted");
             assert!(!names_embed_model(dir.path()), "a refused name is not a switch owed");
@@ -1122,6 +1146,22 @@ mod tests {
     }
 
     #[test]
+    fn a_store_the_fp32_default_wrote_stays_on_fp32_until_the_file_names_another() {
+        with_machine(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
+            std::fs::write(dir.path().join(".zerograph/vectors.json"), r#"{"ids":[],"hashes":[],"kinds":[],"dim":768,"model":"onnx-community/embeddinggemma-300m-ONNX"}"#).unwrap();
+            std::fs::write(dir.path().join(".zerograph/vectors.f32"), []).unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::GEMMA);
+            std::fs::write(dir.path().join("zerograph.toml"), "embed_model = \"onnx-community/embeddinggemma-300m-ONNX:q4\"\n").unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::DEFAULT_MODEL, "naming q4 moves it");
+            std::fs::remove_file(dir.path().join("zerograph.toml")).unwrap();
+            std::fs::write(dir.path().join(".zerograph/vectors.json"), r#"{"ids":[],"hashes":[],"kinds":[],"dim":384,"model":"intfloat/multilingual-e5-small"}"#).unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::DEFAULT_MODEL, "only fp32 gemma is kept; the small model still moves");
+        });
+    }
+
+    #[test]
     fn a_catalogued_model_in_another_case_is_trusted_under_the_catalogues_spelling() {
         let shouted = crate::index::embed::DEFAULT_MODEL.to_ascii_uppercase();
         assert_eq!(trusted_spelling(&shouted).as_deref(), Some(crate::index::embed::DEFAULT_MODEL));
@@ -1373,6 +1413,27 @@ mod tests {
             let err = Config::load(dir.path()).unwrap_err().to_string();
             unsafe { std::env::remove_var("ZEROGRAPH_RESOURCES") };
             assert!(err.contains("ZEROGRAPH_RESOURCES"), "{err}");
+        });
+    }
+
+    #[test]
+    fn embed_skip_is_a_projects_key_its_globs_are_checked_and_a_misspelling_is_refused() {
+        let load = |text: &str| with_machine(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("zerograph.toml"), text).unwrap();
+            Config::load(dir.path()).map_err(|e| format!("{e:#}"))
+        });
+        assert!(Config::default().embed_skip.is_empty());
+        assert_eq!(load("embed_skip = [\"**/generated/**\", \"**/*.gen.ts\"]\n").unwrap().embed_skip, ["**/generated/**", "**/*.gen.ts"]);
+        let err = load("embed_skip = [\"src/{a\"]\n").unwrap_err();
+        assert!(err.contains("embed_skip") && err.contains("zerograph.toml"), "{err}");
+        let err = load("embed_skips = []\n").unwrap_err();
+        assert!(err.contains("embed_skips"), "{err}");
+        // It says which files of this repository get vectors, so a machine file may not.
+        with_machine(Some("embed_skip = [\"**/*.sql\"]\n"), || {
+            let dir = tempfile::tempdir().unwrap();
+            let err = format!("{:#}", Config::load(dir.path()).unwrap_err());
+            assert!(err.contains("config.toml") && err.contains("embed_skip"), "{err}");
         });
     }
 

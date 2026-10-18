@@ -85,6 +85,10 @@ What zerograph reads from the old install:
   as `repograph` once `zerograph` is registered (one in another scope is named, with the command
   that removes it). Codex's old script stays until `~/.codex/hooks.json` points at
   `zerograph-hook.mjs`; the install prints the block to paste.
+- **The skill (0.6.4).** It is `zerograph` now, in `.claude/skills/zerograph/` and
+  `.codex/skills/zerograph/`, with the release that wrote it as `metadata.version`. The install
+  removes the `repo-query` directory beside it when it holds only the `SKILL.md` 0.6.0–0.6.3 wrote;
+  an edited one, a link or one with files of its own is left and named.
 
 ## Windows notes
 
@@ -96,7 +100,7 @@ Install through npm; nothing else is required. What can still trip a Windows use
   through Explorer shows "Windows protected your PC"; npm, pnpm, `curl` and `gh release download`
   never do. `Unblock-File .\zerograph.exe` clears it. [Verifying a download](#verifying-a-download)
   proves the file is ours.
-- **Defender.** It scans the model as it lands (about 1.2 GB for the default) and the store on every
+- **Defender.** It scans the model as it lands (about 200 MB for the default) and the store on every
   write; the first download prints the `Add-MpPreference -ExclusionPath` line, which is optional. A
   heuristic false positive is restored from Protection History.
 - **Serve.** `zerograph serve --detach` starts one with no window, `zerograph stop` ends it and

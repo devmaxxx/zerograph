@@ -338,6 +338,14 @@ everyone who ever rebuilt, to buy something only a person sitting at a loaded ma
 [The unnoticeable results](bench/2026-09-07-unnoticeable-results.md) are what it measured while
 it existed; none of those numbers is carried forward here, because they are the band's.
 
+Since 0.6.4 a band is back, for work nobody waits on and nothing else: a detached `update` and
+`watch` ([keeping fresh](keeping-fresh.md#background-priority)); `serve` stays in the normal band,
+because a question can be waiting behind its poll. The 2026-09-09
+objection was to the price landing on everyone who rebuilt; a foreground writer still runs in the
+normal band, and the wall a detached catch-up loses is time no command was waiting through. It
+followed a repository whose hooks ran `update --no-dense` for fear of the embed loading the machine,
+and whose store owed 18,787 rows that a paraphrase never found.
+
 What a rebuild costs the person beside it is now bounded by two things only, the token budget and
 one word:
 
@@ -362,6 +370,10 @@ price is about 30% more wall on an embed. The re-measured table, per phase, is i
 [Resources](configuration.md#resources) and
 [the 2026-10-09 results](bench/2026-10-09-bound-build-results.md).
 
+On 2026-10-17 the owner moved it to 40%, which is four threads here again: the wall the 30% rule
+cost was judged worth more than the 94 points of CPU it kept back. A box of twelve logical cores
+lands on the same count the third gave, so the four-thread rows of 2026-10-09 are its measurement.
+
 `resources` is the only resource lever there is. `threads = N` was the escape hatch until
 2026-09-09 and is gone with `priority`; **`full` is now both the most of the machine you can ask
 for and the fastest setting the tool has**, which was not true while a hand-written count existed.
@@ -382,9 +394,9 @@ with memory to spare that costs nothing; on one that is already short it costs 6
 because pages the system is free to reclaim are pages it reclaims and the run reads them again.
 Readers are unchanged and keep their own copies: they answer one query and leave.
 
-The level follows the machine: `balanced`'s 30% of the logical cores is one thread on a two- to
-six-core box, and on Linux `available_parallelism` honours a container's `--cpus` quota, so a
-devcontainer gets 30% of what it was given rather than 30% of the host. A build server with
+The level follows the machine: `balanced`'s 40% of the logical cores is one thread on a two- to
+four-core box, and on Linux `available_parallelism` honours a container's `--cpus` quota, so a
+devcontainer gets 40% of what it was given rather than 40% of the host. A build server with
 nobody at the keyboard wants `resources = "full"`, one line in
 `~/.config/zerograph/config.toml`; a laptop you are working on wants `"low"`.
 
@@ -396,7 +408,7 @@ not of the laptop that happens to be building them.
 
 Two things bound it, and the first of them now has a name. `resources` caps the ONNX session's
 intra-op pool and rayon's global pool, which is what `tokenizers` fans a batch out over; left alone
-that is 30% of the logical cores, because the runtime otherwise takes every performance core
+that is 40% of the logical cores, because the runtime otherwise takes every performance core
 and holds it for the length of the run. And a batch closes on a padded-token budget rather than on
 a count of texts, so the largest shape the runtime ever allocates an arena for is bounded whatever
 the corpus's longest passages happen to be — a count of sixty-four bounds nothing, since sixty-four

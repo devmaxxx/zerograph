@@ -1,7 +1,7 @@
 # Embeddings
 
-Dense retrieval embeds by default with `onnx-community/embeddinggemma-300m-ONNX` (768-d, ONNX,
-≈1.2 GB on disk, downloaded on first use) run through `ort` directly: the tokenizer and the session open concurrently at optimisation
+Dense retrieval embeds by default with `onnx-community/embeddinggemma-300m-ONNX:q4`, the 4-bit
+export of embeddinggemma-300m (768-d, ONNX, ≈200 MB on disk, downloaded on first use) run through `ort` directly: the tokenizer and the session open concurrently at optimisation
 level 1,
 which halves model-open time against the library default. The files are a one-time Hugging Face
 download cached under `FASTEMBED_CACHE_DIR` if that is set, else `~/.cache/zerograph/fastembed`
@@ -72,15 +72,18 @@ the nine are offered here; [the readings](bench/2026-09-22-embedders-results.md)
 
 | hub id | dim | paraphrase | embed | vectors | licence |
 | --- | --- | --- | --- | --- | --- |
-| `onnx-community/embeddinggemma-300m-ONNX` (default) | 768 | **21/30** | 1.0× | 103 MB | Gemma |
+| `onnx-community/embeddinggemma-300m-ONNX` (default as `:q4`) | 768 | **21/30** | 1.0× | 103 MB | Gemma |
 | `intfloat/multilingual-e5-small` | 384 | 15/30 | 0.2× | 51 MB | MIT |
 | `Snowflake/snowflake-arctic-embed-l-v2.0` | 1024 | **21/30** | 2.7× | 137 MB | Apache-2.0 |
 
-The default is the cheapest of the four models that read 21/30; the small model it replaced reads
-15/30. A reader answers with the model that wrote the store, but a writer embeds with the
+The default is the cheapest of the four models that read 21/30, read through its `:q4` export and
+quoted at fp32's figures ([ADR-005](adr/ADR-005-gemma-q4-is-the-default.md)); the small model it
+replaced reads 15/30. A reader answers with the model that wrote the store, but a writer embeds with the
 configured one: a store the small model wrote, in a repository that names no `embed_model`, moves
-to the default at its next `update` — one 1.2 GB download and one whole re-embed, in the background
-band. Pin `embed_model = "intfloat/multilingual-e5-small"` to stay on the small model.
+to the default at its next `update` — one 197 MB download and one whole re-embed, in the background
+band. Pin `embed_model = "intfloat/multilingual-e5-small"` to stay on the small model. A store
+gemma's fp32 export wrote, the default before 0.6.4, stays on fp32 with no `embed_model` named: it
+has already paid the download `:q4` saves. Name the `:q4` id to move it.
 `Snowflake/snowflake-arctic-embed-l-v2.0` is the upgrade, and the choice under an OSI licence: a
 widened arm of 60 paraphrase cases separated the four, and it took 39/60 against the default's
 35/60, for 2.7× the embed and 137 MB of vectors where the default writes 103 MB. The conditions, the other seven candidates, the flips and
@@ -106,6 +109,18 @@ The model is opened before anything is written, so an id with no ONNX export fai
 own error and leaves the repository exactly as it was. `zerograph.toml` is then rewritten in place —
 only that one value, comments and everything else kept — and the store re-embedded, which
 `--no-embed` stops if you would rather pay for it later.
+
+A hub id followed by `:<variant>` reads another export from the same repository and commit:
+`onnx-community/embeddinggemma-300m-ONNX:q4` opens `onnx/model_q4.onnx` in place of
+`onnx/model.onnx`, with the model's own prefixes and pooling. Variants follow onnx-community's file
+names, so `quantized`, `fp16`, `q4` and `q4f16` are the usual ones. A variant writes different
+vectors, so the store records it as a model of its own, and switching to or from it re-embeds every
+row once. Only the default's `:q4` is trusted as is; any other variant is not catalogued, so
+`zerograph model <hub id>:<variant>` trusts it on the machine before `zerograph.toml` may name it.
+Measured on gemma, every export recalls what fp32 does and none embeds faster on Apple Silicon.
+`:q4` is a 197 MB download against 1.2 GB, with 0.91 GB of RSS against 1.47 GB, at the same wall
+time, which is why it is the default
+([the readings](bench/2026-10-17-gemma-quantized-results.md)).
 
 ### Licence
 

@@ -24,7 +24,8 @@ quoted in comments) and answers questions about it in a few lines of text.
   tokens and is opt-in.
 - **A better door, not a better graph.** Exact id, BM25 and local dense retrieval find the entry
   point from a question in ordinary words, in about 200 tokens an answer.
-- **Built for agents.** `--json` on every reader, an MCP server, and hooks that keep the graph fresh.
+- **Built for agents.** `--json` on every reader, an MCP server, and hooks that keep the graph fresh
+  at background priority.
 
 [![zerograph against graphify and GitNexus: questions answered by each embedder and with rerank, and LLM tokens to build](docs/assets/comparison.png)](docs/assets/comparison.png)
 
@@ -35,7 +36,7 @@ Sources: [the three-tool run](docs/bench/2026-09-04-three-graphs-results.md) and
 ```bash
 npm install -g zerograph                   # or: pnpm add -D zerograph
 echo .zerograph/ >> .gitignore             # the graph is built per checkout
-zerograph build                            # first run downloads the embedding model (~1.2 GB)
+zerograph build                            # first run downloads the embedding model (~200 MB)
 zerograph ask cancellation policy          # stays fresh with your edits, no update to run
 zerograph install-agent --claude           # optional: MCP server + git hooks for your agent
 ```

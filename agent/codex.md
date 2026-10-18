@@ -77,7 +77,7 @@ JSON reflects that: three events, no `PreToolUse`.
 Confirmed by running it: a scratch repository carrying `.codex/skills/probe-codex/SKILL.md` and
 `.agents/skills/probe-agents/SKILL.md` had **both** listed under *Available skills* in
 `codex debug prompt-input`'s output, with the roots table naming each directory. So
-`.codex/skills/repo-query/SKILL.md` is read, which is where the installer puts it; `.agents/skills`
+`.codex/skills/zerograph/SKILL.md` is read, which is where the installer puts it; `.agents/skills`
 is the other repository-scoped root, and is left alone because a repository that uses it has its own
 conventions there.
 

@@ -301,7 +301,8 @@ impl Server {
             match index::dense::DenseIndex::load(&store) {
                 Ok(dense) => {
                     let rows = dense.ids.iter().filter(|id| !id.is_empty()).count();
-                    let owed = dense.owed(&graph);
+                    let skip = cfg.as_ref().ok().and_then(|c| index::dense::EmbedSkip::new(&c.embed_skip).ok()).unwrap_or_default();
+                    let owed = dense.owed(&graph, &skip);
                     say(format!("vectors: {rows} rows, {owed} owed"));
                 }
                 Err(err) => say(format!("vectors: unreadable ({err:#})")),

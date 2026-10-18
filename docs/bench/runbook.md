@@ -316,14 +316,18 @@ between embedders it reported in
 [the embedder readings](2026-09-22-embedders-results.md) was its ceiling rather than
 theirs.
 
-A widened arm of 60 lives in the bench kit at `~/bench/paraphrase-arm-2026-09-22`:
-`cases-wide-112.jsonl` is the 82 recorded cases plus 30 new paraphrase ones, `gate.py`
-is what admitted them, and `out/` holds the six cells. Run it with `--cases`, against
-the writable store and never the pinned fixture:
+A widened arm of 60 lives in the repository: `bench/cases-wide-112.jsonl` is the 82
+recorded cases plus 30 paraphrase ones, and `bench/paraphrase-gate.py` is what admitted
+them. The 2026-09-22 kit's texts were lost; these were written again on 2026-10-18 for
+the same target ids ([readings](2026-10-18-widened-arm-q4.md)). Run it with `--cases`,
+against the writable store and never the pinned fixture:
 
 ```bash
-zerograph --repo ~/bench/beauty-crm-test bench --cases ~/bench/paraphrase-arm-2026-09-22/cases-wide-112.jsonl
+zerograph --repo ~/bench/beauty-crm-test bench --cases bench/cases-wide-112.jsonl
 ```
+
+A new case passes `python3 bench/paraphrase-gate.py <graph.json> <cases.jsonl>`, which
+needs `snowballstemmer`, before it joins the file.
 
 Two things to know before quoting a number off it. `RECORDED_SHAPE` in `src/bench.rs`
 names 40/30/12, so a 112-case file is measured and **not graded** — the summary line
@@ -334,7 +338,8 @@ question that reuses the document's vocabulary is a keyword case in a longer sen
 and an arm of those reads high for a retriever that does nothing but match tokens.
 
 Write the cells into `bench/history/runs.jsonl` like any other run, with the arm named
-so the suite is obvious (`paraphrase60:<model>[+rerank]`).
+so the suite is obvious (`paraphrase60b:<model>[+rerank]` for the current texts;
+`paraphrase60` rows read the lost ones and do not compare).
 
 ## Cutting a release
 

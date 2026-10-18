@@ -397,7 +397,7 @@ pub fn detach(repo: &Path, no_dense: bool, args: &[String]) -> Result<()> {
     let path = socket_path(repo);
     if sys::present(&path) && sys::connect(&path).is_ok() { anyhow::bail!("another serve answers at {}", path.display()); }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    let alive = crate::refresh::spawn_detached_logging(repo, no_dense, &args, "serve.log")?;
+    let alive = crate::refresh::spawn_detached_logging(repo, no_dense, false, &args, "serve.log")?;
     let log = format!("{}/serve.log", crate::store::dir_name_of(repo));
     let start = Instant::now();
     loop {
