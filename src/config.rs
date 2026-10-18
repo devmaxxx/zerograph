@@ -368,6 +368,8 @@ impl Config {
                     cfg.embed_model = crate::index::embed::DEFAULT_MODEL.into();
                 }
             }
+        } else if kept_on_fp32(repo) {
+            cfg.embed_model = crate::index::embed::GEMMA.into();
         }
         Ok(cfg)
     }
@@ -502,6 +504,14 @@ pub fn trusted_spelling(model: &str) -> Option<String> {
         .or_else(|| crate::index::embed::measured(model).map(|m| m.model.to_string()))
         .or_else(|| trust_path().and_then(listed))
         .or_else(|| legacy_machine_path().map(|p| p.with_file_name("trusted-models")).and_then(listed))
+}
+
+/// Whether the store holds rows gemma's fp32 export wrote, the default before its q4 export. The
+/// two recall the same at the same embed time, so a store fp32 already wrote keeps it rather than
+/// pay a download and a whole re-embed for nothing it can measure; naming `:q4` moves it.
+fn kept_on_fp32(repo: &Path) -> bool {
+    crate::index::dense::DenseIndex::recorded_model(&crate::store::Store::new(repo)).ok().flatten()
+        .is_some_and(|m| m.eq_ignore_ascii_case(crate::index::embed::GEMMA))
 }
 
 /// Records `model` as one this machine's reader chose; `None` when nothing needed writing.
@@ -1133,6 +1143,22 @@ mod tests {
         std::os::unix::fs::symlink(LEGACY_PROJECT_FILE, dir.path().join(PROJECT_FILE)).unwrap();
         assert!(!legacy_file_is_shadowed(dir.path()), "one file under two names");
         assert_eq!(project_file_name(dir.path()), PROJECT_FILE);
+    }
+
+    #[test]
+    fn a_store_the_fp32_default_wrote_stays_on_fp32_until_the_file_names_another() {
+        with_machine(None, || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
+            std::fs::write(dir.path().join(".zerograph/vectors.json"), r#"{"ids":[],"hashes":[],"kinds":[],"dim":768,"model":"onnx-community/embeddinggemma-300m-ONNX"}"#).unwrap();
+            std::fs::write(dir.path().join(".zerograph/vectors.f32"), []).unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::GEMMA);
+            std::fs::write(dir.path().join("zerograph.toml"), "embed_model = \"onnx-community/embeddinggemma-300m-ONNX:q4\"\n").unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::DEFAULT_MODEL, "naming q4 moves it");
+            std::fs::remove_file(dir.path().join("zerograph.toml")).unwrap();
+            std::fs::write(dir.path().join(".zerograph/vectors.json"), r#"{"ids":[],"hashes":[],"kinds":[],"dim":384,"model":"intfloat/multilingual-e5-small"}"#).unwrap();
+            assert_eq!(Config::load(dir.path()).unwrap().embed_model, crate::index::embed::DEFAULT_MODEL, "only fp32 gemma is kept; the small model still moves");
+        });
     }
 
     #[test]

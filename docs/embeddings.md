@@ -81,8 +81,9 @@ quoted at fp32's figures ([ADR-005](adr/ADR-005-gemma-q4-is-the-default.md)); th
 replaced reads 15/30. A reader answers with the model that wrote the store, but a writer embeds with the
 configured one: a store the small model wrote, in a repository that names no `embed_model`, moves
 to the default at its next `update` — one 197 MB download and one whole re-embed, in the background
-band, and so does a store gemma's fp32 export wrote. Pin `embed_model = "intfloat/multilingual-e5-small"`
-to stay on the small model, or `embed_model = "onnx-community/embeddinggemma-300m-ONNX"` to stay on fp32.
+band. Pin `embed_model = "intfloat/multilingual-e5-small"` to stay on the small model. A store
+gemma's fp32 export wrote, the default before 0.6.4, stays on fp32 with no `embed_model` named: it
+has already paid the download `:q4` saves. Name the `:q4` id to move it.
 `Snowflake/snowflake-arctic-embed-l-v2.0` is the upgrade, and the choice under an OSI licence: a
 widened arm of 60 paraphrase cases separated the four, and it took 39/60 against the default's
 35/60, for 2.7× the embed and 137 MB of vectors where the default writes 103 MB. The conditions, the other seven candidates, the flips and

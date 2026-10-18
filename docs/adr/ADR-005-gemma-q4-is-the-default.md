@@ -33,10 +33,11 @@ of its own. `bench` grades either export against `Floors::Gemma`.
 
 ## Consequences
 
-- A writer embeds with the configured model, so a store fp32 gemma wrote, in a repository that
-  names no `embed_model`, moves to q4 at its next `update`: a 197 MB download and one whole
-  re-embed in the background band. Pinning `embed_model = "onnx-community/embeddinggemma-300m-ONNX"`
-  keeps fp32.
+- A store fp32 gemma already wrote, in a repository that names no `embed_model`, stays on fp32:
+  moving it would cost a 197 MB download and one whole re-embed for nothing the suite can measure,
+  since its user has already paid the download q4 saves. Naming
+  `embed_model = "onnx-community/embeddinggemma-300m-ONNX:q4"` moves it. A store the small model
+  wrote still moves to the default, now q4, as ADR-003 set out.
 - The widened paraphrase arm is still owed. If it shows q4 below fp32 by more than noise, this
   decision is reversed.
 - The licence is unchanged: q4 is the same model's weights under Gemma's terms.
