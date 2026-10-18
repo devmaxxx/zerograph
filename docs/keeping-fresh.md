@@ -101,15 +101,18 @@ rows going first. A write that takes it over the cap starts `zerograph cache pru
 process, which trims it to 80% of the cap, so the answer that wrote the row never waits on the
 prune; a long-lived `serve` or MCP server starts one at most every 10 minutes. Every prune also
 drops repeated and torn records and rows of an older format, so `cache prune` under the cap can
-still report rows removed: its line says how many went for each reason. `zerograph cache status` shows what it holds per model. `0` turns the cache off: nothing
-reads or writes it from then on, and `zerograph cache prune` empties what it already holds.
+still report rows removed: its line says how many went for each reason. `zerograph cache status`
+shows what it holds per model, and apart from that the bytes of shards a later release wrote or
+nothing can read, which count against the cap too. `0` turns the cache off: nothing reads or
+writes it from then on, and `zerograph cache prune` empties what it already holds.
 
-An `ask` looks rows up only while they fall in at most 32 of the cache's shards, since it reads
-each one whole before its budget is weighed; rows past that are left to the refresh it starts.
+An `ask` reads at most 32 of the cache's shards, those holding the most of its rows first, since
+it reads each one whole before its budget is weighed. When it had to leave some unread it embeds
+nothing itself: the rows still owed are left to the refresh it starts, which looks them up first.
 
 `ZEROGRAPH_VECTOR_CACHE` points one run at another directory, which must be absolute. On Unix
-every directory above it must belong to the user or root and be writable by nobody else unless it
-has the sticky bit, as `/tmp` does. On Windows it must sit under `%LOCALAPPDATA%`, because Windows
+every directory above it, as spelled and where its links lead, must belong to the user, or to root
+and be writable by nobody else unless it has the sticky bit, as `/tmp` does. On Windows it must sit under `%LOCALAPPDATA%`, because Windows
 does not check who owns the directory. An
 override that breaks either rule turns the cache off for that run and says so once on stderr.
 

@@ -17,7 +17,7 @@
 
 use anyhow::{Context, Result};
 use std::collections::{HashMap, HashSet};
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
 
 const MAGIC: &[u8; 8] = b"ZGVCACHE";
@@ -53,6 +53,16 @@ pub struct VectorCache { root: PathBuf, max: u64, detached: bool }
 #[derive(Debug, PartialEq)]
 pub struct Usage { pub model: String, pub revision: String, pub dims: usize, pub rows: u64, pub bytes: u64, pub current: bool }
 
+/// What `status` read: each model's directory, and the bytes of shards this build cannot
+/// describe — a later format, or no header at all — which the cap still weighs.
+#[derive(Debug, PartialEq)]
+pub struct Status { pub models: Vec<Usage>, pub other: u64 }
+
+impl Status {
+    /// Every byte the cap is weighed against, as `bytes` counts them.
+    pub fn bytes(&self) -> u64 { self.models.iter().map(|u| u.bytes).sum::<u64>() + self.other }
+}
+
 /// What a prune dropped, by why: past the cap (`evicted`), a second record of a key or one no
 /// reader returns (`repeated`), or a shard of an earlier format (`older`).
 #[derive(Debug, Default, PartialEq)]
@@ -83,8 +93,10 @@ pub fn default_root() -> Result<PathBuf> {
         let overridden = named.is_some();
         let root = root_from(named, platform, None)?;
         // The platform root sits in the user's home; an override can sit anywhere.
-        if overridden { crate::store::refuse_shared_ancestors(&root)?; }
-        Ok(root)
+        match overridden {
+            true => crate::store::refuse_shared_ancestors(&root),
+            false => Ok(root),
+        }
     }
 }
 
@@ -312,24 +324,29 @@ impl VectorCache {
     /// Rows for as many of the `wanted` hex text hashes as the cache holds under `model` at
     /// `revision` and `dims`.
     pub fn get(&self, model: &str, revision: &str, dims: usize, wanted: &[&str]) -> HashMap<String, Vec<f32>> {
-        self.get_at(model, revision, dims, wanted, None, now_minutes())
+        self.get_at(model, revision, dims, wanted, None, now_minutes()).0
     }
 
-    /// `get`, or nothing at all when the wanted rows fall in more than `shards` shards. Each shard
-    /// is read whole, so a reader that owes a pull's worth of rows would otherwise read most of
-    /// the cache before its budget is weighed; those rows are left to the refresh it starts.
-    pub fn get_within(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: usize) -> HashMap<String, Vec<f32>> {
+    /// `get` over at most `shards` of the shards the wanted rows fall in, those holding the most
+    /// of them first, and whether any were left unread. Each shard is read whole, so a reader that
+    /// owes a pull's worth of rows would otherwise read most of the cache before its budget is
+    /// weighed; the rows in the shards left unread are the refresh's to look up.
+    pub fn get_within(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: usize) -> (HashMap<String, Vec<f32>>, bool) {
         self.get_at(model, revision, dims, wanted, Some(shards), now_minutes())
     }
 
-    fn get_at(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: Option<usize>, now: u32) -> HashMap<String, Vec<f32>> {
+    fn get_at(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: Option<usize>, now: u32) -> (HashMap<String, Vec<f32>>, bool) {
         let mut found = HashMap::new();
-        if dims == 0 || model.is_empty() { return found; }
+        if dims == 0 || model.is_empty() { return (found, false); }
         let layout = Layout::new(model, revision, dims);
         let dir = self.root.join(layout.dir_name());
         let mut by_shard: HashMap<String, HashSet<[u8; KEY]>> = HashMap::new();
         for k in wanted.iter().filter_map(|h| key_of(h)) { by_shard.entry(shard_of(&k)).or_default().insert(k); }
-        if shards.is_some_and(|most| by_shard.len() > most) { return found; }
+        let mut by_shard: Vec<(String, HashSet<[u8; KEY]>)> = by_shard.into_iter().collect();
+        by_shard.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
+        let most = shards.unwrap_or(usize::MAX);
+        let cut = by_shard.len() > most;
+        by_shard.truncate(most);
         for (shard, mut keys) in by_shard {
             let path = dir.join(format!("{shard}.rows"));
             // Read-write for the touch below; a shard that will not open so still reads.
@@ -349,7 +366,7 @@ impl VectorCache {
             // and one lost to a prune's rename only leaves the row a little older.
             for at in stale { let _ = write_at(&f, (at + KEY) as u64, &now.to_le_bytes()); }
         }
-        found
+        (found, cut)
     }
 
     /// Appends `rows` — hex text hash and vector — under `model` at `revision` and `dims`, then
@@ -417,12 +434,16 @@ impl VectorCache {
     /// whole, so a torn, corrupt or repeated record is not counted as a row; its bytes still are.
     /// A directory of an earlier format is listed with `current` false and its whole records as
     /// rows: nothing reads them, and the next prune drops them.
-    pub fn status(&self) -> Vec<Usage> {
+    pub fn status(&self) -> Status {
         let mut out = Vec::new();
+        let mut other = 0;
         for dir in self.model_dirs() {
             let mut usage: Option<Usage> = None;
             for shard in Self::shards(&dir) {
-                let Ok(bytes) = open(&shard, false, false).and_then(|mut f| read_all(&mut f)) else { continue };
+                let Ok(bytes) = open(&shard, false, false).and_then(|mut f| read_all(&mut f)) else {
+                    other += std::fs::symlink_metadata(&shard).map_or(0, |m| m.len());
+                    continue;
+                };
                 let (model, revision, dims, rows, current) = match read_header(&bytes) {
                     Header::Current(layout) => {
                         let mut keys = HashSet::new();
@@ -432,7 +453,7 @@ impl VectorCache {
                         (layout.model, layout.revision, layout.dims, rows, true)
                     }
                     Header::Older { model, dims, rows } => (model, String::new(), dims, rows, false),
-                    Header::Newer | Header::Garbage => continue,
+                    Header::Newer | Header::Garbage => { other += bytes.len() as u64; continue }
                 };
                 let u = usage.get_or_insert(Usage { model, revision, dims, rows: 0, bytes: 0, current });
                 u.rows += rows;
@@ -440,7 +461,7 @@ impl VectorCache {
             }
             out.extend(usage);
         }
-        out
+        Status { models: out, other }
     }
 
     /// Trims the cache to `target` bytes, least recently used first. On the way it drops every
@@ -603,11 +624,12 @@ fn make_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `records` appended to one shard under its lock. A shard that does not start with this layout's
-/// header — new or garbage — is started over; a torn tail a crash left is cut back to the last
-/// whole record first, or every record after it would be read out of step. A shard whose header
-/// names another format is left alone and nothing is appended: it is not this build's to rewrite.
-/// Returns the shard's length before and after.
+/// `records` appended to one shard under its lock, less those whose key the shard already holds
+/// as a whole record: another checkout may have embedded the same text since this one looked.
+/// A shard that does not start with this layout's header — new or garbage — is started over; a
+/// torn tail a crash left is cut back to the last whole record first, or every record after it
+/// would be read out of step. A shard whose header names another format is left alone and nothing
+/// is appended: it is not this build's to rewrite. Returns the shard's length before and after.
 fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<(u64, u64)> {
     let _guard = lock_shard(dir, shard)?;
     let path = dir.join(format!("{shard}.rows"));
@@ -629,8 +651,19 @@ fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<(u
         }
     };
     if at != len { f.set_len(at).with_context(|| format!("truncate {}", path.display()))?; }
-    write_at(&f, at, records).with_context(|| format!("write {}", path.display()))?;
-    Ok((len, at + records.len() as u64))
+    let fresh = match fits {
+        true => {
+            f.seek(std::io::SeekFrom::Start(0)).with_context(|| format!("seek {}", path.display()))?;
+            let bytes = read_all(&mut f).with_context(|| format!("read {}", path.display()))?;
+            let held: HashSet<&[u8]> = layout.records(&bytes)
+                .filter(|(_, rec)| layout.row_of(rec).is_some())
+                .map(|(_, rec)| &rec[..KEY]).collect();
+            records.chunks(layout.record_len()).filter(|rec| !held.contains(&rec[..KEY])).flatten().copied().collect()
+        }
+        false => records.to_vec(),
+    };
+    write_at(&f, at, &fresh).with_context(|| format!("write {}", path.display()))?;
+    Ok((len, at + fresh.len() as u64))
 }
 
 #[cfg(test)]
@@ -750,7 +783,7 @@ mod tests {
         c.put_at("m", REV, 2, &[(&old, &[1.0, 0.0])], 1_000).unwrap();
         c.put_at("m", REV, 2, &[(&mid, &[0.0, 1.0])], 2_000).unwrap();
         c.put_at("m", REV, 2, &[(&new, &[1.0, 1.0])], 3_000).unwrap();
-        assert_eq!(c.get_at("m", REV, 2, &[&old], None, 4_000).len(), 1);
+        assert_eq!(c.get_at("m", REV, 2, &[&old], None, 4_000).0.len(), 1);
         let header = Layout::new("m", REV, 2).header().len() as u64;
         let rec = Layout::new("m", REV, 2).record_len() as u64;
         let pruned = c.prune(2 * rec + 3 * header).unwrap();
@@ -792,7 +825,9 @@ mod tests {
         let (_d, c) = cache();
         c.put("org/A", REV, 2, &[(&hash(1, 1), &[1.0, 0.0]), (&hash(2, 2), &[1.0, 0.0])]).unwrap();
         c.put("org/b", REV, 3, &[(&hash(1, 1), &[1.0, 0.0, 0.0])]).unwrap();
-        let mut s = c.status();
+        let status = c.status();
+        assert_eq!((status.other, status.bytes()), (0, c.bytes()));
+        let mut s = status.models;
         s.sort_by(|a, b| a.model.cmp(&b.model));
         let l = Layout::new("org/a", REV, 2);
         assert_eq!(s[0], Usage { model: "org/a".into(), revision: REV.into(), dims: 2, rows: 2, bytes: 2 * (l.header().len() + l.record_len()) as u64, current: true });
@@ -811,25 +846,39 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_lookup_reads_nothing_past_its_shard_count() {
+    fn a_bounded_lookup_reads_its_fullest_shards_and_says_it_left_the_rest() {
         let (_d, c) = cache();
-        let rows: Vec<String> = (0..5u32).map(|i| hash(i as u8, i)).collect();
+        // Shard 3 holds two of the wanted rows, shards 1, 2 and 4 one each.
+        let rows: Vec<String> = [(1, 0), (2, 1), (3, 2), (3, 3), (4, 4)].iter().map(|&(s, n)| hash(s, n)).collect();
         let pairs: Vec<(&str, &[f32])> = rows.iter().map(|h| (h.as_str(), &[1.0f32, 0.0][..])).collect();
         c.put("m", REV, 2, &pairs).unwrap();
         let wanted: Vec<&str> = rows.iter().map(String::as_str).collect();
-        assert!(c.get_within("m", REV, 2, &wanted, 4).is_empty(), "five shards are past a bound of four");
-        assert_eq!(c.get_within("m", REV, 2, &wanted, 5).len(), 5);
-        assert_eq!(c.get_within("m", REV, 2, &wanted[..2], 4).len(), 2);
+        let (found, cut) = c.get_within("m", REV, 2, &wanted, 2);
+        assert!(cut, "four shards are past a bound of two");
+        let mut got: Vec<&str> = found.keys().map(String::as_str).collect();
+        got.sort();
+        let mut first = vec![rows[2].as_str(), rows[3].as_str(), rows[0].as_str()];
+        first.sort();
+        assert_eq!(got, first, "the shard holding the most wanted rows is read first, then the lowest named");
+        assert_eq!(c.get_within("m", REV, 2, &wanted, 4), (c.get("m", REV, 2, &wanted), false));
+        assert_eq!(c.get_within("m", REV, 2, &wanted, 4).0.len(), 5);
     }
 
     #[test]
-    fn a_key_given_twice_is_stored_once_and_a_repeat_is_pruned_as_one() {
+    fn a_key_already_held_is_never_stored_again_and_a_repeat_is_pruned_as_one() {
         let (_d, c) = cache();
         let h = hash(8, 1);
         c.put("m", REV, 2, &[(&h, &[1.0, 0.0]), (&h, &[1.0, 0.0])]).unwrap();
         let l = Layout::new("m", REV, 2);
         assert_eq!(c.bytes(), (l.header().len() + l.record_len()) as u64, "one record for one key");
         c.put("m", REV, 2, &[(&h, &[1.0, 0.0])]).unwrap();
+        assert_eq!(c.bytes(), (l.header().len() + l.record_len()) as u64, "a later put of a held key writes nothing");
+        // A repeat from a release that did not check what the shard held.
+        let path = shard_file(&c, "m", 2, 8);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let rec = bytes[l.header().len()..].to_vec();
+        bytes.extend(rec);
+        std::fs::write(&path, bytes).unwrap();
         let p = c.prune(u64::MAX).unwrap();
         assert_eq!((p.evicted, p.repeated, p.older), (0, 1, 0), "under the cap only the repeat goes");
         assert_eq!(c.get("m", REV, 2, &[&h]).len(), 1);
@@ -859,7 +908,11 @@ mod tests {
         newer.extend_from_slice(&(VERSION + 1).to_le_bytes());
         newer.extend_from_slice(&[7; 40]);
         std::fs::write(later.join("020.rows"), &newer).unwrap();
-        let s = c.status();
+        std::fs::write(later.join("030.rows"), b"not a shard").unwrap();
+        let status = c.status();
+        assert_eq!(status.other, (newer.len() + 11) as u64, "a later format and garbage are weighed apart");
+        assert_eq!(status.bytes(), c.bytes(), "and with the rest against the cap");
+        let s = status.models;
         assert_eq!(s.len(), 1, "a later format is not this build's to describe: {s:?}");
         assert_eq!((s[0].rows, s[0].current), (3, false));
         c.put("m", REV, 2, &[(&hash(2, 9), &[1.0, 0.0])]).unwrap();
@@ -868,6 +921,7 @@ mod tests {
         assert_eq!((p.older, p.rows()), (3, 3));
         assert!(!old.exists());
         assert_eq!(std::fs::read(later.join("020.rows")).unwrap(), newer, "nor does a prune remove it");
+        assert!(!later.join("030.rows").exists(), "garbage is removed");
     }
 
     #[cfg(unix)]

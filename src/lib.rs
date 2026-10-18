@@ -759,15 +759,17 @@ fn cache_command(action: CacheAction) -> anyhow::Result<String> {
 }
 
 fn cache_status(cache: &index::cache::VectorCache) -> String {
-    let usage = cache.status();
-    let total: u64 = usage.iter().map(|u| u.bytes).sum();
-    let mut out = format!("cache: {} — {} of {}\n", cache.root().display(), size(total), size(cache.max()));
-    for u in usage {
+    let status = cache.status();
+    let mut out = format!("cache: {} — {} of {}\n", cache.root().display(), size(status.bytes()), size(cache.max()));
+    for u in status.models {
         let at = match u.current {
             true => format!("revision {}", terminal_safe(&u.revision)),
             false => "an older format, dropped by the next prune".to_string(),
         };
         out.push_str(&format!("  {}@{} ({at}): {} rows, {}\n", terminal_safe(&u.model), u.dims, u.rows, size(u.bytes)));
+    }
+    if status.other > 0 {
+        out.push_str(&format!("  other formats (a later release's, or unreadable): {}\n", size(status.other)));
     }
     out
 }

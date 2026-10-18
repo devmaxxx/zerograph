@@ -58,6 +58,9 @@ pub struct DenseIndex {
     /// Set by `take_cached`, so the sync that follows it does not ask the cache a second time
     /// for rows it was just asked for and did not hold.
     #[serde(skip)] looked_up: bool,
+    /// Set by `take_cached` when its bounded lookup left shards unread, whose rows the cache may
+    /// hold: they are the refresh's to look up, not this reader's to embed.
+    #[serde(skip)] lookup_cut: bool,
 }
 
 /// Every text embedded for a node, e5-prefixed. A file has no passage row — its head comment is
@@ -271,7 +274,7 @@ impl DenseIndex {
         self.revision = revision.to_string();
     }
 
-    /// Caps a cache lookup at `shards` shards; past it the lookup returns nothing.
+    /// Caps a cache lookup at `shards` shards; the rows in the shards past it are not looked up.
     pub fn bound_cache(&mut self, shards: usize) { self.cache_shards = Some(shards); }
 
     pub fn load(store: &Store) -> Result<DenseIndex> {
@@ -363,8 +366,9 @@ impl DenseIndex {
             }
         }
         let hashes: Vec<String> = todo.iter().map(|(_, h)| h.clone()).collect();
-        let lent = self.cached(&hashes);
+        let (lent, cut) = self.cached(&hashes);
         self.looked_up = true;
+        self.lookup_cut = cut;
         if lent.is_empty() { return 0; }
         if self.dim == 0 { self.ids.clear(); self.hashes.clear(); self.kinds.clear(); self.vectors.clear(); self.free.clear(); self.persisted = 0; }
         self.dim = self.claimed_dim;
@@ -380,6 +384,9 @@ impl DenseIndex {
         self.reindex();
         taken
     }
+
+    /// Whether the last `take_cached` left rows unlooked-up past its shard bound.
+    pub fn lookup_cut(&self) -> bool { self.lookup_cut }
 
     /// The index in hand made searchable again after a sync its callback stopped: the rows that
     /// sync appended join the scan beside the ones they will replace, which is the state a
@@ -434,7 +441,7 @@ impl DenseIndex {
         }
         let lent = match std::mem::take(&mut self.looked_up) {
             true => Default::default(),
-            false => self.cached(&todo_hashes),
+            false => self.cached(&todo_hashes).0,
         };
         if !lent.is_empty() {
             // A cold index learns its width here rather than from a first chunk; a warm one already
@@ -498,18 +505,18 @@ impl DenseIndex {
     /// vector is a function of the model and the text alone, so such a row is the one this sync
     /// would embed — near-identical rather than bit-identical, since batch padding moves the last
     /// digits.
-    fn cached(&self, wanted: &[String]) -> std::collections::HashMap<String, Vec<f32>> {
+    fn cached(&self, wanted: &[String]) -> (std::collections::HashMap<String, Vec<f32>>, bool) {
         let Some(cache) = self.cache.as_ref().filter(|_| self.claimed_dim > 0 && !wanted.is_empty()) else { return Default::default() };
         let asked: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        let found = match self.cache_shards {
+        let (found, cut) = match self.cache_shards {
             Some(shards) => cache.get_within(&self.model, &self.revision, self.claimed_dim, &asked, shards),
-            None => cache.get(&self.model, &self.revision, self.claimed_dim, &asked),
+            None => (cache.get(&self.model, &self.revision, self.claimed_dim, &asked), false),
         };
         if !found.is_empty() {
             let rows = wanted.iter().filter(|h| found.contains_key(h.as_str())).count();
             eprintln!("dense: {rows} rows from the vector cache");
         }
-        found
+        (found, cut)
     }
 
     /// Rows this process just embedded, written through to the cache — the one place anything
@@ -1095,7 +1102,7 @@ mod tests {
         let mut cached = vec![1.0, 2.0, 5.0];
         normalise(&mut cached);
         assert_eq!(row(&idx, "FR-PAY-26"), cached, "the first checkout's vector, not a fresh embed");
-        let held: u64 = cache.status().iter().map(|u| u.rows).sum();
+        let held: u64 = cache.status().models.iter().map(|u| u.rows).sum();
         assert_eq!(held, 3, "a row read back from the cache is not written to it again");
     }
 
@@ -1119,7 +1126,7 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_reader_takes_nothing_from_a_lookup_past_its_bound() {
+    fn a_bounded_reader_is_told_its_lookup_was_cut_short() {
         let (_c, cache) = machine_cache();
         checkout(&cache, &graph("x"), "m", constant);
         let g = graph("отмена другая");
@@ -1129,7 +1136,11 @@ mod tests {
         idx.bound_cache(0);
         idx.written_by("m", 3);
         assert_eq!(idx.take_cached(&g, &EmbedSkip::default()), 0, "the rows are left to the refresh");
+        assert!(idx.lookup_cut(), "and the reader is told so, rather than embedding them itself");
         assert_eq!(idx.owed(&g, &EmbedSkip::default()), 2);
+        idx.bound_cache(32);
+        assert_eq!(idx.take_cached(&g, &EmbedSkip::default()), 1, "inside its bound the cached row is lent");
+        assert!(!idx.lookup_cut());
     }
 
     #[test]
@@ -1168,7 +1179,7 @@ mod tests {
         idx.use_cache(Some(cache.clone()), "r");
         idx.written_by("m", 3);
         assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap(), 0);
-        assert!(cache.status().is_empty(), "a store's own rows never reach the cache");
+        assert!(cache.status().models.is_empty(), "a store's own rows never reach the cache");
         assert_eq!(checkout(&cache, &graph("x"), "m", fake).2, 2, "so another checkout embeds them itself");
     }
 
