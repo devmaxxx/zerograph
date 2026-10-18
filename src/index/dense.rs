@@ -48,6 +48,10 @@ pub struct DenseIndex {
     /// The machine's vector cache, which a sync asks before it embeds and writes every embedded
     /// row through to. `None` — a test, or a cache turned off or refused — embeds everything.
     #[serde(skip)] cache: Option<super::cache::VectorCache>,
+    /// The commit the model's files were fetched at, which the cache keys rows by beside the id.
+    #[serde(skip)] revision: String,
+    /// How many of the cache's shards one lookup may read, when a reader set a bound.
+    #[serde(skip)] cache_shards: Option<usize>,
     /// The width `written_by` claimed. A cold index has no width until its first chunk is
     /// embedded, and a cached row has to be looked up at one before that.
     #[serde(skip)] claimed_dim: usize,
@@ -260,8 +264,15 @@ impl DenseIndex {
         self.claimed_dim = dim;
     }
 
-    /// Attaches the vector cache a sync asks and writes through to.
-    pub fn use_cache(&mut self, cache: Option<super::cache::VectorCache>) { self.cache = cache; }
+    /// Attaches the vector cache a sync asks and writes through to, for the model files fetched at
+    /// `revision`.
+    pub fn use_cache(&mut self, cache: Option<super::cache::VectorCache>, revision: &str) {
+        self.cache = cache;
+        self.revision = revision.to_string();
+    }
+
+    /// Caps a cache lookup at `shards` shards; past it the lookup returns nothing.
+    pub fn bound_cache(&mut self, shards: usize) { self.cache_shards = Some(shards); }
 
     pub fn load(store: &Store) -> Result<DenseIndex> {
         let Some(meta) = store.read_bytes("vectors.json")? else { return Ok(DenseIndex::default()) };
@@ -490,7 +501,10 @@ impl DenseIndex {
     fn cached(&self, wanted: &[String]) -> std::collections::HashMap<String, Vec<f32>> {
         let Some(cache) = self.cache.as_ref().filter(|_| self.claimed_dim > 0 && !wanted.is_empty()) else { return Default::default() };
         let asked: Vec<&str> = wanted.iter().map(String::as_str).collect();
-        let found = cache.get(&self.model, self.claimed_dim, &asked);
+        let found = match self.cache_shards {
+            Some(shards) => cache.get_within(&self.model, &self.revision, self.claimed_dim, &asked, shards),
+            None => cache.get(&self.model, &self.revision, self.claimed_dim, &asked),
+        };
         if !found.is_empty() {
             let rows = wanted.iter().filter(|h| found.contains_key(h.as_str())).count();
             eprintln!("dense: {rows} rows from the vector cache");
@@ -506,7 +520,7 @@ impl DenseIndex {
         let rows: Vec<(&str, &[f32])> = hashes.iter().zip(vecs)
             .filter(|(_, v)| v.len() == self.claimed_dim)
             .map(|(h, v)| (h.as_str(), v.as_slice())).collect();
-        if let Err(err) = cache.put(&self.model, self.claimed_dim, &rows) {
+        if let Err(err) = cache.put(&self.model, &self.revision, self.claimed_dim, &rows) {
             super::cache::warn_once("not written", &err);
         }
     }
@@ -1058,7 +1072,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let store = Store::new(repo.path());
         let mut idx = DenseIndex::load(&store).unwrap();
-        idx.use_cache(Some(cache.clone()));
+        idx.use_cache(Some(cache.clone()), "r");
         idx.written_by(model, embed(&["passage: x".into()]).unwrap()[0].len());
         let mut seen = Vec::new();
         let n = idx.sync(g, &EmbedSkip::default(), &mut |t| { seen.extend_from_slice(t); embed(t) }).unwrap();
@@ -1092,7 +1106,7 @@ mod tests {
         let g = graph("отмена другая");
         let repo = tempfile::tempdir().unwrap();
         let mut idx = DenseIndex::load(&Store::new(repo.path())).unwrap();
-        idx.use_cache(Some(cache));
+        idx.use_cache(Some(cache), "r");
         idx.written_by("m", 3);
         assert_eq!(idx.owed(&g, &EmbedSkip::default()), 2, "before the lookup every row is owed");
         assert_eq!(idx.take_cached(&g, &EmbedSkip::default()), 1);
@@ -1102,6 +1116,32 @@ mod tests {
         assert_eq!((n, seen.len()), (1, 1), "the sync embeds exactly what the count said");
         assert_eq!(idx.owed(&g, &EmbedSkip::default()), 0);
         assert_eq!(idx.live.len(), 2, "the cached row is kept, not duplicated");
+    }
+
+    #[test]
+    fn a_bounded_reader_takes_nothing_from_a_lookup_past_its_bound() {
+        let (_c, cache) = machine_cache();
+        checkout(&cache, &graph("x"), "m", constant);
+        let g = graph("отмена другая");
+        let repo = tempfile::tempdir().unwrap();
+        let mut idx = DenseIndex::load(&Store::new(repo.path())).unwrap();
+        idx.use_cache(Some(cache), "r");
+        idx.bound_cache(0);
+        idx.written_by("m", 3);
+        assert_eq!(idx.take_cached(&g, &EmbedSkip::default()), 0, "the rows are left to the refresh");
+        assert_eq!(idx.owed(&g, &EmbedSkip::default()), 2);
+    }
+
+    #[test]
+    fn a_row_cached_under_another_revision_is_never_taken() {
+        let (_c, cache) = machine_cache();
+        checkout(&cache, &graph("x"), "m", constant);
+        let g = graph("x");
+        let repo = tempfile::tempdir().unwrap();
+        let mut idx = DenseIndex::load(&Store::new(repo.path())).unwrap();
+        idx.use_cache(Some(cache), "another-commit");
+        idx.written_by("m", 3);
+        assert_eq!(idx.take_cached(&g, &EmbedSkip::default()), 0);
     }
 
     #[test]
@@ -1125,7 +1165,7 @@ mod tests {
         planted.sync(&graph("x"), &EmbedSkip::default(), &mut constant).unwrap();
         planted.save(&store).unwrap();
         let mut idx = DenseIndex::load(&store).unwrap();
-        idx.use_cache(Some(cache.clone()));
+        idx.use_cache(Some(cache.clone()), "r");
         idx.written_by("m", 3);
         assert_eq!(idx.sync(&graph("x"), &EmbedSkip::default(), &mut fake).unwrap(), 0);
         assert!(cache.status().is_empty(), "a store's own rows never reach the cache");
@@ -1139,7 +1179,7 @@ mod tests {
         let before = cache.status();
         let repo = tempfile::tempdir().unwrap();
         let mut idx = DenseIndex::load(&Store::new(repo.path())).unwrap();
-        idx.use_cache(Some(cache.clone()));
+        idx.use_cache(Some(cache.clone()), "r");
         assert_eq!(idx.sync(&graph("отмена другая"), &EmbedSkip::default(), &mut fake).unwrap(), 2);
         assert_eq!(cache.status(), before);
     }
@@ -1151,7 +1191,7 @@ mod tests {
         let repo = tempfile::tempdir().unwrap();
         let store = Store::new(repo.path());
         let mut idx = DenseIndex::load(&store).unwrap();
-        idx.use_cache(Some(cache));
+        idx.use_cache(Some(cache), "r");
         idx.written_by("m", 3);
         let mut saves = 0;
         let n = idx.sync_chunked(&graph("отмена другая"), &EmbedSkip::default(), &mut fake, ChunkBudget::rows(1), &mut |idx, p| {

@@ -130,6 +130,27 @@ pub(crate) fn prepare_private_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Refuses `dir` when another user could move it: an ancestor that is neither this user's nor
+/// root's, or one that others may write without the sticky bit, lets them rename the path away and
+/// put their own directory in its place after `prepare_private_dir` has checked it. Ancestors
+/// that do not exist yet are made by this user and so are not asked about.
+#[cfg(unix)]
+pub(crate) fn refuse_shared_ancestors(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    for above in dir.ancestors().skip(1) {
+        let Ok(meta) = std::fs::metadata(above) else { continue };
+        let mode = meta.permissions().mode();
+        let owned = meta.uid() == me || meta.uid() == 0;
+        let shared = mode & 0o022 != 0 && mode & 0o1000 == 0;
+        if !owned || shared {
+            anyhow::bail!("{} sits under {}, which another user can change", dir.display(), above.display());
+        }
+    }
+    Ok(())
+}
+
 /// The profile directory's own ACL is what keeps others out on Windows; all that is owed here is
 /// a directory, and never one reached through a reparse point.
 #[cfg(not(unix))]
@@ -538,6 +559,24 @@ const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 mod tests {
     use super::*;
     use crate::model::{EdgeKind, Extraction, NodeKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_under_one_others_can_write_is_refused_unless_it_is_sticky() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let shared = home.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        let cache = shared.join("zerograph").join("vectors");
+        refuse_shared_ancestors(&cache).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(refuse_shared_ancestors(&cache).is_err(), "anyone may rename it away");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o1777)).unwrap();
+        refuse_shared_ancestors(&cache).unwrap();
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(refuse_shared_ancestors(&cache).is_err(), "a group may too");
+        std::fs::set_permissions(&shared, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
 
     #[test]
     fn the_store_ignores_itself_so_a_commit_of_everything_leaves_it_out() {

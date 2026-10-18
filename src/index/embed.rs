@@ -108,6 +108,7 @@ pub struct Embedder {
     cache_inputs: Vec<(String, usize, usize)>,
     profile: Profile,
     name: String,
+    snapshot: String,
     dim: Option<usize>,
 }
 
@@ -405,6 +406,21 @@ fn fetch_from(cache: &Path, endpoint: Option<&str>, model: &str) -> Result<Files
     Ok(Files { model, tokenizer, pad_token, pad_id })
 }
 
+/// The hub commit a model's files were fetched at. The hub client keeps each fetch under
+/// `snapshots/<commit>/`, so a model that follows `main` lands in a new directory when its
+/// weights move. A file found anywhere else is named by its length and modification time.
+fn snapshot_of(model: &Path) -> String {
+    let commit = model.ancestors().skip(1)
+        .find(|d| d.parent().and_then(Path::file_name).is_some_and(|n| n == "snapshots"))
+        .and_then(Path::file_name).and_then(|n| n.to_str());
+    if let Some(c) = commit { return c.to_string(); }
+    let meta = std::fs::metadata(model).ok();
+    let len = meta.as_ref().map_or(0, |m| m.len());
+    let mtime = meta.and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map_or(0, |d| d.as_nanos());
+    format!("file-{}", &blake3::hash(format!("{len}:{mtime}").as_bytes()).to_hex()[..16])
+}
+
 fn load_tokenizer(files: &Files) -> Result<Tokenizer> {
     let mut tk = Tokenizer::from_file(&files.tokenizer).map_err(|e| anyhow!("{e}"))?;
     tk.with_truncation(Some(TruncationParams { max_length: MAX_TOKENS, ..Default::default() })).map_err(|e| anyhow!("{e}"))?;
@@ -548,11 +564,15 @@ impl Embedder {
             })
             .collect::<Result<Vec<_>>>()?;
         let (wants_type_ids, wants_position_ids) = (wants("token_type_ids"), wants("position_ids"));
-        Ok(Embedder { session, tokenizer, wants_type_ids, wants_position_ids, cache_inputs, profile: profile(model), name: model.to_string(), dim: None })
+        let snapshot = snapshot_of(&files.model);
+        Ok(Embedder { session, tokenizer, wants_type_ids, wants_position_ids, cache_inputs, profile: profile(model), name: model.to_string(), snapshot, dim: None })
     }
 
     /// The hub id the vectors this embedder writes belong to; recorded in the store by `written_by`.
     pub fn name(&self) -> &str { &self.name }
+
+    /// The commit this embedder's files were fetched at; the vector cache keys rows by it.
+    pub fn snapshot(&self) -> &str { &self.snapshot }
 
     /// The width of the vectors this model gives. Only a forward pass knows it, so one short
     /// string is embedded and the answer kept: a caller comparing the model against a store's
@@ -1043,6 +1063,18 @@ mod fetch_tests {
         assert!(files.model.ends_with("onnx/model.onnx"));
         assert_eq!(files.pad_token, "<pad>");
         assert_eq!(files.pad_id, 1);
+        assert_eq!(snapshot_of(&files.model), revision(UNNAMED_MODEL).unwrap(), "the commit the files were fetched at");
+    }
+
+    #[test]
+    fn a_model_outside_a_snapshot_is_named_by_its_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model = dir.path().join("model.onnx");
+        std::fs::write(&model, b"one").unwrap();
+        let first = snapshot_of(&model);
+        assert!(first.starts_with("file-"), "{first}");
+        std::fs::write(&model, b"other weights").unwrap();
+        assert_ne!(snapshot_of(&model), first, "new weights are another model");
     }
 
     #[test]

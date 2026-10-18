@@ -172,10 +172,11 @@ pub(crate) fn spawn_detached_logging(repo: &Path, no_dense: bool, background: bo
 }
 
 /// `zerograph --background <args>` with no repository and no output anyone reads: housekeeping
-/// that is the machine's, not a checkout's, so it has no store to log into.
-pub(crate) fn spawn_quiet(args: &[&str]) -> anyhow::Result<()> {
+/// that is the machine's, not a checkout's, so it has no store to log into. It starts in `dir`
+/// rather than in this process's directory, which may be a worktree since removed.
+pub(crate) fn spawn_quiet(dir: &Path, args: &[&str]) -> anyhow::Result<()> {
     let mut cmd = std::process::Command::new(std::env::current_exe()?);
-    cmd.arg("--background").args(args)
+    cmd.arg("--background").args(args).current_dir(dir)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());

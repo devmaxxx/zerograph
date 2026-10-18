@@ -242,7 +242,8 @@ enum CacheAction {
     /// Where the cache is, its cap, and the rows and bytes it holds per model.
     Status,
     /// Trims the cache to 80% of `vector_cache_max` (to nothing when it is 0), least recently
-    /// used first, and drops torn records.
+    /// used first. Every run also drops repeated and torn records and rows of an older format,
+    /// so a cache under its cap can still lose rows no reader would have returned.
     Prune,
 }
 
@@ -685,7 +686,7 @@ fn embed_all(repo: &std::path::Path, no_dense: bool, cfg: &config::Config) -> an
 fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Embedder, skip: &index::dense::EmbedSkip, cfg: &config::Config) -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let dim = emb.dim()?;
-    let cache = index::cache::VectorCache::machine(cfg.vector_cache_max);
+    let cache = index::cache::VectorCache::machine(cfg.vector_cache_max).map(|c| (c, emb.snapshot().to_string()));
     let n = pay_owed(repo, model, dim, skip, cache, &mut |texts, forwarded| emb.embed_with(texts, forwarded))?;
     println!("dense: embedded {n} rows in {:.1}s", t.elapsed().as_secs_f32());
     Ok(())
@@ -696,7 +697,7 @@ fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Emb
 /// graph as stored, not against what this run changed, so a dense `update` over a tree nothing
 /// moved still pays them.
 #[allow(clippy::type_complexity)]
-fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, cache: Option<index::cache::VectorCache>, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
+fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, cache: Option<(index::cache::VectorCache, String)>, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
     let store = store::Store::new(repo);
     // `embed` and a model switch write only vectors, but into a store this build may not write.
     if let Some(line) = store.newer_store_line() { anyhow::bail!("{line}"); }
@@ -704,7 +705,8 @@ fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense
     let (graph, _) = store.load()?;
     let mut dense = index::dense::DenseIndex::load(&store)?;
     dense.written_by(model, dim);
-    dense.use_cache(cache);
+    let (cache, revision) = cache.unzip();
+    dense.use_cache(cache, revision.as_deref().unwrap_or_default());
     // Taken from the cache before the count, so the meter's total is the rows this run embeds.
     dense.take_cached(&graph, skip);
     let mut meter = Meter::new(dense.owed(&graph, skip));
@@ -746,7 +748,12 @@ fn cache_command(action: CacheAction) -> anyhow::Result<String> {
         CacheAction::Status => cache_status(&cache),
         CacheAction::Prune => {
             let p = cache.prune(cache.prune_target())?;
-            format!("cache: pruned {} rows, {} -> {}\n", p.rows, size(p.before), size(p.after))
+            let mut out = format!(
+                "cache: pruned {} rows, {} -> {}: {} least recently used, {} repeated or unreadable, {} of an older format\n",
+                p.rows(), size(p.before), size(p.after), p.evicted, p.repeated, p.older,
+            );
+            if p.failed > 0 { out.push_str(&format!("cache: {} shards could not be rewritten and were left as they were\n", p.failed)); }
+            out
         }
     })
 }
@@ -756,7 +763,11 @@ fn cache_status(cache: &index::cache::VectorCache) -> String {
     let total: u64 = usage.iter().map(|u| u.bytes).sum();
     let mut out = format!("cache: {} — {} of {}\n", cache.root().display(), size(total), size(cache.max()));
     for u in usage {
-        out.push_str(&format!("  {}@{}: {} rows, {}\n", terminal_safe(&u.model), u.dims, u.rows, size(u.bytes)));
+        let at = match u.current {
+            true => format!("revision {}", terminal_safe(&u.revision)),
+            false => "an older format, dropped by the next prune".to_string(),
+        };
+        out.push_str(&format!("  {}@{} ({at}): {} rows, {}\n", terminal_safe(&u.model), u.dims, u.rows, size(u.bytes)));
     }
     out
 }
@@ -1088,6 +1099,12 @@ pub fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> anyhow::Result<()> {
     // First of all, before anything here starts a thread that would keep the old priority.
     if cli.background { priority::background_process(); }
+    // The cache is the machine's: it reads no repository, and a detached prune may start in a
+    // directory that has since been removed.
+    if let Cmd::Cache { action } = cli.cmd {
+        print!("{}", cache_command(action)?);
+        return Ok(());
+    }
     let repo = match &cli.repo {
         Some(repo) => plain(repo.canonicalize()?),
         None => repo_root(&std::env::current_dir()?.canonicalize()?),
@@ -1140,10 +1157,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 embed_all(&repo, cli.no_dense, &cfg)
             }
         }
-        Cmd::Cache { action } => {
-            print!("{}", cache_command(action)?);
-            Ok(())
-        }
+        Cmd::Cache { .. } => unreachable!("dispatched before the repository is resolved"),
         Cmd::Model { hub_id, no_embed, json } => {
             let cfg = load_cfg()?;
             cap_pools(index::embed::threads(cfg.resources));
