@@ -45,6 +45,7 @@ fp32 misses, and the reverse. Every gain is the same pair or a pair from the sam
 `~/bench/paraphrase-arm-2026-09-22/cases-wide-112.jsonl`, which no longer exists on this machine.
 `bench/history/runs.jsonl` keeps their ids, and the case texts are not in this repository. The arm
 can be read again only after those 30 cases are recovered or written again under the same gate.
+They were written again on 2026-10-18: [q4 40/60, fp32 38/60](2026-10-18-widened-arm-q4.md).
 
 ## What the readings say
 

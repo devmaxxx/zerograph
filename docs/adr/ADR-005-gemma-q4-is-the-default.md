@@ -38,6 +38,7 @@ of its own. `bench` grades either export against `Floors::Gemma`.
   since its user has already paid the download q4 saves. Naming
   `embed_model = "onnx-community/embeddinggemma-300m-ONNX:q4"` moves it. A store the small model
   wrote still moves to the default, now q4, as ADR-003 set out.
-- The widened paraphrase arm is still owed. If it shows q4 below fp32 by more than noise, this
-  decision is reversed.
+- The widened arm, written again for the same 30 targets, reads q4 40/60 against fp32 38/60
+  and level on the 30 new cases ([readings](../bench/2026-10-18-widened-arm-q4.md)). It shows
+  no loss, so the decision stands.
 - The licence is unchanged: q4 is the same model's weights under Gemma's terms.

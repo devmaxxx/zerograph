@@ -1,0 +1,112 @@
+{"kind":"keyword","q":"расход виден салону","expect":"FR-AI-138"}
+{"kind":"keyword","q":"арендатор отдельный контур","expect":"FR-VIS-80"}
+{"kind":"keyword","q":"только нативном приложении","expect":"FR-PAY-110"}
+{"kind":"keyword","q":"панели отражающие обещания","expect":"FR-APP-64"}
+{"kind":"keyword","q":"изменение любой позиции","expect":"FR-PAY-133"}
+{"kind":"keyword","q":"групповое занятие кассе","expect":"FR-PAY-54"}
+{"kind":"keyword","q":"награда выдаётся против","expect":"FR-TOOL-18"}
+{"kind":"keyword","q":"паритет поверхностей","expect":"FR-WH-05"}
+{"kind":"keyword","q":"место содержимое занято","expect":"FR-APP-02"}
+{"kind":"keyword","q":"знаний салона ассистента","expect":"FR-AI-145"}
+{"kind":"keyword","q":"зачитывается автоматически","expect":"FR-PAY-28"}
+{"kind":"keyword","q":"сигнал блокирует работу","expect":"FR-VIS-55"}
+{"kind":"keyword","q":"денежные конфликты поведение","expect":"FR-PAY-143"}
+{"kind":"keyword","q":"черновик виден черновик","expect":"FR-SVC-04"}
+{"kind":"keyword","q":"режим тренировки сотрудника","expect":"FR-LIFE-29"}
+{"kind":"keyword","q":"списание штрафа происходит","expect":"FR-PAY-26"}
+{"kind":"keyword","q":"шаблоны ролей салона","expect":"FR-VIS-35"}
+{"kind":"keyword","q":"экономика аренды","expect":"FR-PAY-82"}
+{"kind":"keyword","q":"только клиентских поверхностях","expect":"FR-APP-67"}
+{"kind":"keyword","q":"единый медиа","expect":"FR-SVC-50"}
+{"kind":"keyword","q":"внутренняя система рассмотрения","expect":"FR-SEC-44"}
+{"kind":"keyword","q":"арендатор уходит своей","expect":"FR-VIS-85"}
+{"kind":"keyword","q":"отчёты склада","expect":"FR-WH-53"}
+{"kind":"keyword","q":"подсказка расписанию двигает","expect":"FR-AI-97"}
+{"kind":"keyword","q":"как устроена выдача публикуется","expect":"FR-MKT-25"}
+{"kind":"keyword","q":"честный экран что не переезжает","expect":"FR-MIG-49"}
+{"kind":"keyword","q":"чат канал утечки контактов","expect":"FR-CRM-57"}
+{"kind":"keyword","q":"прайс аренды рабочих мест","expect":"FR-DM-128"}
+{"kind":"keyword","q":"осознанное наложение помечается навсегда","expect":"FR-CAL-43"}
+{"kind":"keyword","q":"понимает то что печатают","expect":"FR-SHELL-21"}
+{"kind":"keyword","q":"деньги и отработанная стоимость","expect":"FR-RPT-04"}
+{"kind":"keyword","q":"hreflang и мультирыночность","expect":"FR-WEB-22"}
+{"kind":"keyword","q":"рабочая локаль не показывается","expect":"FR-OPS-81"}
+{"kind":"keyword","q":"повторный найм новое членство","expect":"FR-STAFF-63"}
+{"kind":"keyword","q":"критерий готовности рыночному запуску","expect":"FR-PH-43"}
+{"kind":"keyword","q":"ведомость мастера не видна","expect":"NFR-STAFF-04"}
+{"kind":"keyword","q":"система делает сама человек отменяет","expect":"INV-19"}
+{"kind":"keyword","q":"role_id holds a role name","expect":"ADR-024"}
+{"kind":"keyword","q":"unfiscalized queue protocol adapters","expect":"BE-M11"}
+{"kind":"keyword","q":"каскадного сдвига дня нет","expect":"W-206"}
+{"kind":"paraphrase","q":"пакет платёжных бумаг за период для внешнего счетовода","expect":"FR-PAY-104"}
+{"kind":"paraphrase","q":"перечень незыблемых требований продукта, который проверяет сборка","expect":"FR-VIS-01"}
+{"kind":"paraphrase","q":"кто получатель платежа записан в документе","expect":"FR-PAY-03"}
+{"kind":"paraphrase","q":"как хранится код доступа сотрудника","expect":"FR-SEC-21"}
+{"kind":"paraphrase","q":"сколько времени держим записи кто решает","expect":"FR-AI-102"}
+{"kind":"paraphrase","q":"создать похожую услугу на основе существующей","expect":"FR-SVC-15"}
+{"kind":"paraphrase","q":"состояния задачи обратного звонка","expect":"FR-AI-66"}
+{"kind":"paraphrase","q":"кто может оценить визит после подтверждения по смс","expect":"FR-VIS-76"}
+{"kind":"paraphrase","q":"клиент должен сразу понять что говорит робот","expect":"FR-AI-21"}
+{"kind":"paraphrase","q":"выявление накрутки бонусов","expect":"FR-TOOL-22"}
+{"kind":"paraphrase","q":"как клиент получает фискальный документ","expect":"FR-PAY-49"}
+{"kind":"paraphrase","q":"бонус начисляется без участия сотрудника","expect":"FR-TOOL-18"}
+{"kind":"paraphrase","q":"прошлые визиты клиента какие услуги делали","expect":"FR-SVC-39"}
+{"kind":"paraphrase","q":"загрузить услуги из файла при регистрации","expect":"FR-LIFE-17"}
+{"kind":"paraphrase","q":"что видит посетитель каталога, если салон не хочет публиковать цену","expect":"FR-MKT-35"}
+{"kind":"paraphrase","q":"как делятся чаевые между теми, кто работал","expect":"FR-STAFF-45"}
+{"kind":"paraphrase","q":"что мешает стереть карточку клиента","expect":"FR-CRM-11"}
+{"kind":"paraphrase","q":"как сверяем итоговые числа отчёта с первичными строками","expect":"FR-RPT-13"}
+{"kind":"paraphrase","q":"можно ли оплатить сертификат в подарок другому человеку","expect":"FR-WEB-34"}
+{"kind":"paraphrase","q":"видит ли наш оператор переписку и визиты чужого бизнеса","expect":"FR-OPS-24"}
+{"kind":"paraphrase","q":"учитываются ли польские выходные и перевод стрелок","expect":"FR-CAL-06"}
+{"kind":"paraphrase","q":"как отдаём освободившееся окно тому, кто ждёт","expect":"FR-CAL-101"}
+{"kind":"paraphrase","q":"что будет, если нажать F5 или стрелку назад","expect":"FR-SHELL-52"}
+{"kind":"paraphrase","q":"что делаем с кривыми телефонными номерами из чужой выгрузки","expect":"FR-MIG-17"}
+{"kind":"paraphrase","q":"в каких полях сущности отмечено, что она ещё не ушла на сервер","expect":"FR-DM-66"}
+{"kind":"paraphrase","q":"как понять, что тюбик просрочен, и какую упаковку тратить первой","expect":"FR-WH-18"}
+{"kind":"paraphrase","q":"чем отличается момент на шкале от времени на стене","expect":"ADR-005"}
+{"kind":"paraphrase","q":"в каком виде храним суммы, чтобы не терять копейки","expect":"ADR-004"}
+{"kind":"paraphrase","q":"что запрещает передать сырую карточку клиента во внешнюю модель","expect":"INV-16"}
+{"kind":"paraphrase","q":"видно ли салону, из каких визитов сложилась пришедшая выплата","expect":"N-109"}
+{"kind":"code","q":"asGrosze","expect":"packages/contracts/src/money.ts"}
+{"kind":"code","q":"problemDetailsOf","expect":"packages/contracts/src/errors.ts"}
+{"kind":"code","q":"vitestBase","expect":"packages/config/vitest.base.ts"}
+{"kind":"code","q":"materialiseSegments","expect":"packages/domain/src/availability/segments.ts"}
+{"kind":"code","q":"localDayBounds","expect":"packages/domain/src/time/index.ts"}
+{"kind":"code","q":"classifyVersionalChange","expect":"packages/domain/src/sync/merge.ts"}
+{"kind":"code","q":"FiscalPort","expect":"packages/ports/src/fiscal.ts"}
+{"kind":"code","q":"resolveConnectionString","expect":"packages/db/src/connection.ts"}
+{"kind":"code","q":"loadAvailabilitySnapshot","expect":"apps/api/src/modules/availability/availability-snapshot.service.ts"}
+{"kind":"code","q":"splitByNamespace","expect":"apps/api/scripts/emit-openapi.ts"}
+{"kind":"code","q":"badgeVariants","expect":"packages/ui/src/components/ui/badge.tsx"}
+{"kind":"code","q":"staleClaims","expect":"tools/tasks/src/cli.ts"}
+{"kind": "paraphrase", "q": "какие пороги должен пройти робот, принимающий звонки, прежде чем его пустят к настоящим посетителям", "expect": "FR-AI-125"}
+{"kind": "paraphrase", "q": "может ли посетитель стереть себя или скачать свою историю без телефона, прямо с сайта", "expect": "FR-APP-09"}
+{"kind": "paraphrase", "q": "что будет с копией базы на планшете, если мастер уволился или гаджет украли", "expect": "FR-APP-41"}
+{"kind": "paraphrase", "q": "человек хочет попасть, когда освободится окошко, и называет пару удобных дней", "expect": "FR-CAL-100"}
+{"kind": "paraphrase", "q": "барбершоп, где приходят без брони и ждут, пока позовут", "expect": "FR-CAL-34"}
+{"kind": "paraphrase", "q": "пускать постоянных гостей сразу, а новых лиц проверять вручную", "expect": "FR-CAL-93"}
+{"kind": "paraphrase", "q": "незарегистрированный человек один раз не явился — что ему теперь нельзя", "expect": "FR-CRM-102"}
+{"kind": "paraphrase", "q": "на какие виды рассылок и обработки нужно отдельное разрешение человека", "expect": "FR-CRM-31"}
+{"kind": "paraphrase", "q": "от чьего имени приходят текстовые сообщения и не теряются ли польские буквы", "expect": "FR-CRM-86"}
+{"kind": "paraphrase", "q": "цифры в прайсе уже включают налог, и до какой копейки обрезать", "expect": "FR-DM-102"}
+{"kind": "paraphrase", "q": "перенесённым из другой системы людям можно ли сразу слать рекламу", "expect": "FR-DM-17"}
+{"kind": "paraphrase", "q": "ошибка в пробитом чеке — можно ли поправить его задним числом", "expect": "FR-DM-46"}
+{"kind": "paraphrase", "q": "что не забыть переключить в соцсетях и на гугл-картах, когда переезжаем к вам", "expect": "FR-MIG-53"}
+{"kind": "paraphrase", "q": "как выглядит страница салона, если он скрыт из поиска или перестал брать брони онлайн", "expect": "FR-MKT-08"}
+{"kind": "paraphrase", "q": "салон не принял заявку — что увидит человек и что ему предложат взамен", "expect": "FR-MKT-67"}
+{"kind": "paraphrase", "q": "какие типы жалоб на фальшивый салон или нечестный отзыв можно подать", "expect": "FR-MKT-89"}
+{"kind": "paraphrase", "q": "как новая надпись в интерфейсе доходит до проверки носителем языка", "expect": "FR-OPS-82"}
+{"kind": "paraphrase", "q": "гость расплатился сертификатом, кэшем и ещё абонементом за один раз", "expect": "FR-PAY-43"}
+{"kind": "paraphrase", "q": "списание краски на процедуру проставляется само по заданной норме", "expect": "FR-PAY-45"}
+{"kind": "paraphrase", "q": "при акции показывать минимальную стоимость за последний месяц по закону", "expect": "FR-SEC-46"}
+{"kind": "paraphrase", "q": "лимит трат на смс и ИИ в сутки, чтобы счёт не улетел", "expect": "FR-SEC-93"}
+{"kind": "paraphrase", "q": "чтобы мастер не начислял себе баллы липовыми записями", "expect": "FR-TOOL-20"}
+{"kind": "paraphrase", "q": "вернуть купленный через сайт абонемент в течение двух недель", "expect": "FR-TOOL-39"}
+{"kind": "paraphrase", "q": "кассир хочет сделать большую скидку — нужен ли управляющий", "expect": "FR-VIS-45"}
+{"kind": "paraphrase", "q": "за сколько должна открываться публичная страница и что ломает сборку при медленной", "expect": "FR-WEB-13"}
+{"kind": "paraphrase", "q": "оценка должна относиться к конкретному специалисту и процедуре", "expect": "N-013"}
+{"kind": "paraphrase", "q": "не тратиться на смс, если у человека стоит наша программа на телефоне", "expect": "N-019"}
+{"kind": "paraphrase", "q": "перечень процедур на родном языке для гостей из-за рубежа", "expect": "N-139"}
+{"kind": "paraphrase", "q": "конкурент берёт процент, если не успел вечером отметить, что гость не пришёл", "expect": "W-039"}
+{"kind": "paraphrase", "q": "насколько абонентская плата у главного соперника выше, чем у местных аналогов", "expect": "W-102"}
