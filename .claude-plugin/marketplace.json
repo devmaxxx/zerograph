@@ -1,0 +1,18 @@
+{
+  "name": "zerograph",
+  "description": "zerograph's Claude Code mods",
+  "owner": {
+    "name": "devmaxxx"
+  },
+  "plugins": [
+    {
+      "name": "zerograph",
+      "source": {
+        "source": "git-subdir",
+        "url": "devmaxxx/zerograph",
+        "path": "agent/claude-code",
+        "ref": "v0.6.4"
+      }
+    }
+  ]
+}
