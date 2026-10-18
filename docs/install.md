@@ -94,10 +94,9 @@ What zerograph reads from the old install:
 ## Claude Code status mod
 
 `agent/claude-code/` is a Claude Code mod that puts the index's state at the end of the line under
-the prompt, read from `zerograph status --json` every ten seconds: `◇ zerograph · in sync`, a bar
-and the time left while a refresh runs, the files behind, vectors still to embed, a warning count
-and whether `serve` answers. `/zerograph` prints the full `zerograph status` report. Install it at
-a Claude Code prompt:
+the prompt: `◇ zerograph · in sync`, a bar and the time left while a refresh runs, the files
+behind, vectors still to embed, a warning count and whether `serve` answers. `/zerograph` prints
+the full `zerograph status` report. Install it at a Claude Code prompt:
 
 ```
 /plugin install zerograph --marketplace devmaxxx/zerograph
@@ -106,6 +105,14 @@ a Claude Code prompt:
 It asks `zerograph` on `PATH`, then the project's `node_modules/.bin`, then `target/release` and
 `target/debug`; the `binary` option in `/config` names another one. A zerograph without `status`
 shows nothing on the line, and `/zerograph` falls back to the tail of `background.log`.
+
+`zerograph status --json` walks the whole tree to count the files behind, so the mod runs it at
+session start, every five minutes, once after a refresh ends and after `/zerograph`. Between those
+it reads the live state every ten seconds from the store's `background.log` (whether a refresh runs
+and how far it has got) and from the `serve` socket, at the path `status --json` names as
+`serve.socket`; a zerograph whose report has no `serve.socket` is looked for at
+`.zerograph/serve.sock`. A socket file is all the mod can see between full reports, so a server
+killed without removing its socket reads as answering until the next full report asks it.
 
 The marketplace pins the mod to a release tag and the mod carries that release's version, so it
 moves with zerograph: `claude plugin update zerograph` then `/reload-plugins` takes the mod of the
@@ -136,4 +143,4 @@ Install through npm; nothing else is required. What can still trip a Windows use
   paths even when set there.
 - **Long paths.** A tree deeper than 260 characters needs `git config core.longpaths true`.
 - **Synced folders.** Keep the repository out of OneDrive, Dropbox or Google Drive: every store
-  write is a rename the client re-uploads, and the socket is a reparse point they do not know.
+  write is a rename the client re-uploads.

@@ -3,10 +3,10 @@
 Most of a fused `ask` is the process opening things it then throws away: the embedding model
 alone costs about 220 ms of it on the shipped default. `serve` opens
 them once and answers over a Unix socket — on Windows too, where the same socket file has existed
-since Windows 10 1803 and is protected the way the repository directory is:
+since Windows 10 1803 and is protected the way your profile directory is:
 
 ```bash
-zerograph serve                  # .zerograph/serve.sock, poll every 30 s, exit after 30 min idle
+zerograph serve                  # ~/.cache/zerograph/sock/<hash>.sock, poll every 30 s, exit after 30 min idle
 zerograph serve --idle 86400     # a day rather than half an hour before it gives up
 zerograph serve --idle-model 60  # forget the model after a minute unasked; the process stays
 zerograph serve --no-dense       # lexical only; a fused `ask` is told so and answers in its own process
@@ -35,14 +35,21 @@ a 70-80 s rerank keeps its five minutes. A server that accepted the connection a
 answer — a wedged worker, a process stopped under a debugger — hands the question back as
 promptly as it does for every other request.
 
-The socket lives at `.zerograph/serve.sock` — unless that path would be longer than a Unix socket
-name may be (104 bytes on macOS, including the terminating NUL), in which case it goes in the
-temporary directory as `zerograph-<hash of the repository path>.sock`. A repository under a deep
-enough path could not run `serve` at all before that fallback, and both the server and every client
-compute the name the same way, so nothing has to be told which one is in use — the startup line
-prints it. A `serve` that is killed with `SIGTERM` or `SIGINT` takes its socket file with it,
-because it leaves through the same exit as an idle timeout, and so does one ended by `zerograph
-stop`, on every platform. On Windows a `Stop-Process` sends no signal and the file is left for the
+The socket lives at `~/.cache/zerograph/sock/<hash>.sock`, the hash taken of the repository's
+canonical path, in a directory `serve` makes private to you (mode `0700` on unix; a directory there
+that is open to others is refused). One place for every repository means every client finds it
+however deep the checkout sits and whatever `$TMPDIR` the client was started under — a shell and an
+editor's agent can disagree on that. Only when the path under your home would be longer than 100 bytes — a
+margin under the Unix socket name limit, 104 bytes on macOS including the terminating NUL — or there is no home
+directory, does it go in a private directory of yours under the temporary directory as
+`zerograph-<uid>/zerograph-<hash>.sock` (the temporary directory itself on Windows, which is already
+per-user). Server and clients compute the name the same way, so nothing has to be told which one is
+in use: the startup line prints it, `zerograph status` prints the path it checked, and `status
+--json` carries it as `serve.socket`, for a tool that looks for a server on its own.
+
+A `serve` that is killed with `SIGTERM` or `SIGINT` takes its socket file with it, because it
+leaves through the same exit as an idle timeout, and so does one ended by `zerograph stop`, on
+every platform. On Windows a `Stop-Process` sends no signal and the file is left for the
 next `serve`, which removes a dead socket before it binds.
 
 `ask` uses it without being told to and answers in this process whenever it cannot — no socket, a
@@ -54,8 +61,14 @@ is also what a live server with a full backlog gives; only `serve` removes one, 
 bound itself — told from a replacement's by device and inode on unix, by NTFS's file reference
 number on Windows.
 
-The socket name is bounded by the platform's own limit — 104 bytes on macOS, 108 elsewhere — which
-is why the fallback exists; the arithmetic of a deep Windows path, and the check that a resident
+**Upgrading from 0.6.4 or earlier.** A server started by zerograph 0.6.4 or earlier listens at the
+old place — `.zerograph/serve.sock`, or the temporary directory for a deep checkout — so a newer
+release does not find it: `ask` answers in its own process, or a new `serve` starts beside the old
+one, and the old one leaves at its own `--idle` timeout. To end it sooner, run the old binary's
+`zerograph stop`.
+
+The socket name is bounded by the platform's own limit — 104 bytes on macOS, 108 elsewhere — so
+only a very deep home directory reaches the fallback; the arithmetic of a deep Windows path, and the check that a resident
 answer is byte-identical to a cold one across all 142 recorded questions, are in
 [the measurements](history.md#the-socket-path-and-the-same-bytes-either-way).
 

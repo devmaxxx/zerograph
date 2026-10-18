@@ -6,11 +6,12 @@ export type Report = {
   vectors: { state: 'rows'; rows: number; owed: number } | { state: 'unreadable'; error: string } | null
   refresh: { state: 'none' | 'starting' | 'running' | 'unknown'; progress?: string; error?: string }
   last_run: string[]
-  serve: { running: boolean; up_secs: number | null; log: string[] }
+  // `socket` is absent from a zerograph that predates it.
+  serve: { running: boolean; socket?: string; up_secs: number | null; log: string[] }
 }
 
 declare module 'claude-code' {
   interface PluginState {
-    'zerograph': { report: Report | null }
+    'zerograph': { report: Report | null; full: { report: Report | null; takenAt: number } | null }
   }
 }

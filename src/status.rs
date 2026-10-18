@@ -87,6 +87,9 @@ pub(crate) enum Refresh {
 #[derive(Serialize)]
 pub(crate) struct Serve {
     pub running: bool,
+    /// The socket checked, which is the one `serve` binds: a reader that looks for a server on its
+    /// own takes the path from here rather than computing the name a second time.
+    pub socket: String,
     /// Seconds since the socket was bound, while one answers.
     pub up_secs: Option<u64>,
     /// `serve.log` from its last start, at most `SERVE_LINES` lines.
@@ -201,11 +204,12 @@ fn serve_state(repo: &Path) -> Serve {
     let running = serve::answering(&path);
     // The socket is bound once, at start, and never touched again, so its age is the server's.
     let up_secs = running.then(|| std::fs::symlink_metadata(&path).and_then(|m| m.modified()).ok()?.elapsed().ok().map(|d| d.as_secs())).flatten();
+    let socket = path.display().to_string();
     let log = log_tail(repo, "serve.log");
     // Lines from before a start the tail no longer holds would be read as this server's.
-    let Some(since) = log.iter().rposition(|l| serve::is_start_line(l)) else { return Serve { running, up_secs, log: vec![] } };
+    let Some(since) = log.iter().rposition(|l| serve::is_start_line(l)) else { return Serve { running, socket, up_secs, log: vec![] } };
     let tail = &log[since..];
-    Serve { running, up_secs, log: tail[tail.len().saturating_sub(SERVE_LINES)..].to_vec() }
+    Serve { running, socket, up_secs, log: tail[tail.len().saturating_sub(SERVE_LINES)..].to_vec() }
 }
 
 /// The last `LOG_TAIL` bytes of a store log, one entry per line. A meter redraws itself with a
@@ -261,9 +265,9 @@ pub(crate) fn render(r: &Report, repo: &Path, build: &str) -> String {
     });
     for line in &r.last_run { say(format!("  {line}")); }
     say(match (r.serve.running, r.serve.up_secs) {
-        (true, Some(s)) => format!("serve: answering, up {}", duration(s)),
-        (true, None) => "serve: answering".to_string(),
-        (false, _) => "serve: not running".to_string(),
+        (true, Some(s)) => format!("serve: answering, up {} ({})", duration(s), r.serve.socket),
+        (true, None) => format!("serve: answering ({})", r.serve.socket),
+        (false, _) => format!("serve: not running (nothing answers at {})", r.serve.socket),
     });
     if !r.serve.log.is_empty() {
         let log = format!("{}/serve.log", store::dir_name_of(repo));
@@ -364,7 +368,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = report(dir.path(), false).unwrap();
         assert!(matches!(r.index, Index::Empty) && matches!(r.refresh, Refresh::None) && !r.serve.running);
-        assert!(render(&r, dir.path(), "`zerograph build`").starts_with("index: empty; `zerograph build` builds it\n"));
+        let text = render(&r, dir.path(), "`zerograph build`");
+        assert!(text.starts_with("index: empty; `zerograph build` builds it\n"), "{text}");
+        assert!(text.contains(&format!("serve: not running (nothing answers at {})\n", serve::socket_path(dir.path()).display())),
+                "the report names the socket it checked: {text}");
         assert!(!store::dir_of(dir.path()).exists(), "status wrote the store directory");
     }
 
@@ -411,6 +418,7 @@ mod tests {
         let v = serde_json::to_value(report(dir.path(), false).unwrap()).unwrap();
         assert_eq!(v["refresh"]["state"], "none");
         assert_eq!(v["serve"]["running"], false);
+        assert_eq!(v["serve"]["socket"], serve::socket_path(dir.path()).display().to_string(), "the socket `serve` binds is the one checked");
         assert_eq!(v["index"]["state"], "empty");
         assert!(v["last_run"].as_array().unwrap().is_empty());
         for key in ["index", "tree", "model", "vectors", "refresh", "last_run", "serve"] {

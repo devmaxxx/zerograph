@@ -12,8 +12,10 @@ import type { Report } from '../types'
 
 export type { Report }
 
+const isMeter = (line: string) => line.startsWith('embedded ')
+
 export function warningsOf(lines: string[]): string[] {
-  return lines.filter(l => !l.startsWith('embedded ') && WARNING.test(l))
+  return lines.filter(l => !isMeter(l) && WARNING.test(l))
 }
 
 const BAR = 8
@@ -57,9 +59,48 @@ export function readRun(log: string, mtimeMs: number, now: number): Run | undefi
   const lines = all.slice(started + 1)
   return {
     isRunning: now - mtimeMs < QUIET_MS,
-    meter: [...lines].reverse().find(l => l.startsWith('embedded ')),
+    meter: [...lines].reverse().find(isMeter),
     last: lines.at(-1),
     warnings: warningsOf(lines),
     lines,
   }
+}
+
+// `status` walks the whole tree to count the files behind, so the full report is taken rarely
+// and the log and the socket, which cost a read and a stat, carry the state between.
+export const FULL_MS = 5 * 60_000
+
+// As many of the run's lines as `status` keeps in `last_run`.
+const RUN_LINES = 10
+
+export type Full = { report: Report; takenAt: number }
+export type LiveLog = { mtimeMs: number; run: Run | undefined }
+export type Live = { log?: LiveLog; socket?: { mtimeMs: number } }
+
+// A zerograph that predates `serve.socket` binds its server inside the store.
+export function socketOf(report: Report | null | undefined, store: string | undefined): string | undefined {
+  return report?.serve.socket ?? (store === undefined ? undefined : `${store}/serve.sock`)
+}
+
+// Due when none was taken, when it is old, and once after a run logged since it ended, so the
+// files behind and the vectors owed do not linger until the next interval.
+export function isFullDue(takenAt: number | undefined, now: number, log: LiveLog | undefined): boolean {
+  if (takenAt === undefined || now - takenAt >= FULL_MS) return true
+  return log !== undefined && log.mtimeMs > takenAt && !log.run?.isRunning
+}
+
+// What changed since the full report, laid over it. A log untouched since then is the one the
+// report already read, and the report also asked the writer lock, which the log's quiet cannot
+// tell from a run that works without writing. A socket bound since then is a new server; an
+// older one is the one the report asked, and only it could tell a live server from a file a
+// killed one left.
+export function overlay(full: Full, live: Live): Report {
+  const { report, takenAt } = full
+  const running = live.socket === undefined ? false : live.socket.mtimeMs > takenAt || report.serve.running
+  const serve = { ...report.serve, running }
+  if (!live.log || live.log.mtimeMs <= takenAt) return { ...report, serve }
+  const { run } = live.log
+  const refresh: Report['refresh'] = run?.isRunning ? { state: 'running', progress: run.meter ?? run.last ?? 'no output yet' } : { state: 'none' }
+  const lastRun = (run?.lines ?? []).filter(l => !isMeter(l)).slice(-RUN_LINES)
+  return { ...report, refresh, last_run: lastRun, serve }
 }
