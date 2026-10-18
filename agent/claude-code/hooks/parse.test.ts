@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { QUIET_MS, lineOf, readRun, type Report } from './parse'
+import { FULL_MS, QUIET_MS, isFullDue, lineOf, overlay, readRun, socketOf, type Report } from './parse'
 
 const base: Report = {
   index: { state: 'built', doc_nodes: 10, code_nodes: 25, edges: 183 },
@@ -54,4 +54,76 @@ test('the log fallback reads only the run after the last marker', () => {
 test('the log fallback treats a quiet log as a run that ended', () => {
   expect(readRun(LOG, 0, QUIET_MS + 1)?.isRunning).toBe(false)
   expect(readRun('embedded 1/2\n', 1000, 2000)).toBeUndefined()
+})
+
+const TAKEN = 1_000_000
+const full: Report = {
+  ...base,
+  tree: { state: 'behind', files: ['a'] },
+  vectors: { state: 'rows', rows: 35, owed: 4 },
+  refresh: { state: 'none' },
+  last_run: ['refresh: 1 changed, 0 removed'],
+  serve: { running: false, socket: '/home/u/.cache/zerograph/sock/1a2b.sock', up_secs: null, log: [] },
+}
+const RUNNING = ['refresh: started', 'refresh: 2 changed, 0 removed', 'embedded 8/40 (8.0 rows/s, ~4 s left)'].join('\n')
+
+test('a log written since the full report replaces its refresh and last run, and the rest stands', () => {
+  const now = TAKEN + 5_000
+  const log = { mtimeMs: TAKEN + 4_000, run: readRun(RUNNING, TAKEN + 4_000, now) }
+  const r = overlay({ report: full, takenAt: TAKEN }, { log, socket: { mtimeMs: TAKEN + 1_000 } })
+  expect(r.refresh).toEqual({ state: 'running', progress: 'embedded 8/40 (8.0 rows/s, ~4 s left)' })
+  expect(r.last_run).toEqual(['refresh: 2 changed, 0 removed'])
+  expect(r.serve.running).toBe(true)
+  expect(r.index).toEqual(full.index)
+  expect(r.tree).toEqual(full.tree)
+  expect(r.vectors).toEqual(full.vectors)
+  expect(r.model).toEqual(full.model)
+})
+
+test('a run that went quiet since the full report reads as none running, its lines kept', () => {
+  const ended = ['refresh: started', ...Array.from({ length: 12 }, (_, i) => `line ${i}`)].join('\n')
+  const log = { mtimeMs: TAKEN + 1, run: readRun(ended, TAKEN + 1, TAKEN + QUIET_MS + 2) }
+  const r = overlay({ report: { ...full, refresh: { state: 'running', progress: 'x' } }, takenAt: TAKEN }, { log })
+  expect(r.refresh).toEqual({ state: 'none' })
+  expect(r.last_run).toEqual(Array.from({ length: 10 }, (_, i) => `line ${i + 2}`))
+})
+
+test('a log not written since the full report leaves the report its word on the run', () => {
+  const report: Report = { ...full, refresh: { state: 'running', progress: 'walking' } }
+  const log = { mtimeMs: TAKEN - 1, run: readRun(RUNNING, TAKEN - 1, TAKEN + QUIET_MS * 2) }
+  const r = overlay({ report, takenAt: TAKEN }, { log, socket: undefined })
+  expect(r.refresh).toEqual(report.refresh)
+  expect(r.last_run).toEqual(report.last_run)
+})
+
+test('the socket reads as serving when present, unless it is the one the full report found dead', () => {
+  const at = (running: boolean) => ({ report: { ...full, serve: { ...full.serve, running } }, takenAt: TAKEN })
+  expect(overlay(at(true), {}).serve.running).toBe(false)
+  expect(overlay(at(false), { socket: { mtimeMs: TAKEN + 1 } }).serve.running).toBe(true)
+  expect(overlay(at(false), { socket: { mtimeMs: TAKEN - 1 } }).serve.running).toBe(false)
+  expect(overlay(at(true), { socket: { mtimeMs: TAKEN - 1 } }).serve.running).toBe(true)
+})
+
+test('the socket checked is the one the full report named, the store one only for a report without it', () => {
+  expect(socketOf(full, '/repo/.zerograph')).toBe('/home/u/.cache/zerograph/sock/1a2b.sock')
+  const older: Report = { ...full, serve: { running: false, up_secs: null, log: [] } }
+  expect(socketOf(older, '/repo/.zerograph')).toBe('/repo/.zerograph/serve.sock')
+  expect(socketOf(null, '/repo/.repograph')).toBe('/repo/.repograph/serve.sock')
+})
+
+test('a full check is due with none taken yet and once five minutes have passed', () => {
+  expect(isFullDue(undefined, TAKEN, undefined)).toBe(true)
+  expect(isFullDue(TAKEN, TAKEN + FULL_MS - 1, undefined)).toBe(false)
+  expect(isFullDue(TAKEN, TAKEN + FULL_MS, undefined)).toBe(true)
+  expect(FULL_MS).toBe(5 * 60_000)
+})
+
+test('a full check is due once a run logged since the last one has ended, and not while it runs', () => {
+  const now = TAKEN + 2 * QUIET_MS
+  const quiet = { mtimeMs: TAKEN + 1, run: readRun(RUNNING, TAKEN + 1, now) }
+  expect(isFullDue(TAKEN, now, quiet)).toBe(true)
+  const live = { mtimeMs: now - 1_000, run: readRun(RUNNING, now - 1_000, now) }
+  expect(isFullDue(TAKEN, now, live)).toBe(false)
+  const before = { mtimeMs: TAKEN - 1, run: readRun(RUNNING, TAKEN - 1, now) }
+  expect(isFullDue(TAKEN, now, before)).toBe(false)
 })

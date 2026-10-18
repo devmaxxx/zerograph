@@ -1,13 +1,15 @@
 import { atom, read, update } from 'claude-code'
 import type { Hook, Register } from 'claude-code'
 
-import { lineOf, readRun, type Report } from './parse'
+import { isFullDue, lineOf, overlay, readRun, socketOf, type LiveLog, type Report } from './parse'
 
-// `status` walks the tree to count the files behind, which is real work on a large repository.
+// A read of the log and a stat of the socket, cheap enough to keep the line live in every session.
 const POLL_MS = 10_000
 const SHOWN_LINES = 15
 
 const report = atom({ plugin: 'zerograph', key: 'report' } as const, null)
+// Kept apart from what the line draws, so each tick lays the live state over `status`'s own words.
+const full = atom({ plugin: 'zerograph', key: 'full' } as const, null)
 
 type Api = Parameters<Hook<'session.start'>>[0]
 
@@ -41,24 +43,65 @@ async function storeDir($: Api): Promise<string | undefined> {
   return undefined
 }
 
-async function fromLogs($: Api) {
-  const dir = await storeDir($)
-  if (!dir) return { isServing: false }
-  const log = `${dir}/background.log`
-  const isServing = await $.fs.exists(`${dir}/serve.sock`)
-  if (!(await $.fs.exists(log))) return { dir, isServing }
-  const [text, stat, now] = await Promise.all([$.fs.read(log), $.fs.stat(log), $.clock.now()])
-  return { dir, run: readRun(text, stat.mtimeMs, now), isServing }
+// A log untouched since `since` is not read: the overlay keeps the full report's reading of it.
+async function readLog($: Api, dir: string, since = -Infinity): Promise<LiveLog | undefined> {
+  const path = `${dir}/background.log`
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (!stat) return undefined
+  if (stat.mtimeMs <= since) return { mtimeMs: stat.mtimeMs, run: undefined }
+  const [text, now] = await Promise.all([$.fs.read(path), $.clock.now()])
+  return { mtimeMs: stat.mtimeMs, run: readRun(text, stat.mtimeMs, now) }
 }
 
-async function poll($: Api, configured: string): Promise<void> {
-  const json = await runStatus($, configured, true)
-  if (json) {
-    const r = JSON.parse(json) as Report
-    await update($, report, () => r)
+async function fromLogs($: Api) {
+  const dir = await storeDir($)
+  if (!dir) return {}
+  const socket = socketOf((await read($, full))?.report, dir) ?? `${dir}/serve.sock`
+  const [log, hasSocket] = await Promise.all([readLog($, dir), $.fs.exists(socket)])
+  return { dir, run: log?.run, socket, hasSocket }
+}
+
+function reportOf(json: string | undefined): Report | null {
+  if (!json) return null
+  try {
+    return JSON.parse(json) as Report
+  } catch {
+    return null
+  }
+}
+
+async function takeFull($: Api, configured: string): Promise<void> {
+  // Before `status` runs, so a socket bound or a line logged meanwhile reads as news to the overlay.
+  const takenAt = await $.clock.now()
+  const r = reportOf(await runStatus($, configured, true))
+  // Recorded even with no report, so a zerograph without `status` is asked again at the interval.
+  await update($, full, () => ({ report: r, takenAt }))
+  await update($, report, () => r)
+}
+
+// A tick that finds a full report under way skips: it would lay the live state over the one
+// being replaced.
+let isTaking = false
+
+async function tick($: Api, configured: string, isForced = false): Promise<void> {
+  if (isTaking) return
+  const [last, dir, now] = await Promise.all([read($, full), storeDir($), $.clock.now()])
+  const log = dir ? await readLog($, dir, last?.takenAt) : undefined
+  if (isForced || isFullDue(last?.takenAt, now, log)) {
+    if (isTaking) return
+    isTaking = true
+    try {
+      await takeFull($, configured)
+    } finally {
+      isTaking = false
+    }
     return
   }
-  await update($, report, () => null)
+  if (!last?.report) return
+  const path = socketOf(last.report, dir)
+  const socket = path ? await $.fs.stat(path).then(s => ({ mtimeMs: s.mtimeMs }), () => undefined) : undefined
+  const live = overlay({ report: last.report, takenAt: last.takenAt }, { log, socket })
+  if (!isTaking) await update($, report, () => live)
 }
 
 export const register: Register = (on, options) => {
@@ -69,9 +112,8 @@ export const register: Register = (on, options) => {
       name: 'zerograph',
       description: 'Show zerograph index, refresh progress, serve state and warnings',
     })
-    const tick = () => poll($, configured).catch(() => update($, report, () => null))
-    void tick()
-    $.clock.every(POLL_MS, tick)
+    void tick($, configured, true).catch(() => update($, report, () => null))
+    $.clock.every(POLL_MS, () => tick($, configured).catch(() => update($, report, () => null)))
 
     return next(e)
   })
@@ -86,11 +128,14 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'zerograph' }, async $ => {
     const text = await runStatus($, configured, false)
+    // Whoever asks for the report wants the line to agree with it.
+    void tick($, configured, true).catch(() => undefined)
     if (text) return { text: text.trimEnd() }
 
-    const { dir, run, isServing } = await fromLogs($)
+    const { dir, run, socket, hasSocket } = await fromLogs($)
     if (!dir) return { text: 'zerograph: no store in this project; `zerograph build` makes one.' }
-    const out = [`store: ${dir}`, `serve: ${isServing ? 'running (socket present)' : 'not running'}`]
+    // A file at the path is all `$` can see: one a killed server left looks the same.
+    const out = [`store: ${dir}`, `serve: ${hasSocket ? `a socket is at ${socket}, not asked whether it answers` : `not running (no socket at ${socket})`}`]
     if (!run) {
       out.push('refresh: no run logged')
     } else {
