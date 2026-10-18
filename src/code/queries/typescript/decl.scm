@@ -89,6 +89,8 @@
 
 ;; Members, of a statement at the file, behind `export` or behind `declare`, and behind both, where
 ;; `declare` keeps the class at depth 3. A class in a body starts deeper, and an anonymous default class is a `class`, which declares nothing.
+;; An interface's data property is declared as a class's field is, though nothing calls it: a props
+;; or a record interface is mostly data, and a hunk that edits one property must name that property.
 
 ((class_declaration body: (class_body [
     (method_definition name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name) @definition.method
@@ -104,7 +106,7 @@
 
 ((interface_declaration body: (interface_body [
     (method_signature name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name) @definition.method
-    (property_signature name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name type: (type_annotation (function_type))) @definition.property
+    (property_signature name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name) @definition.property
   ])) (#set! depth "2"))
 
 ((ambient_declaration [
@@ -120,7 +122,7 @@
   ]))
   (interface_declaration body: (interface_body [
     (method_signature name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name) @definition.method
-    (property_signature name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name type: (type_annotation (function_type))) @definition.property
+    (property_signature name: [(property_identifier) (private_property_identifier) (number) (string) (computed_property_name (string))] @name) @definition.property
   ]))
 ]) (#set! depth "2"))
 
