@@ -225,10 +225,24 @@ enum Cmd {
         #[arg(long, default_value_t = 300, value_parser = depth)] depth: usize,
     },
     ImportLegacy { graph_json: PathBuf },
+    /// The machine's vector cache: rows every checkout embedded, keyed by model, width and text,
+    /// so a new worktree or clone reads them instead of embedding them again.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// A stdio MCP server: `ask`, `explain`, `impact`, `trace` and `changes` as tools, plus
     /// `status` (what the index is behind by and how far a background refresh has got), `reindex`
     /// and `switch_model`. Protocol on stdout, diagnostics on stderr; `install-agent` registers it.
     Mcp,
+}
+
+#[derive(Subcommand)]
+enum CacheAction {
+    /// Where the cache is, its cap, and the rows and bytes it holds per model.
+    Status,
+    /// Trims the cache to `vector_cache_max`, least recently used first, and drops torn records.
+    Prune,
 }
 
 impl Cmd {
@@ -241,7 +255,7 @@ impl Cmd {
             // until its errors are given the JSON form too.
             Cmd::Build | Cmd::Update { .. } | Cmd::Serve { .. } | Cmd::Stop
             | Cmd::InstallAgent { .. } | Cmd::Embed | Cmd::Bench { .. } | Cmd::Dump { .. }
-            | Cmd::ImportLegacy { .. } | Cmd::Mcp => false,
+            | Cmd::ImportLegacy { .. } | Cmd::Mcp | Cmd::Cache { .. } => false,
         }
     }
 }
@@ -660,17 +674,18 @@ fn embed_all(repo: &std::path::Path, no_dense: bool, cfg: &config::Config) -> an
     // weights paged in as the first forwards touch them — so without this line the first thing a
     // person sees is both, and the 60 s bar is missed before a row is embedded.
     eprintln!("dense: model open in {:.1}s, {dim}-d vectors", open.elapsed().as_secs_f32());
-    embed_opened(repo, &model, &mut emb, &index::dense::EmbedSkip::new(&cfg.embed_skip)?)
+    embed_opened(repo, &model, &mut emb, &index::dense::EmbedSkip::new(&cfg.embed_skip)?, cfg)
 }
 
 /// The same rows under a model the caller already has open. `model` switches into this rather
 /// than through `embed_all`, because the model it just downloaded and probed is the model the
 /// rows are owed to, and opening a second session of it would cost the reader a second wait for
 /// nothing.
-fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Embedder, skip: &index::dense::EmbedSkip) -> anyhow::Result<()> {
+fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Embedder, skip: &index::dense::EmbedSkip, cfg: &config::Config) -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let dim = emb.dim()?;
-    let n = pay_owed(repo, model, dim, skip, &mut |texts, forwarded| emb.embed_with(texts, forwarded))?;
+    let cache = index::cache::VectorCache::machine(cfg.vector_cache_max);
+    let n = pay_owed(repo, model, dim, skip, cache, &mut |texts, forwarded| emb.embed_with(texts, forwarded))?;
     println!("dense: embedded {n} rows in {:.1}s", t.elapsed().as_secs_f32());
     Ok(())
 }
@@ -680,7 +695,7 @@ fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Emb
 /// graph as stored, not against what this run changed, so a dense `update` over a tree nothing
 /// moved still pays them.
 #[allow(clippy::type_complexity)]
-fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
+fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, cache: Option<index::cache::VectorCache>, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
     let store = store::Store::new(repo);
     // `embed` and a model switch write only vectors, but into a store this build may not write.
     if let Some(line) = store.newer_store_line() { anyhow::bail!("{line}"); }
@@ -688,8 +703,9 @@ fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense
     let (graph, _) = store.load()?;
     let mut dense = index::dense::DenseIndex::load(&store)?;
     dense.written_by(model, dim);
-    // Borrowed before the count, so the meter's total is the rows this run embeds.
-    dense.borrow_owed(&graph, skip);
+    dense.use_cache(cache);
+    // Taken from the cache before the count, so the meter's total is the rows this run embeds.
+    dense.take_cached(&graph, skip);
     let mut meter = Meter::new(dense.owed(&graph, skip));
     let n = dense.sync_chunked(&graph, skip, &mut |texts| embed(texts, &mut |k| meter.add(k)), SYNC_CHUNK, &mut |idx, _| idx.save(&store))?;
     dense.synced_against(graph_at);
@@ -718,6 +734,39 @@ impl Meter {
         let left = self.total.saturating_sub(self.done) as f32 / rate.max(f32::EPSILON);
         let left = if left < 120.0 { format!("{left:.0} s") } else { format!("{:.0} min", left / 60.0) };
         eprintln!("embedded {}/{} ({rate:.1} rows/s, ~{left} left)", self.done, self.total);
+    }
+}
+
+fn cache_command(action: CacheAction) -> anyhow::Result<String> {
+    let max = config::Config::machine_cache_max()?;
+    let Some(root) = index::cache::default_root() else { anyhow::bail!("no vector cache: this environment names no home directory") };
+    if max == 0 { return Ok(format!("cache: off (vector_cache_max = 0); {} is not read or written\n", root.display())); }
+    let cache = index::cache::VectorCache::at(root, max)?;
+    Ok(match action {
+        CacheAction::Status => cache_status(&cache),
+        CacheAction::Prune => {
+            let p = cache.prune(max)?;
+            format!("cache: pruned {} rows, {} -> {}\n", p.rows, size(p.before), size(p.after))
+        }
+    })
+}
+
+fn cache_status(cache: &index::cache::VectorCache) -> String {
+    let usage = cache.status();
+    let total: u64 = usage.iter().map(|u| u.bytes).sum();
+    let mut out = format!("cache: {} — {} of {}\n", cache.root().display(), size(total), size(cache.max()));
+    for u in usage {
+        out.push_str(&format!("  {}@{}: {} rows, {}\n", terminal_safe(&u.model), u.dims, u.rows, size(u.bytes)));
+    }
+    out
+}
+
+/// Bytes in the largest binary unit that keeps a whole number in front.
+fn size(bytes: u64) -> String {
+    let units = [("GiB", 30), ("MiB", 20), ("KiB", 10)];
+    match units.iter().find(|(_, s)| bytes >= 1 << s) {
+        Some((unit, shift)) => format!("{:.1} {unit}", bytes as f64 / (1u64 << shift) as f64),
+        None => format!("{bytes} B"),
     }
 }
 
@@ -861,7 +910,7 @@ fn switch_model(repo: &std::path::Path, cfg: &config::Config, id: &str, no_embed
         eprintln!("model: the graph is empty, so there is nothing to re-embed — run `zerograph build`");
         return Ok(());
     }
-    embed_opened(repo, id, &mut emb, &index::dense::EmbedSkip::new(&cfg.embed_skip)?)
+    embed_opened(repo, id, &mut emb, &index::dense::EmbedSkip::new(&cfg.embed_skip)?, cfg)
 }
 
 /// The node `impact` or `trace` walks from. The names it passed over go to stderr, so a LOW
@@ -1090,6 +1139,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 let _lock = wait_for_writer(&store, "embed")?;
                 embed_all(&repo, cli.no_dense, &cfg)
             }
+        }
+        Cmd::Cache { action } => {
+            print!("{}", cache_command(action)?);
+            Ok(())
         }
         Cmd::Model { hub_id, no_embed, json } => {
             let cfg = load_cfg()?;
@@ -1486,14 +1539,14 @@ mod tests {
         let store = store::Store::new(repo);
         let skip = index::dense::EmbedSkip::default();
         let owed = || index::dense::DenseIndex::load(&store).unwrap().owed(&store.load().unwrap().0, &skip);
-        assert!(pay_owed(repo, "fake", 3, &skip, &mut fake.clone()).unwrap() > 0);
+        assert!(pay_owed(repo, "fake", 3, &skip, None, &mut fake.clone()).unwrap() > 0);
         assert_eq!(owed(), 0);
         std::fs::write(repo.join("docs/b.md"), "# B\n\n**FR-PAY-24 · MUST · chargeback**\n\nbody\n").unwrap();
         assert_eq!(run_update(repo, &cfg, false).unwrap().changed, 1, "the lexical write");
         let left = owed();
         assert!(left > 0, "the new file's rows are owed");
         assert_eq!(run_update(repo, &cfg, false).unwrap().changed, 0, "the dense update finds nothing to re-read");
-        assert_eq!(pay_owed(repo, "fake", 3, &skip, &mut fake.clone()).unwrap(), left, "and embeds exactly what was owed");
+        assert_eq!(pay_owed(repo, "fake", 3, &skip, None, &mut fake.clone()).unwrap(), left, "and embeds exactly what was owed");
         assert_eq!(owed(), 0);
     }
 
@@ -1520,16 +1573,16 @@ mod tests {
         let vectored = || index::dense::DenseIndex::load(&store).unwrap().ids.into_iter().filter(|id| !id.is_empty()).collect::<Vec<_>>();
         let owed = |skip: &index::dense::EmbedSkip| index::dense::DenseIndex::load(&store).unwrap().owed(&graph, skip);
 
-        let all = pay_owed(repo, "fake", 3, &none, &mut fake.clone()).unwrap();
+        let all = pay_owed(repo, "fake", 3, &none, None, &mut fake.clone()).unwrap();
         let theirs = vectored().iter().filter(|id| generated(id)).count();
         assert!(theirs > 0 && all > theirs, "both files are embedded without the key: {:?}", vectored());
 
         assert_eq!(owed(&skip), 0, "a skipped file's rows are not owed");
-        assert_eq!(pay_owed(repo, "fake", 3, &skip, &mut fake.clone()).unwrap(), 0, "adding the key re-embeds nothing");
+        assert_eq!(pay_owed(repo, "fake", 3, &skip, None, &mut fake.clone()).unwrap(), 0, "adding the key re-embeds nothing");
         assert!(vectored().iter().all(|id| !generated(id)), "and the writer drops the rows it held: {:?}", vectored());
         assert_eq!(vectored().len(), all - theirs, "while every other row stays");
         assert_eq!(owed(&none), theirs, "without the key those rows are owed again");
-        assert_eq!(pay_owed(repo, "fake", 3, &none, &mut fake.clone()).unwrap(), theirs, "and removing it embeds them alone");
+        assert_eq!(pay_owed(repo, "fake", 3, &none, None, &mut fake.clone()).unwrap(), theirs, "and removing it embeds them alone");
 
         let root = graph.nodes.values().find(|n| n.label == "makeQuotaClient" && generated(&n.id)).expect("the skipped file's symbol is in the graph");
         let callers = impact::render(&graph, &impact::upstream(&graph, &root.id, 2), "upstream");

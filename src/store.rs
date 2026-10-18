@@ -106,6 +106,39 @@ pub(crate) fn open_unlinked(o: &mut std::fs::OpenOptions, p: &Path) -> std::io::
     open_nofollow(o, p)
 }
 
+/// Makes `dir` and refuses it unless it is ours alone: another user may have created the name
+/// first, or planted a symlink at it, and what this process then puts there — a socket, cached
+/// vectors — is theirs to read and replace. Only the leaf is made private: the directories above
+/// it are the user's own to arrange.
+#[cfg(unix)]
+pub(crate) fn prepare_private_dir(dir: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+    if let Some(above) = dir.parent() {
+        std::fs::create_dir_all(above).with_context(|| format!("create {}", above.display()))?;
+    }
+    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).with_context(|| format!("create {}", dir.display())),
+    }
+    let meta = std::fs::symlink_metadata(dir).with_context(|| format!("stat {}", dir.display()))?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let mine = meta.uid() == unsafe { libc::geteuid() };
+    if !meta.is_dir() || !mine || meta.permissions().mode() & 0o077 != 0 {
+        anyhow::bail!("{} is not a directory private to this user", dir.display());
+    }
+    Ok(())
+}
+
+/// The profile directory's own ACL is what keeps others out on Windows; all that is owed here is
+/// a directory, and never one reached through a reparse point.
+#[cfg(not(unix))]
+pub(crate) fn prepare_private_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).with_context(|| format!("create {}", dir.display()))?;
+    if is_link(dir) { anyhow::bail!("{} is a link, not a directory of ours", dir.display()); }
+    Ok(())
+}
+
 /// Apart from the check so that the flag can be tested on its own: with the check in front, a
 /// planted link never reaches it.
 fn open_nofollow(o: &mut std::fs::OpenOptions, p: &Path) -> std::io::Result<std::fs::File> {
