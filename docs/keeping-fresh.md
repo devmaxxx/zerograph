@@ -65,6 +65,24 @@ embed is every two seconds:
 embedded 400/1683 (14.2 rows/s, ~90 s left)
 ```
 
+### Borrowing from sibling worktrees
+
+A new `git worktree` of a repository that already has a built checkout does not embed the rows that
+checkout already holds. Each worktree builds its own graph, and a cold build is almost all
+embedding, so before a sync embeds a missing row it looks the row's text hash up in the stores of
+the other worktrees `git worktree list` names. A sibling lends only when its rows are the same
+model, variant and dimension as the ones being written; only the rows no sibling holds are embedded:
+
+```
+dense: borrowed 5119 rows from /work/zerograph
+```
+
+A sibling is read under its writer lock and left untouched: one that is refreshing, has no lock
+file, or holds a torn pair is skipped. A borrowed vector is the one this checkout would have
+embedded up to the last digits — batch padding makes two embeds of the same text near-identical,
+not bit-identical — so answers do not move. There is no switch: a repository with one checkout, or
+siblings on another model, simply embeds everything.
+
 ### Background priority
 
 The detached `update` that a reader, a git hook or the MCP `reindex` and `switch_model` tools start
