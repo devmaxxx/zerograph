@@ -937,10 +937,11 @@ fn json_out(text: String, stale: &Option<refresh::Stale>) -> String {
 /// a subdirectory is part of the checkout around it, and a store built there would be a second,
 /// partial one. A worktree is a checkout of its own and gets its own root. Outside git, the nearest
 /// directory up that already holds a store is the one that was built; failing both, `cwd`.
+/// Answered plain: git states the top level without the verbatim prefix and `cwd` arrives with it.
 fn repo_root(cwd: &std::path::Path) -> PathBuf {
-    git_toplevel(cwd)
+    plain(git_toplevel(cwd)
         .or_else(|| cwd.ancestors().find(|d| [store::DIR, store::LEGACY_DIR].iter().any(|n| d.join(n).is_dir())).map(PathBuf::from))
-        .unwrap_or_else(|| cwd.to_path_buf())
+        .unwrap_or_else(|| cwd.to_path_buf()))
 }
 
 fn git_toplevel(cwd: &std::path::Path) -> Option<PathBuf> {
@@ -1013,10 +1014,10 @@ pub fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> anyhow::Result<()> {
     // First of all, before anything here starts a thread that would keep the old priority.
     if cli.background || matches!(cli.cmd, Cmd::Watch { .. }) { priority::background_process(); }
-    let repo = plain(match &cli.repo {
-        Some(repo) => repo.canonicalize()?,
+    let repo = match &cli.repo {
+        Some(repo) => plain(repo.canonicalize()?),
         None => repo_root(&std::env::current_dir()?.canonicalize()?),
-    });
+    };
     // Loaded per command: `bench` reads its own from `ZEROGRAPH_BENCH_REPO`, and `explain`/`verify`
     // must not fail on a broken `zerograph.toml` they never read. `embed` does read it — the model
     // the vectors are written with lives there — so it fails on a broken one like the other writers.
@@ -1653,7 +1654,8 @@ mod tests {
     #[test]
     fn the_root_is_the_checkout_around_a_subdirectory_and_a_worktree_is_its_own() {
         let dir = tempfile::tempdir().unwrap();
-        let main = dir.path().canonicalize().unwrap().join("main");
+        // Plain, because git refuses a `\\?\` path as a worktree location.
+        let main = plain(dir.path().canonicalize().unwrap()).join("main");
         std::fs::create_dir_all(main.join("packages/x")).unwrap();
         git(&main, &["init", "-q"]);
         assert_eq!(repo_root(&main.join("packages/x")), main);
@@ -1667,7 +1669,7 @@ mod tests {
     #[test]
     fn outside_git_the_root_is_the_nearest_store_above_else_the_directory_itself() {
         let dir = tempfile::tempdir().unwrap();
-        let top = dir.path().canonicalize().unwrap();
+        let top = plain(dir.path().canonicalize().unwrap());
         // A temp directory inside someone's checkout would answer with that checkout instead.
         if git_toplevel(&top).is_some() { return; }
         let deep = top.join("a/b");
