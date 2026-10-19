@@ -383,6 +383,16 @@ Eight steps, in order. Each one exists because skipping it once cost a release r
    Then on npmjs.com, the package's Settings → Trusted publishing: GitHub Actions, repository
    `devmaxxx/zerograph`, workflow `release.yml`. Once set up, this step is skipped.
 
+   crates.io's trusted publishing has the same rule, and its first version is the real one, from
+   the commit step 4 read, before the tag is pushed (`cargo login` once with a token from
+   crates.io → Account Settings → API Tokens, scope `publish-new`):
+   ```bash
+   git worktree add ../zerograph-crate $SHA && cd ../zerograph-crate && cargo publish --locked
+   ```
+   Then on crates.io, the crate's Settings → Trusted Publishing: GitHub, owner `devmaxxx`,
+   repository `zerograph`, workflow `release.yml`. The tag's `crates` job finds that version
+   published and skips it; every later tag publishes from there. Once set up, this is skipped too.
+
 6. **Tag and push.**
    ```bash
    git tag v<version> $SHA && gh auth switch --hostname github.com --user devmaxxx && git push origin v<version>
@@ -401,8 +411,9 @@ Eight steps, in order. Each one exists because skipping it once cost a release r
    ```bash
    gh api repos/devmaxxx/zerograph/releases/latest --jq .tag_name
    npm view zerograph@<version> version
+   cargo info zerograph@<version> --registry crates-io | grep '^version'
    ```
-   The first prints the tag, the release carries three assets, and the second prints the version: a
+   The first prints the tag, the release carries three assets, and the others print the version: a
    release is done when someone else can install it, not when the tag exists.
 
 ## Post-run cleanup, if the run was not in a worktree

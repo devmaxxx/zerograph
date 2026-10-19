@@ -6,6 +6,26 @@ rust-version = "1.98"
 description = "A project knowledge graph built and queried at zero API tokens"
 license = "MIT"
 repository = "https://github.com/devmaxxx/zerograph"
+readme = "README.md"
+keywords = ["knowledge-graph", "code-search", "mcp", "embeddings", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+# The crate carries what the binary compiles in and nothing else: docs, bench history and test
+# fixtures put it near crates.io's 10 MB limit. The docs and bench files named here are
+# `include_str!`'d by src/, so a build from the published source needs them.
+include = [
+    "/src/**",
+    "/agent/hook.mjs",
+    "/agent/rule.txt",
+    "/agent/stanza.md",
+    "/agent/subagent.md",
+    "/agent/skill/*.md",
+    "/bench/cases.jsonl",
+    "/bench/cases.pin",
+    "/docs/embeddings.md",
+    "/docs/bench/2026-09-22-embedders-results.md",
+    "/README.md",
+    "/LICENSE",
+]
 
 [dependencies]
 anyhow = "=1.0.104"
