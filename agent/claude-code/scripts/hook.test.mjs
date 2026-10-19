@@ -24,7 +24,7 @@ const WIN = process.platform === 'win32';
  * code page, and writes the argv line itself, so the log reads the same on both platforms whatever
  * quoting the launcher needed.
  */
-function world({ store = true, answer = '', status = 0 } = {}) {
+function world({ store = true, answer = '', status = 0, version = '0.7.0' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'zerograph-hook-test-'));
   if (store) {
     mkdirSync(join(root, '.zerograph'), { recursive: true });
@@ -44,6 +44,7 @@ function world({ store = true, answer = '', status = 0 } = {}) {
     `appendFileSync(${JSON.stringify(budgetLog)}, process.argv[2] + ' ' + (process.env.ZEROGRAPH_READER_BUDGET ?? '-') + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(cwdLog)}, process.cwd() + '\\n', 'utf8');`,
     `appendFileSync(${JSON.stringify(pathLog)}, (process.env.PATH ?? '') + '\\n', 'utf8');`,
+    `if (process.argv.includes('--version')) { writeSync(1, ${JSON.stringify(`zerograph ${version}\n`)}); process.exit(0); }`,
     `writeSync(1, ${JSON.stringify(answer + '\n')});`,
     `process.exit(${status});`,
   ].join('\n'), 'utf8');
@@ -71,7 +72,7 @@ function fire(w, payload, env = {}, hook = HOOK, args = []) {
   const r = spawnSync(process.execPath, [hook, ...args], {
     input: JSON.stringify({ cwd: w.root, session_id: 'sess', ...payload }),
     encoding: 'utf8',
-    env: {
+    env: withoutNulls({
       ...harnessless(process.env),
       PATH: `${w.bin}${delimiter}${process.env.PATH}`,
       // Windows resolves a bare name through `PATHEXT` only inside a shell, so `PATH` alone would
@@ -80,12 +81,17 @@ function fire(w, payload, env = {}, hook = HOOK, args = []) {
       // `tmpdir()` reads TMPDIR on POSIX and TEMP/TMP on Windows. All three, or the per-session
       // state the once-and-cadence gates keep would be shared between tests on one platform.
       TMPDIR: join(w.root, 'tmp'), TEMP: join(w.root, 'tmp'), TMP: join(w.root, 'tmp'),
+      // A machine's own update cache would add a message to every SessionStart here.
+      ZEROGRAPH_NO_UPDATE_CHECK: '1',
       ...env,
-    },
+    }),
   });
   assert.equal(r.status, 0, `the hook always exits 0; stderr: ${r.stderr}`);
   return r.stdout ? JSON.parse(r.stdout) : null;
 }
+
+/** `env` without the keys a test set to null, which is how a test unsets a default of `fire`. */
+function withoutNulls(env) { return Object.fromEntries(Object.entries(env).filter(([, v]) => v !== null)); }
 
 function context(out) { return out?.hookSpecificOutput?.additionalContext ?? null; }
 
@@ -799,5 +805,70 @@ test('a home directory that is a checkout keeps its own PATH entries', { skip: W
     assert.equal(onPath(join(home, 'notes')), join(bin, 'zerograph'));
   } finally {
     Object.assign(process.env, saved);
+  }
+});
+
+/** A home whose update cache holds `body`, and the variables that make the hook read it. */
+function updateHome(w, body) {
+  const home = join(w.root, 'home');
+  mkdirSync(join(home, '.cache', 'zerograph'), { recursive: true });
+  if (body !== undefined) writeFileSync(join(home, '.cache', 'zerograph', 'update.json'), body);
+  return { HOME: home, USERPROFILE: home, ZEROGRAPH_NO_UPDATE_CHECK: null, NO_UPDATE_NOTIFIER: null, ZEROGRAPH_HOOK_SERVE: '0' };
+}
+
+const cached = (versions) => JSON.stringify({ versions });
+const CACHED = cached({ '0.7.0': { checked: 1, latest: '0.7.1' } });
+
+test('SessionStart shows a cached newer release to the person and tells the model once', () => {
+  const w = world({ answer: 'zerograph: 3 doc nodes' });
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, updateHome(w, CACHED));
+  assert.equal(out.systemMessage, '▲ zerograph 0.7.1 available (you have 0.7.0)\n  npm i -g zerograph@0.7.1 · pnpm add -g zerograph@0.7.1');
+  const c = context(out);
+  assert.ok(c.startsWith('zerograph: 3 doc nodes'), c);
+  assert.equal(c.split('\n').filter((l) => l.includes('0.7.1')).length, 1, c);
+
+  const bare = world({ store: false });
+  const shown = fire(bare, { hook_event_name: 'SessionStart', source: 'startup' }, updateHome(bare, CACHED));
+  assert.ok(shown.systemMessage.startsWith('▲ zerograph 0.7.1'), JSON.stringify(shown));
+});
+
+test('the message is about the binary the hook runs, not the one that last wrote the cache', () => {
+  for (const [version, versions] of [
+    ['0.7.1', { '0.7.0': { checked: 1, latest: '0.7.1' } }],
+    ['0.6.0', { '0.7.0': { checked: 1, latest: '0.7.1' } }],
+    ['0.8.0', { '0.8.0': { checked: 1, latest: '0.7.1' } }],
+    ['0.7.0', { '0.7.0': { claimed: 1, latest: '0.7.1' } }],
+  ]) {
+    const w = world({ answer: 'zerograph: 3 doc nodes', version });
+    const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, updateHome(w, cached(versions)));
+    assert.equal(out.systemMessage, undefined, `${version} ${JSON.stringify(versions)}`);
+    assert.equal(context(out), 'zerograph: 3 doc nodes');
+  }
+  const pre = world({ answer: 'zerograph: 3 doc nodes', version: '0.8.0-rc.1' });
+  const out = fire(pre, { hook_event_name: 'SessionStart', source: 'startup' }, updateHome(pre, cached({ '0.8.0-rc.1': { checked: 1, latest: '0.8.0' } })));
+  assert.match(out.systemMessage, /0\.8\.0 available \(you have 0\.8\.0-rc\.1\)/);
+});
+
+test('Codex gets the brief line and no systemMessage', () => {
+  const w = world({ answer: 'zerograph: 3 doc nodes' });
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, updateHome(w, CACHED), HOOK, ['--codex']);
+  assert.equal(out.systemMessage, undefined);
+  assert.match(context(out), /0\.7\.1 is out/);
+});
+
+test('no update message, and no version asked, when the cache is missing, garbled or names nothing newer, or the person opted out', () => {
+  for (const [body, extra] of [
+    [undefined, {}],
+    ['{not json', {}],
+    [cached({ '0.7.0': { checked: 1, latest: null } }), {}],
+    [cached({ '0.7.0': { checked: 1, latest: '0.7.1; rm -rf ~' } }), {}],
+    [CACHED, { ZEROGRAPH_NO_UPDATE_CHECK: '1' }],
+    [CACHED, { NO_UPDATE_NOTIFIER: '1' }],
+  ]) {
+    const w = world({ answer: 'zerograph: 3 doc nodes' });
+    const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { ...updateHome(w, body), ...extra });
+    assert.equal(out.systemMessage, undefined, `${body} ${JSON.stringify(extra)}`);
+    assert.equal(context(out), 'zerograph: 3 doc nodes');
+    assert.ok(!argv(w).some((l) => l.includes('--version')), argv(w).join(' | '));
   }
 });

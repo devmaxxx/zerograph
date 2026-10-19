@@ -32,6 +32,8 @@ pub(crate) struct Report {
     /// The refresh log's lines after its last start marker, without meters.
     pub last_run: Vec<String>,
     pub serve: Serve,
+    /// A newer release the daily check found, read from its cache and never fetched here.
+    pub update: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -137,7 +139,7 @@ pub(crate) fn report(repo: &Path, starting: bool) -> Result<Report> {
     };
     let model = Model { recorded, configured: cfg.as_ref().ok().map(|c| c.embed_model.clone()) };
     let log = log_tail(repo, "background.log");
-    Ok(Report { index, tree, model, vectors, refresh: refresh_state(repo, starting, &log), last_run: last_run(&log), serve: serve_state(repo) })
+    Ok(Report { index, tree, model, vectors, refresh: refresh_state(repo, starting, &log), last_run: last_run(&log), serve: serve_state(repo), update: crate::update::known() })
 }
 
 fn vectors(store: &store::Store, graph: &crate::model::Graph, cfg: Option<&config::Config>, recorded: bool) -> Option<Vectors> {
@@ -276,6 +278,10 @@ pub(crate) fn render(r: &Report, build: &str) -> String {
             false => say(format!("  last lines of {log}, from the server that ran last:")),
         }
         for line in &r.serve.log { say(format!("    {line}")); }
+    }
+    if let Some(latest) = &r.update {
+        let (npm, pnpm) = crate::update::commands(latest);
+        say(format!("update: zerograph {latest} is out and this is {}; `{npm}` or `{pnpm}`", env!("CARGO_PKG_VERSION")));
     }
     out
 }

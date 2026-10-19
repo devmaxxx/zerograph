@@ -1,5 +1,5 @@
 import type { On } from 'claude-code'
-import { expect, test } from 'claude-code/testing'
+import { expect, mock, test } from 'claude-code/testing'
 
 const ROOT = '/work/cloned'
 const MACHINE = '/usr/local/bin'
@@ -138,4 +138,26 @@ test('a PATH entry that is a symlinked alias of the checkout is the checkout\'s'
   await $.command.run({ command: 'zerograph', args: '' })
   expect(ran.length).toBeGreaterThan(0)
   expect(ran.filter(argv => argv[0] !== `${MACHINE}/zerograph`)).toEqual([])
+})
+
+test('the hint under the prompt carries the cached newer release from status', async ($, on) => {
+  const clock = mock.clock(on)
+  on('session.root', async () => ({ value: ROOT }))
+  on('env.get', async ($, e) => ({ value: e.name === 'PATH' ? MACHINE : undefined }))
+  on('fs.exists', async () => ({ value: false }))
+  on('fs.stat', async ($, e) => {
+    if (e.path !== `${MACHINE}/zerograph`) throw new Error('ENOENT')
+    return { value: { kind: 'file', size: 1, mtimeMs: 0 } }
+  })
+  const report = {
+    index: { state: 'built', doc_nodes: 1, code_nodes: 1, edges: 1 }, tree: { state: 'in_step' }, model: { recorded: null, configured: null },
+    vectors: null, refresh: { state: 'none' }, last_run: [], serve: { running: false, up_secs: null, log: [] }, update: '0.7.1',
+  }
+  on('process.run', async () => ({ value: { exitCode: 0, stdout: JSON.stringify(report), stderr: '', isStdoutTruncated: false } }))
+  // Stands in for the engine's own drawing, so what the mod handed it can be read back.
+  on('ui.render', ($, e) => ({ type: 'Text', props: {}, children: [String(e.props.tail ?? '')] }))
+  await $.command.run({ command: 'zerograph', args: '' })
+  await clock.settle()
+  const ui = await $.ui.mount({ plugin: 'zerograph', component: 'PromptHint', requestId: 'hint', surface: 'terminal', props: { isDraft: false, isWorking: false, hint: '' } })
+  expect(await ui.find({ type: 'Text', text: /· ↑0\.7\.1$/ })).toBeDefined()
 })

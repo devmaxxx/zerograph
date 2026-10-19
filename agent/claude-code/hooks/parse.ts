@@ -47,6 +47,7 @@ export function lineOf(r: Report): string {
   if (r.model.recorded && r.model.configured && r.model.recorded.toLowerCase() !== r.model.configured.toLowerCase()) parts.push('model switch due')
   if (parts.length === 1) parts.push('in sync')
   if (r.serve.running) parts.push('⇄ serve')
+  if (r.update) parts.push(`↑${r.update}`)
   return parts.join(' · ')
 }
 

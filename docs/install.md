@@ -74,6 +74,42 @@ hooks, deleting a hook that held nothing else. The install runs only once the pl
 the `claude` or `codex` CLI is missing or a step fails, it prints the commands to run by hand and
 leaves the older install in place.
 
+### A newer release
+
+Once a day an interactive run asks npm for zerograph's latest release
+(`https://registry.npmjs.org/zerograph/latest`) on a thread of its own that no command waits for,
+and keeps the answer in `~/.cache/zerograph/update.json`, one entry per installed release. A run
+that ends before npm answers is retried within the hour. When the cached answer is newer than the
+binary, the run ends with a box on stderr:
+
+```
+╭────────────────────────────────────╮
+│                                    │
+│   Update available 0.7.0 → 0.7.1   │
+│    Run npm i -g zerograph@0.7.1    │
+│   or pnpm add -g zerograph@0.7.1   │
+│                                    │
+╰────────────────────────────────────╯
+```
+
+It names npm and pnpm whichever way the binary was installed; a Cargo or archive install updates
+the way it was installed. `mcp`, `serve`, `status` and any `--json` run neither ask nor print, nor
+does a run whose stderr is not a terminal or one with `CI` set. `zerograph status` and the MCP
+`status` tool report the cached release as an `update:` line (`update` in `status --json`),
+without asking npm.
+
+The Claude Code plugin reads the same file and asks nobody. At session start, when the entry for
+the binary it runs names a newer release, it shows
+
+```
+▲ zerograph 0.7.1 available (you have 0.7.0)
+  npm i -g zerograph@0.7.1 · pnpm add -g zerograph@0.7.1
+```
+
+and the hint under the prompt ends in `↑0.7.1`. `ZEROGRAPH_NO_UPDATE_CHECK` or
+`NO_UPDATE_NOTIFIER`, set to anything, turns all of it off — see
+[Update notices](configuration.md#update-notices).
+
 <a id="claude-code-status-mod"></a>
 
 ## Claude Code plugin
@@ -162,7 +198,7 @@ to `agent/claude-code/scripts/` reaches the Codex plugin's copies through
 `agent/codex/` is the same integration as a Codex plugin, listed by `.agents/plugins/marketplace.json`:
 
 ```bash
-codex plugin marketplace add devmaxxx/zerograph --ref v0.7.0
+codex plugin marketplace add devmaxxx/zerograph --ref v0.7.1
 codex plugin add zerograph@zerograph
 ```
 

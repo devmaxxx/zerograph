@@ -1,6 +1,6 @@
 [package]
 name = "zerograph"
-version = "0.7.0"
+version = "0.7.1"
 edition = "2021"
 rust-version = "1.98"
 description = "A project knowledge graph built and queried at zero API tokens"
@@ -87,6 +87,9 @@ postcard = { version = "=1.1.3", features = ["use-std"] }
 secrets_scanner = { version = "=0.2.3", default-features = false }
 # Already in the tree through `regex`; named here to find which rules a text's keywords call for.
 aho-corasick = "=1.1.5"
+# A newer zerograph on npm, checked at most daily from an interactive run (src/update.rs). Its ureq 3
+# and native-tls unify with hf-hub's, so no second HTTP or TLS stack is built.
+update-informer = { version = "=1.3.0", default-features = false, features = ["npm", "ureq", "native-tls"] }
 
 [dev-dependencies]
 tempfile = "=3.27.0"

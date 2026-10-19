@@ -273,6 +273,13 @@ on the poll that applies it, and `ask`'s own refresh never costs a pass over the
 `zerograph.toml` still naming `id_families` parses, gets one line on stderr, and is otherwise
 unaffected.
 
+### Update notices
+
+`ZEROGRAPH_NO_UPDATE_CHECK` or `NO_UPDATE_NOTIFIER`, set to any value, turns off the daily check
+for a newer release, its box, the `update:` line of `status` and the plugin's message and hint
+marker. `CI` set turns off the check and the box. `NO_COLOR`, `CLICOLOR=0` or `TERM=dumb` draws the
+box without colour. See [A newer release](install.md#a-newer-release).
+
 ## Resources
 
 Every reader costs a fraction of a second and the model it opened. The one command that can take a

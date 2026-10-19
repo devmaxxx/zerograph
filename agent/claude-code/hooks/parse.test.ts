@@ -126,3 +126,10 @@ test('a full check is due once a run logged since the last one has ended, and no
   const before = { mtimeMs: TAKEN - 1, run: readRun(RUNNING, TAKEN - 1, now) }
   expect(isFullDue(TAKEN, now, before)).toBe(false)
 })
+
+test('a newer release the CLI cached ends the line with its marker, and the live overlay keeps it', () => {
+  const r: Report = { ...base, update: '0.7.1' }
+  expect(lineOf(r)).toBe('◇ zerograph · in sync · ↑0.7.1')
+  expect(lineOf({ ...base, update: null })).toBe('◇ zerograph · in sync')
+  expect(lineOf(overlay({ report: r, takenAt: 0 }, { log: { mtimeMs: 1, run: undefined } }))).toBe('◇ zerograph · in sync · ↑0.7.1')
+})
