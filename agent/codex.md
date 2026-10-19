@@ -87,15 +87,23 @@ Established on 0.154.0 with a scratch `CODEX_HOME` and a local marketplace, no m
   session's project directory, with the payload's `cwd` naming it too. A `PostToolUse` matcher of
   `apply_patch|Edit|Write` is honoured; `apply_patch` is Codex's edit tool.
 - An MCP server's `args` are passed as written — no `${PLUGIN_ROOT}` is substituted — and its
-  environment is scrubbed down to what `env_vars` names. With no `cwd` it starts in the project. So
-  `.mcp.json` runs `node -e` with a bootstrap that imports `scripts/mcp.mjs` from the cache path
-  under `CODEX_HOME` (or `~/.codex`), and the version in that path is held equal to
-  `plugin.json`'s by `plugin.test.mjs`.
+  environment is scrubbed down to Codex's defaults (`HOME`, `LANG`, `LC_ALL`, `LOGNAME`, `PATH`,
+  `SHELL`, `TERM`, `TMPDIR`, `USER` on macOS) and what `env_vars` names. With no `cwd` it starts in
+  the project. `command` takes only a bare name or a `./` path, and `cwd` only a `./` path — which
+  resolves to the plugin root, losing the project — so `${PLUGIN_ROOT}` reaches the server nowhere.
+  `.mcp.json` therefore runs `node -e` with a bootstrap that imports `scripts/mcp.mjs` from the
+  newest version directory under `$CODEX_HOME/plugins/cache/zerograph/zerograph/`.
+- `codex plugin marketplace add` with a different `--ref` than the configured one fails ("already
+  added from a different source"); `marketplace remove` then `add` repins it and keeps the plugin
+  enabled, and `codex plugin add` replaces the old version directory with the new one.
+- Hook handlers take a `commandWindows` override, used on Windows instead of `command`.
 - A skill's `agents/openai.yaml` with `policy.allow_implicit_invocation: false` keeps it out of the
   model's own choices, so the commands run only when named, as `$zerograph:<name>`.
 
 The scripts are copies of `agent/claude-code/scripts/` — a plugin is installed as one directory and
-cannot import from a sibling — and `plugin.test.mjs` fails when they differ.
+cannot import from a sibling, and a symlink out of it would be a text file in a Windows checkout
+without `core.symlinks` — and `plugin.test.mjs` fails when they differ;
+`scripts/sync-plugin-scripts.sh` copies them over.
 
 ## Skills: `.codex/skills/<name>/SKILL.md`
 

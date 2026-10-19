@@ -171,6 +171,9 @@ enum Cmd {
         #[arg(long)] opencode: bool,
         /// How this repository invokes the binary, in the editors' MCP entries and stanzas.
         #[arg(long, default_value = "zerograph")] command: String,
+        /// With --claude or --codex: also take out the older install's files that git tracks. Left
+        /// by default, since they serve every teammate who has no plugin yet.
+        #[arg(long)] retire_repo: bool,
     },
     /// What a coding agent should be told about this repository at the start of a session: node
     /// counts, which embedder the vectors belong to, how many families the documents define, and the five commands. Reads the store; never refreshes.
@@ -1290,7 +1293,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if graph.nodes.is_empty() { anyhow::bail!("graph is empty — run `zerograph build`"); }
             Ok(())
         }
-        Cmd::InstallAgent { claude, codex, cursor, copilot, gemini, opencode, command } => {
+        Cmd::InstallAgent { claude, codex, cursor, copilot, gemini, opencode, command, retire_repo } => {
             use install_agent::Editor;
             let editors: Vec<Editor> = [(cursor, Editor::Cursor), (copilot, Editor::Copilot), (gemini, Editor::Gemini), (opencode, Editor::Opencode)]
                 .into_iter().filter(|(on, _)| *on).map(|(_, e)| e).collect();
@@ -1320,23 +1323,38 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 for note in &r.notes { println!("{name}: {note}"); }
                 // An older install is the only thing serving sessions until the plugin is in.
                 if !installed { continue; }
-                let mut retired = vec![install_agent::retire_repo_install(&repo, target)];
+                let mut retire = install_agent::Retire { committed: retire_repo, machine_hooks_gone: true };
+                let mut retired = Vec::new();
+                // Hook entries before the script they run: an entry left pointing at a removed
+                // script fails on every event it matches.
+                if target == install_agent::Target::Codex {
+                    if let Some(home) = install_agent::codex_home() {
+                        let (gone, r) = install_agent::retire_codex_hooks(&home);
+                        retire.machine_hooks_gone = gone;
+                        retired.push(r);
+                    }
+                }
+                retired.push(install_agent::retire_repo_install(&repo, target, retire));
                 match target {
                     install_agent::Target::Claude => if let Some(config) = install_agent::claude_config() {
                         retired.push(install_agent::prune_mcp(&config, &install_agent::worktrees(&repo)));
                     },
-                    install_agent::Target::Codex => {
-                        // An earlier release wrote the Codex hook into the main worktree, for the
-                        // machine's hooks file to point at.
-                        if let Some(main) = install_agent::main_worktree(&repo) {
-                            let mut r = install_agent::Report::default();
-                            install_agent::retire_hook_script(&main.join(".codex").join("hooks"), &mut r);
-                            retired.push(r);
-                        }
-                        if let Some(home) = install_agent::codex_home() { retired.push(install_agent::retire_codex_hooks(&home)); }
-                    }
+                    // An earlier release wrote the Codex hook into the main worktree, for the
+                    // machine's hooks file to point at.
+                    install_agent::Target::Codex => if let Some(main) = install_agent::main_worktree(&repo) {
+                        let mut r = install_agent::Report::default();
+                        install_agent::retire_hook_script(&main.join(".codex").join("hooks"), retire.machine_hooks_gone, retire, &mut r);
+                        retired.push(r);
+                    },
                 }
                 for r in &retired { for note in &r.notes { println!("{name}: {note}"); } }
+                let committed: Vec<&String> = retired.iter().flat_map(|r| &r.committed).collect();
+                if !committed.is_empty() {
+                    let flag = match target { install_agent::Target::Claude => "--claude", install_agent::Target::Codex => "--codex" };
+                    println!("{name}: left what an earlier release wrote that git tracks, for teammates without the plugin: {}; \
+                              once every teammate has it, `zerograph install-agent {flag} --retire-repo` takes them out",
+                             committed.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", "));
+                }
                 if command != "zerograph" {
                     println!("{name}: the plugin's hints name `zerograph`, and it starts the one on PATH outside the checkout; \
                               `--command` reaches only the editors' files. A binary elsewhere is named by its absolute path \

@@ -414,12 +414,29 @@ function reminder(payload, sessionKey) {
     : null;
 }
 
+/**
+ * The files an edit wrote. Claude Code names one in `file_path`; Codex's `apply_patch` carries a
+ * patch in `command`, where every file it adds, updates or moves to has its own header line, relative
+ * to the project.
+ */
+function editedFiles(input, root) {
+  if (input.file_path) return [String(input.file_path)];
+  const patch = typeof input.command === 'string' ? input.command : '';
+  const files = [...patch.matchAll(/^\*\*\* (?:Add File|Update File|Move to): (.+?)\s*$/gm)].map((m) => m[1]);
+  return [...new Set(files)].map((f) => (isAbsolute(f) ? f : join(root, f)));
+}
+
 function riskLine(payload, root, sessionKey) {
-  const file = String((payload.tool_input || {}).file_path || '');
-  if (!/\.tsx?$/.test(file)) return null;
+  const files = editedFiles(payload.tool_input || {}, root).filter((f) => /\.tsx?$/.test(f));
+  if (!files.length) return null;
   let r;
   try { r = JSON.parse(run(root, ['changes', '--depth', '1', '--json'])); } catch { return null; }
   if (!r || !['MEDIUM', 'HIGH', 'CRITICAL'].includes(r.risk)) return null;
+  const lines = files.map((file) => fileRisk(r, file, root, sessionKey)).filter(Boolean);
+  return lines.length ? lines.join('\n') : null;
+}
+
+function fileRisk(r, file, root, sessionKey) {
   // `changes` covers the whole working diff: keep only what the edited file contributes, or an edit to
   // a leaf file is told about the callers of symbols some other file in the diff touched.
   const rel = relative(root, file).split('\\').join('/');
@@ -568,4 +585,6 @@ if (invokedDirectly()) {
   main();
 }
 
-export { rule, RULE, COMMAND, binary, onPath, bounded, intercept, riskLine, handlers, MAX_INJECTIONS };
+// `main` for Codex on Windows, whose hook command imports this file rather than naming its path in
+// a shell variable.
+export { main, rule, RULE, COMMAND, binary, onPath, bounded, intercept, riskLine, handlers, MAX_INJECTIONS };

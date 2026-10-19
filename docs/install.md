@@ -63,8 +63,11 @@ plugin, then takes out what releases before 0.7.0 wrote, which the plugin now do
   `.codex/hooks/zerograph-hook.mjs`, the `.codex/skills/zerograph/` and `repo-query` skills, and
   the stanza in `AGENTS.md` unless `--opencode` still reads it there.
 
-A skill or subagent somebody edited, a link, or a directory with files of its own is left and
-named. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
+A hook script goes only after the entries that run it are gone. A hook script, skill or subagent
+somebody edited, a link, or a directory with files of its own is left and named. A file git tracks
+is left too, and listed in one line: it is the team's, and serves every teammate who has no plugin
+yet. Once all of them have it, `zerograph install-agent --claude --retire-repo` (or `--codex
+--retire-repo`) takes those out as well, for a commit of their own. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
 hooks, deleting a hook that held nothing else. The install runs only once the plugin installed: when
 the `claude` or `codex` CLI is missing or a step fails, it prints the commands to run by hand and
 leaves the older install in place.
@@ -109,7 +112,9 @@ by name from its own `PATH`, which the plugin cannot pin; a checkout whose direc
 `PATH`, or on Windows the directory the server starts in, could put its own `node` there.
 
 **With `install-agent --claude`.** It installs this plugin through the `claude` CLI (`claude plugin
-marketplace add devmaxxx/zerograph`, then `claude plugin install zerograph@zerograph`) and removes
+marketplace add devmaxxx/zerograph`, `claude plugin marketplace update zerograph`, `claude plugin
+install zerograph@zerograph`, then `claude plugin update zerograph@zerograph`, so a re-run after
+upgrading the binary moves the plugin to the same release) and removes
 the server, hook, skill and stanza an older `install-agent --claude` wrote (see
 [Upgrading](#upgrading)), so the model never sees the tools twice, as `mcp__zerograph__*` and as
 `mcp__plugin_zerograph_zerograph__*`.
@@ -144,8 +149,11 @@ killed without removing its socket reads as answering until the next full report
 The marketplace pins the mod to a release tag and the mod carries that release's version, so it
 moves with zerograph: `claude plugin update zerograph` then `/reload-plugins` takes the mod of the
 latest release, and nothing merged to `main` reaches an install before its tag. A version bump
-changes `Cargo.toml`, `agent/claude-code/.claude-plugin/plugin.json` and the `ref` in
-`.claude-plugin/marketplace.json` together; CI fails when they disagree.
+changes `Cargo.toml`, `agent/claude-code/.claude-plugin/plugin.json`,
+`agent/codex/.codex-plugin/plugin.json` and the `ref` in `.claude-plugin/marketplace.json`
+together, and the `--ref` in the Codex command below; CI fails when the first four disagree. A fix
+to `agent/claude-code/scripts/` reaches the Codex plugin's copies through
+`scripts/sync-plugin-scripts.sh`, and CI fails until it does.
 
 ## Codex plugin
 
@@ -156,15 +164,24 @@ codex plugin marketplace add devmaxxx/zerograph --ref v0.7.0
 codex plugin add zerograph@zerograph
 ```
 
-`zerograph install-agent --codex` runs those two and the clean-up in [Upgrading](#upgrading). The
+`zerograph install-agent --codex` runs those two and the clean-up in [Upgrading](#upgrading). Codex
+refuses to re-add a marketplace under another ref, so after a binary upgrade the run removes the
+`zerograph` marketplace and adds it at the new tag; the plugin stays enabled. The
 plugin starts the MCP server (`scripts/mcp.mjs`, the Claude Code plugin's, found under
 `$CODEX_HOME/plugins/cache/zerograph/zerograph/<version>/`), runs the session hook at session start,
 for each subagent and after an `apply_patch`, and carries the commands as skills: `$zerograph:ask`,
 `$zerograph:impact`, `$zerograph:trace`, `$zerograph:changes`, `$zerograph:explain`,
 `$zerograph:status` and `$zerograph:refresh` run only when named, and `use-the-graph` is the one the
 model picks up by itself. Codex asks once before it trusts a plugin's hooks. Codex hands the server
-only `CODEX_HOME` and `ZEROGRAPH_BIN` from the environment, so a project-local binary goes in
-`ZEROGRAPH_BIN`. Codex has no hook before a shell command, so nothing answers a grep before it runs.
+its own short list (`PATH`, `HOME`, `LANG`, `TMPDIR` and a few more) plus what `.mcp.json` names:
+`CODEX_HOME`, the `ZEROGRAPH_*` settings, the model cache and Hugging Face variables, the
+`HTTP(S)_PROXY`/`NO_PROXY`/`ALL_PROXY` pair in both cases, the certificate paths and `LC_*`. A
+project-local binary goes in `ZEROGRAPH_BIN`. Codex has no hook before a shell command, so nothing
+answers a grep before it runs.
+
+On Windows the hooks run their `commandWindows` form, which reads `PLUGIN_ROOT` inside `node`
+instead of through a POSIX shell's `${PLUGIN_ROOT}`; it is checked under a POSIX shell in CI but has
+not run under Codex on a Windows machine yet.
 
 ## Windows notes
 

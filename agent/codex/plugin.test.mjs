@@ -19,16 +19,16 @@ test('the scripts are the Claude Code plugin\'s, byte for byte', () => {
   for (const file of readdirSync(join(CLAUDE, 'scripts')).filter((f) => f.endsWith('.mjs') && !f.endsWith('.test.mjs'))) {
     assert.ok(existsSync(join(CODEX, 'scripts', file)), `agent/codex/scripts/${file} is missing`);
     assert.equal(readFileSync(join(CODEX, 'scripts', file), 'utf8'), readFileSync(join(CLAUDE, 'scripts', file), 'utf8'),
-      `agent/codex/scripts/${file} differs; copy it from agent/claude-code/scripts`);
+      `agent/codex/scripts/${file} differs; run scripts/sync-plugin-scripts.sh`);
   }
 });
 
-test('one version: both plugins, the bootstrap\'s cache path and the crate', () => {
+test('one version: both plugins and the crate', () => {
   const version = json(CODEX, '.codex-plugin', 'plugin.json').version;
   assert.equal(json(CLAUDE, '.claude-plugin', 'plugin.json').version, version);
   assert.equal(readFileSync(join(REPO, 'Cargo.toml'), 'utf8').match(/^version = "(.+)"$/m)[1], version);
-  // Codex installs a plugin under its version, and the bootstrap names that directory.
-  assert.ok(json(CODEX, '.mcp.json').mcpServers.zerograph.args.join(' ').includes(`'${version}'`));
+  assert.doesNotMatch(json(CODEX, '.mcp.json').mcpServers.zerograph.args.join(' '), /\d+\.\d+\.\d+/,
+    'the bootstrap finds the installed version; one written into it goes stale on the next release');
 });
 
 test('every Claude Code command is a Codex skill, explicit-only where the command is', () => {
@@ -52,7 +52,12 @@ test('the hooks run the shipped hook, and the marketplace points at this directo
   const hooks = json(CODEX, 'hooks', 'hooks.json').hooks;
   assert.deepEqual(Object.keys(hooks).sort(), ['PostToolUse', 'SessionStart', 'SubagentStart']);
   for (const groups of Object.values(hooks)) {
-    for (const h of groups.flatMap((g) => g.hooks)) assert.equal(h.command, 'node "${PLUGIN_ROOT}/scripts/hook.mjs"');
+    for (const h of groups.flatMap((g) => g.hooks)) {
+      assert.equal(h.command, 'node "${PLUGIN_ROOT}/scripts/hook.mjs"');
+      // `${PLUGIN_ROOT}` is a POSIX shell's expansion; the Windows form reads the variable in node.
+      assert.doesNotMatch(h.commandWindows, /\$\{|%PLUGIN_ROOT%|\$env:/);
+      assert.match(h.commandWindows, /process\.env\.PLUGIN_ROOT/);
+    }
   }
   const market = json(REPO, '.agents', 'plugins', 'marketplace.json');
   assert.equal(market.name, 'zerograph');
@@ -61,11 +66,23 @@ test('the hooks run the shipped hook, and the marketplace points at this directo
   for (const key of ['skills', 'mcpServers', 'hooks']) assert.ok(existsSync(join(CODEX, manifest[key])), key);
 });
 
+test('the Windows hook command starts the hook from PLUGIN_ROOT', () => {
+  const [h] = json(CODEX, 'hooks', 'hooks.json').hooks.SessionStart[0].hooks;
+  const project = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-codex-hook-')));
+  const r = spawnSync(h.commandWindows, { shell: true, cwd: project, encoding: 'utf8',
+    env: { ...process.env, PLUGIN_ROOT: CODEX }, input: JSON.stringify({ hook_event_name: 'SessionStart', cwd: project }) });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stderr, '');
+});
+
 test('the MCP bootstrap finds the installed plugin under CODEX_HOME and serves the project it starts in', { skip: WIN && 'a POSIX launcher for the fake' }, () => {
   const base = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-codex-test-')));
-  const version = json(CODEX, '.codex-plugin', 'plugin.json').version;
   const home = join(base, 'codex-home');
-  cpSync(CODEX, join(home, 'plugins', 'cache', 'zerograph', 'zerograph', version), { recursive: true });
+  const cache = join(home, 'plugins', 'cache', 'zerograph', 'zerograph');
+  cpSync(CODEX, join(cache, '0.10.0'), { recursive: true });
+  // An older release left behind must not win: 0.9.0 sorts after 0.10.0 as text.
+  mkdirSync(join(cache, '0.9.0', 'scripts'), { recursive: true });
+  writeFileSync(join(cache, '0.9.0', 'scripts', 'mcp.mjs'), 'export function main() { process.exit(7); }\n');
   const project = join(base, 'project');
   mkdirSync(join(project, '.git'), { recursive: true });
   mkdirSync(join(project, 'src'));
@@ -81,4 +98,16 @@ test('the MCP bootstrap finds the installed plugin under CODEX_HOME and serves t
   const r = spawnSync(server.command, server.args, { cwd: join(project, 'src'), env, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);
   assert.equal(readFileSync(seen, 'utf8').trim(), `--repo ${project} mcp`);
+
+  const bare = spawnSync(server.command, server.args, { cwd: project, env: { ...env, CODEX_HOME: join(base, 'empty') }, encoding: 'utf8' });
+  assert.equal(bare.status, 1);
+  assert.match(bare.stderr, /no installed plugin under .*codex plugin add zerograph@zerograph/);
+});
+
+test('the MCP server sees the variables the binary and its model download read', () => {
+  const passed = json(CODEX, '.mcp.json').mcpServers.zerograph.env_vars;
+  // PATH, HOME, LANG, TMPDIR and the like Codex passes by itself; everything else it scrubs.
+  for (const name of ['ZEROGRAPH_BIN', 'ZEROGRAPH_CONFIG', 'HF_HOME', 'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'USERPROFILE', 'LC_ALL']) {
+    assert.ok(passed.includes(name), name);
+  }
 });

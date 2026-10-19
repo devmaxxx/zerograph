@@ -4,12 +4,44 @@
       "command": "node",
       "env_vars": [
         "CODEX_HOME",
-        "ZEROGRAPH_BIN"
+        "ZEROGRAPH_BIN",
+        "ZEROGRAPH_CONFIG",
+        "ZEROGRAPH_CODE_GLOBS",
+        "ZEROGRAPH_TEXT_GLOBS",
+        "ZEROGRAPH_EMBED_MODEL",
+        "ZEROGRAPH_RERANK_MODEL",
+        "ZEROGRAPH_RERANKER_DIR",
+        "ZEROGRAPH_RESOURCES",
+        "ZEROGRAPH_READER_BUDGET",
+        "ZEROGRAPH_VECTOR_CACHE",
+        "ZEROGRAPH_QUESTIONS_GATE",
+        "ZEROGRAPH_TIMING",
+        "FASTEMBED_CACHE_DIR",
+        "HF_HOME",
+        "HF_ENDPOINT",
+        "XDG_CONFIG_HOME",
+        "XDG_CACHE_HOME",
+        "USERPROFILE",
+        "LOCALAPPDATA",
+        "APPDATA",
+        "HTTP_PROXY",
+        "HTTPS_PROXY",
+        "NO_PROXY",
+        "ALL_PROXY",
+        "http_proxy",
+        "https_proxy",
+        "no_proxy",
+        "all_proxy",
+        "SSL_CERT_FILE",
+        "SSL_CERT_DIR",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE"
       ],
       "args": [
         "--input-type=module",
         "-e",
-        "import{homedir}from'node:os';import{join}from'node:path';import{pathToFileURL}from'node:url';const m=await import(pathToFileURL(join(process.env.CODEX_HOME||join(homedir(),'.codex'),'plugins','cache','zerograph','zerograph','0.7.0','scripts','mcp.mjs')).href);m.main();"
+        "import{readdirSync}from'node:fs';import{homedir}from'node:os';import{join}from'node:path';import{pathToFileURL}from'node:url';const d=join(process.env.CODEX_HOME||join(homedir(),'.codex'),'plugins','cache','zerograph','zerograph');let v=[];try{v=readdirSync(d).sort((a,b)=>b.localeCompare(a,'en',{numeric:true}))}catch{}if(!v.length){process.stderr.write(`zerograph: no installed plugin under ${d}; run codex plugin add zerograph@zerograph\\n`);process.exit(1)}(await import(pathToFileURL(join(d,v[0],'scripts','mcp.mjs')).href)).main();"
       ]
     }
   }

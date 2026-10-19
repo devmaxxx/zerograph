@@ -611,6 +611,23 @@ test('an edit to a hub injects one risk line, once, and only above LOW', () => {
   assert.deepEqual(argv(doc), [], 'a document edit does not even ask');
 });
 
+test('a Codex apply_patch is scored on every file its patch writes', () => {
+  const w = world({ answer: diff([
+    { file: 'src/db.ts', symbol: 'DatabaseService.withTenant', callers: 18 },
+    { file: 'src/slots.ts', symbol: 'freeSlots', callers: 6, files: 2 },
+  ], 'HIGH') });
+  const patch = ['*** Begin Patch', '*** Update File: src/db.ts', '@@', '-a', '+b', '*** Add File: notes.md', '+x',
+    '*** Update File: src/old.ts', '*** Move to: src/slots.ts', '@@', '-c', '+d', '*** End Patch'].join('\n');
+  const c = context(fire(w, { hook_event_name: 'PostToolUse', tool_name: 'apply_patch', tool_input: { command: patch } }));
+  assert.match(c, /risk HIGH — 18 direct callers of DatabaseService\.withTenant/);
+  assert.match(c, /risk MEDIUM — 6 direct callers of freeSlots in 2 files/, 'a moved file is scored at its new path');
+
+  const doc = world({ answer: diff([{ file: 'src/db.ts', symbol: 'x', callers: 18 }], 'HIGH') });
+  const md = { hook_event_name: 'PostToolUse', tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Add File: x.md\n+y\n*** End Patch' } };
+  assert.equal(fire(doc, md), null);
+  assert.deepEqual(argv(doc), [], 'a patch that writes no TypeScript does not even ask');
+});
+
 test('an edit is scored on its own file\'s callers, not on the rest of the diff', () => {
   const w = world({ answer: diff([
     { file: 'src/db.ts', symbol: 'DatabaseService.withTenant', callers: 40 },

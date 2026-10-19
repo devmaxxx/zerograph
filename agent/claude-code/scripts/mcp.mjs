@@ -17,8 +17,6 @@ export function argvOf(bin, checkout, comspec) {
   return commandOf(bin, ['--repo', checkout, 'mcp'], comspec);
 }
 
-const UNSET_OPTION = '${user_config.binary}';
-
 export function main() {
   const win = process.platform === 'win32';
   const env = process.env;
@@ -26,10 +24,9 @@ export function main() {
   // project and names nothing, and neither documents the working directory for the other.
   const checkout = checkoutOf(env.CLAUDE_PROJECT_DIR || process.cwd());
   // ZEROGRAPH_BIN before the option, in the hook's order, so the two never run different binaries.
-  // Claude Code passes the option as the one argument, unsubstituted while it is unset; Codex has
-  // no options and passes ZEROGRAPH_BIN through.
-  const option = process.argv[2] === UNSET_OPTION ? '' : process.argv[2];
-  const found = binaryOf(env.ZEROGRAPH_BIN || option || '', { path: env[pathKey(env, win)], checkout, win });
+  // Claude Code passes the option as the one argument, unsubstituted while it is unset, which
+  // `binaryOf` reads as empty; Codex has no options and passes ZEROGRAPH_BIN through.
+  const found = binaryOf(env.ZEROGRAPH_BIN || process.argv[2] || '', { path: env[pathKey(env, win)], checkout, win });
   const launch = found.error ? found : argvOf(found.bin, checkout, env.ComSpec);
   if (launch.error) {
     // stderr is the server log the harness shows; stdout belongs to the protocol.

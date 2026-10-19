@@ -19,10 +19,13 @@ const LEGACY_SKILL: &str = include_str!("../agent/legacy/skill.md");
 const LEGACY_REPO_QUERY: &str = include_str!("../agent/legacy/repo-query.md");
 const LEGACY_SCOUT: &str = include_str!("../agent/legacy/repo-scout.md");
 const LEGACY_HOOK: &str = "zerograph-hook.mjs";
+/// The hook script 0.6.0–0.6.4 wrote, one text across all five.
+const LEGACY_HOOK_TEXT: &str = include_str!("../agent/legacy/zerograph-hook.mjs");
 
 /// The repository both harnesses read the marketplace from, and the plugin's id in it.
 const MARKETPLACE: &str = "devmaxxx/zerograph";
 const PLUGIN: &str = "zerograph@zerograph";
+const MARKETPLACE_NAME: &str = "zerograph";
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Target { Claude, Codex }
@@ -36,23 +39,75 @@ impl Target {
         match self { Target::Claude => "claude", Target::Codex => "codex" }
     }
 
-    /// The commands that install the plugin, each safe to repeat. Claude Code's marketplace pins
-    /// the plugin to a release tag itself; Codex reads the plugin out of the marketplace's own
-    /// checkout, so the release is pinned on the marketplace, to the one this binary is.
+    /// The commands that install the plugin, or bring an installed one to this release, each safe
+    /// to repeat. Claude Code's marketplace pins the plugin to a release tag itself, so the catalog
+    /// is refreshed and the plugin updated to what it names now; an install alone leaves an older
+    /// release in place. Codex reads the plugin out of the marketplace's own checkout, so the
+    /// release is pinned on the marketplace, to the one this binary is.
     fn plugin_steps(self) -> Vec<Vec<String>> {
         let s = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
         match self {
-            Target::Claude => vec![s(&["plugin", "marketplace", "add", MARKETPLACE]), s(&["plugin", "install", PLUGIN])],
+            Target::Claude => vec![
+                s(&["plugin", "marketplace", "add", MARKETPLACE]),
+                s(&["plugin", "marketplace", "update", MARKETPLACE_NAME]),
+                s(&["plugin", "install", PLUGIN]),
+                s(&["plugin", "update", PLUGIN]),
+            ],
             Target::Codex => vec![
                 s(&["plugin", "marketplace", "add", MARKETPLACE, "--ref", &format!("v{VERSION}")]),
                 s(&["plugin", "add", PLUGIN]),
             ],
         }
     }
+
+    /// What to run instead when `step` failed saying `said`. Codex refuses to re-add a marketplace
+    /// under another ref — which is every upgrade of the binary — until the old source is removed;
+    /// removing it keeps the plugin enabled, and the `plugin add` after it installs the new release.
+    fn recovery(self, step: &[String], said: &str) -> Option<Vec<Vec<String>>> {
+        let repinning = self == Target::Codex && step.get(1).is_some_and(|a| a == "marketplace")
+            && said.contains("already added from a different source");
+        repinning.then(|| vec![
+            ["plugin", "marketplace", "remove", MARKETPLACE_NAME].iter().map(|a| a.to_string()).collect(),
+            step.to_vec(),
+        ])
+    }
 }
 
 #[derive(Debug, Default)]
-pub struct Report { pub written: usize, pub paths: Vec<String>, pub notes: Vec<String> }
+pub struct Report {
+    pub written: usize,
+    pub paths: Vec<String>,
+    pub notes: Vec<String>,
+    /// Files an earlier install wrote that git tracks, left for the team to retire.
+    pub committed: Vec<String>,
+}
+
+/// How far a retirement reaches.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Retire {
+    /// Take out files git tracks too. Off by default: a committed hook or stanza serves every
+    /// teammate who has no plugin yet, and removing it here puts that removal in someone's commit.
+    pub committed: bool,
+    /// Whether the machine's hook entries that run a script in the repository are gone. Codex's
+    /// live in `$CODEX_HOME/hooks.json`, outside the repository, and a script they still run
+    /// stays.
+    pub machine_hooks_gone: bool,
+}
+
+/// Whether git tracks `path` in the checkout that holds it.
+fn tracked(path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
+    std::process::Command::new("git").arg("-C").arg(dir).args(["ls-files", "--error-unmatch", "--"]).arg(name)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().is_ok_and(|s| s.success())
+}
+
+/// Whether `path` stays because git tracks it, recording it when so.
+fn keep_committed(path: &Path, retire: Retire, report: &mut Report) -> bool {
+    if retire.committed || !tracked(path) { return false; }
+    report.committed.push(path.display().to_string());
+    true
+}
 
 /// How a CLI is run: `program`, in `cwd`, with `args`; `None` when it is not installed. A test
 /// passes its own.
@@ -89,16 +144,27 @@ pub fn install_plugin(root: &Path, target: Target, run: Run) -> (bool, Report) {
     let mut report = Report::default();
     let cli = target.cli();
     let steps = target.plugin_steps();
-    let by_hand = steps.iter().map(|s| format!("  {cli} {}", s.iter().map(|a| shell_word(a)).collect::<Vec<_>>().join(" "))).collect::<Vec<_>>().join("\n");
+    let mut by_hand = steps.iter().map(|s| format!("  {cli} {}", s.iter().map(|a| shell_word(a)).collect::<Vec<_>>().join(" "))).collect::<Vec<_>>().join("\n");
+    if target == Target::Codex {
+        by_hand.push_str(&format!("\n(when Codex says the marketplace is already added from a different source, run `codex plugin marketplace remove {MARKETPLACE_NAME}` first)"));
+    }
+    let said = |out: &std::process::Output| [&out.stderr[..], &out.stdout[..]].iter()
+        .map(|b| String::from_utf8_lossy(b).trim().to_string()).find(|s| !s.is_empty()).unwrap_or_default();
     for step in &steps {
-        match run(cli, root, step) {
+        let mut out = run(cli, root, step);
+        if let Some(fallback) = out.as_ref().filter(|o| !o.status.success()).and_then(|o| target.recovery(step, &said(o))) {
+            for again in &fallback {
+                out = run(cli, root, again);
+                if !out.as_ref().is_some_and(|o| o.status.success()) { break; }
+            }
+        }
+        match out {
             None => {
                 report.notes.push(format!("`{cli}` is not on PATH, so the plugin was not installed; run these where it is, then run this again to take out the older install:\n{by_hand}"));
                 return (false, report);
             }
             Some(out) if !out.status.success() => {
-                let said = [&out.stderr[..], &out.stdout[..]].iter().map(|b| String::from_utf8_lossy(b).trim().to_string()).find(|s| !s.is_empty()).unwrap_or_default();
-                report.notes.push(format!("`{cli} {}` failed ({said}), so the plugin was not installed; the commands are:\n{by_hand}", step.join(" ")));
+                report.notes.push(format!("`{cli} {}` failed ({}), so the plugin was not installed; the commands are:\n{by_hand}", step.join(" "), said(&out)));
                 return (false, report);
             }
             Some(_) => {}
@@ -191,13 +257,15 @@ fn write_if_changed(path: &Path, text: &str, report: &mut Report) -> Result<()> 
 }
 
 /// Removes `path`, counted and named, or says why it stayed.
-fn remove(path: &Path, why: &str, report: &mut Report) {
+fn remove(path: &Path, why: &str, retire: Retire, report: &mut Report) {
+    if std::fs::symlink_metadata(path).is_err() { return; }
     // Unlinking would leave the file it points at, which another checkout or a dotfile manager
     // shares, still holding what is being retired, and nothing would say so.
     if is_symlink(path) {
         report.notes.push(format!("{} is a symlink, so it was left; {why}, so remove it and what it points at by hand", path.display()));
         return;
     }
+    if keep_committed(path, retire, report) { return; }
     match std::fs::remove_file(path) {
         Ok(()) => {
             report.written += 1;
@@ -233,7 +301,7 @@ fn generated_from(template: &str, text: &str) -> bool {
 /// Removes a skill directory an earlier release wrote: only one holding nothing but the `SKILL.md`
 /// `ours` recognises. An edited one, or one with files of its own, is a team's skill under that
 /// name, and is left and named.
-fn retire_skill(dir: &Path, ours: &dyn Fn(&str) -> bool, report: &mut Report) {
+fn retire_skill(dir: &Path, ours: &dyn Fn(&str) -> bool, retire: Retire, report: &mut Report) {
     let Ok(meta) = std::fs::symlink_metadata(dir) else { return };
     let file = dir.join("SKILL.md");
     let only_skill = meta.is_dir() && std::fs::read_dir(dir).is_ok_and(|entries| {
@@ -243,7 +311,7 @@ fn retire_skill(dir: &Path, ours: &dyn Fn(&str) -> bool, report: &mut Report) {
         report.notes.push(format!("{} is not the skill an earlier zerograph wrote, so it was left; the plugin's skill replaces it", dir.display()));
         return;
     }
-    remove(&file, "the plugin carries the skill now", report);
+    remove(&file, "the plugin carries the skill now", retire, report);
     let _ = std::fs::remove_dir(dir);
 }
 
@@ -278,35 +346,51 @@ pub fn without_hook_entries(existing: &str) -> Result<Option<String>> {
     Ok(Some(serde_json::to_string_pretty(&root)? + "\n"))
 }
 
-/// Takes our hook entries out of a settings file, removing the file when they were all it held.
-fn retire_hook_entries(path: &Path, report: &mut Report) {
-    let Ok(existing) = std::fs::read_to_string(path) else { return };
+/// Takes our hook entries out of a settings file, removing the file when they were all it held, and
+/// says whether none are left in it.
+fn retire_hook_entries(path: &Path, retire: Retire, report: &mut Report) -> bool {
+    let Ok(existing) = std::fs::read_to_string(path) else { return true };
     match without_hook_entries(&existing) {
-        Ok(None) => {}
-        Ok(Some(_)) if is_symlink(path) => report.notes.push(format!("{} is a symlink, so the hook entries an earlier release wrote were left in it; take out the ones that run {LEGACY_HOOK}", path.display())),
-        Ok(Some(rest)) if rest.trim() == "{}" => remove(path, "it held only the hook entries an earlier release wrote, and the plugin runs the hook now", report),
+        Ok(None) => true,
+        Ok(Some(_)) if is_symlink(path) => {
+            report.notes.push(format!("{} is a symlink, so the hook entries an earlier release wrote were left in it; take out the ones that run {LEGACY_HOOK}", path.display()));
+            false
+        }
+        Ok(Some(_)) if keep_committed(path, retire, report) => false,
+        Ok(Some(rest)) if rest.trim() == "{}" => {
+            remove(path, "it held only the hook entries an earlier release wrote, and the plugin runs the hook now", retire, report);
+            !path.exists()
+        }
         Ok(Some(rest)) => match std::fs::write(path, rest) {
             Ok(()) => {
                 report.written += 1;
                 report.paths.push(path.display().to_string());
                 report.notes.push(format!("{}: took out the hook entries an earlier release wrote; the plugin runs the hook now", path.display()));
+                true
             }
-            Err(e) => report.notes.push(format!("{} could not be rewritten ({e}); take out the entries that run {LEGACY_HOOK}", path.display())),
+            Err(e) => {
+                report.notes.push(format!("{} could not be rewritten ({e}); take out the entries that run {LEGACY_HOOK}", path.display()));
+                false
+            }
         },
-        Err(e) => report.notes.push(format!("{} is left as it is ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display())),
+        Err(e) => {
+            report.notes.push(format!("{} is left as it is ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display()));
+            false
+        }
     }
 }
 
 /// Takes our stanza out of an instructions file, removing the file when it was all it held.
-fn retire_stanza(path: &Path, report: &mut Report) {
+fn retire_stanza(path: &Path, retire: Retire, report: &mut Report) {
     let Ok(existing) = std::fs::read_to_string(path) else { return };
     let Some(rest) = without_stanza(&existing) else { return };
     if is_symlink(path) {
         report.notes.push(format!("{} is a symlink, so the stanza an earlier release wrote was left in what it points to; the plugin's skill replaces it", path.display()));
         return;
     }
+    if keep_committed(path, retire, report) { return; }
     if rest.trim().is_empty() {
-        remove(path, "it held only the stanza an earlier release wrote, and the plugin's skill replaces it", report);
+        remove(path, "it held only the stanza an earlier release wrote, and the plugin's skill replaces it", retire, report);
         return;
     }
     match std::fs::write(path, rest) {
@@ -326,13 +410,38 @@ fn opencode_wants_stanza(root: &Path) -> bool {
         .is_some_and(|v| v[Editor::Opencode.servers_key()].get(MCP_NAME).is_some())
 }
 
+/// Whether `text` is the hook 0.6.0–0.6.4 wrote: the template with its command line resolved to
+/// whatever command the install was given, and, from 0.6.4, a stamp under the shebang.
+fn generated_hook(text: &str) -> bool {
+    const TEMPLATE_COMMAND: &str = "const COMMAND = \"zerograph\";";
+    let Some((shebang, rest)) = text.split_once('\n') else { return false };
+    let rest = match rest.split_once('\n') {
+        Some((stamp, after)) if stamp.starts_with("// zerograph ") && stamp.contains(" wrote: ") => after,
+        _ => rest,
+    };
+    let Some(a) = rest.find("const COMMAND = ") else { return false };
+    let end = rest[a..].find('\n').map_or(rest.len(), |n| a + n);
+    format!("{shebang}\n{}{TEMPLATE_COMMAND}{}", &rest[..a], &rest[end..]) == LEGACY_HOOK_TEXT
+}
+
 /// Removes the hook script an earlier release wrote into `hooks`, and its rule while it is still the
-/// text that release generated.
-pub fn retire_hook_script(hooks: &Path, report: &mut Report) {
-    remove(&hooks.join(LEGACY_HOOK), "the plugin runs the session hook now", report);
+/// text that release generated — but only once `entries_gone`: a hook entry left pointing at a
+/// removed script fails on every event it matches.
+pub fn retire_hook_script(hooks: &Path, entries_gone: bool, retire: Retire, report: &mut Report) {
+    let script = hooks.join(LEGACY_HOOK);
+    let Ok(text) = std::fs::read_to_string(&script) else { return };
+    if !entries_gone {
+        report.notes.push(format!("{} was left: hook entries that run it are still in place", script.display()));
+        return;
+    }
+    if !generated_hook(&text) {
+        report.notes.push(format!("{} is not the hook an earlier zerograph wrote, so it was left; the plugin runs its own", script.display()));
+        return;
+    }
+    remove(&script, "the plugin runs the session hook now", retire, report);
     let rule = hooks.join("rule.txt");
     match std::fs::read_to_string(&rule) {
-        Ok(t) if generated_from(LEGACY_RULE, &t) => remove(&rule, "the plugin's hook carries the rule", report),
+        Ok(t) if generated_from(LEGACY_RULE, &t) => remove(&rule, "the plugin's hook carries the rule", retire, report),
         Ok(_) => report.notes.push(format!("{} was edited, so it was left; the plugin's hook carries its own rule and never reads it", rule.display())),
         Err(_) => {}
     }
@@ -343,29 +452,32 @@ pub fn retire_hook_script(hooks: &Path, report: &mut Report) {
 /// carries it: the hook script and its rule, the hook entries in `.claude/settings.json`, the skill
 /// and the subagent where they are still the text that release generated, and the stanza. Run only
 /// once the plugin is in, so a session is never left with neither.
-pub fn retire_repo_install(root: &Path, target: Target) -> Report {
+pub fn retire_repo_install(root: &Path, target: Target, retire: Retire) -> Report {
     let mut report = Report::default();
     let base = root.join(target.dir());
-    retire_hook_script(&base.join("hooks"), &mut report);
-    if target == Target::Claude { retire_hook_entries(&base.join("settings.json"), &mut report); }
+    let entries_gone = match target {
+        Target::Claude => retire_hook_entries(&base.join("settings.json"), retire, &mut report),
+        Target::Codex => retire.machine_hooks_gone,
+    };
+    retire_hook_script(&base.join("hooks"), entries_gone, retire, &mut report);
 
     let skills = base.join("skills");
     let generated = |t: &str| skill_version(t).is_some_and(|v| generated_from(&LEGACY_SKILL.replace("{{version}}", v), t));
-    if skills.join("zerograph").exists() { retire_skill(&skills.join("zerograph"), &generated, &mut report); }
-    if skills.join("repo-query").exists() { retire_skill(&skills.join("repo-query"), &|t| generated_from(LEGACY_REPO_QUERY, t), &mut report); }
+    if skills.join("zerograph").exists() { retire_skill(&skills.join("zerograph"), &generated, retire, &mut report); }
+    if skills.join("repo-query").exists() { retire_skill(&skills.join("repo-query"), &|t| generated_from(LEGACY_REPO_QUERY, t), retire, &mut report); }
     remove_if_empty(&skills);
     let scout = base.join("agents").join("repo-scout.md");
     match std::fs::read_to_string(&scout) {
-        Ok(t) if generated_from(LEGACY_SCOUT, &t) => remove(&scout, "the plugin carries the subagent now", &mut report),
+        Ok(t) if generated_from(LEGACY_SCOUT, &t) => remove(&scout, "the plugin carries the subagent now", retire, &mut report),
         Ok(_) => report.notes.push(format!("{} is not the subagent an earlier zerograph wrote, so it was left; the plugin's repo-scout replaces it", scout.display())),
         Err(_) => {}
     }
     remove_if_empty(&base.join("agents"));
 
     match target {
-        Target::Claude => for file in [root.join("CLAUDE.md"), base.join("CLAUDE.md")] { retire_stanza(&file, &mut report) },
+        Target::Claude => for file in [root.join("CLAUDE.md"), base.join("CLAUDE.md")] { retire_stanza(&file, retire, &mut report) },
         Target::Codex if opencode_wants_stanza(root) => {}
-        Target::Codex => retire_stanza(&root.join("AGENTS.md"), &mut report),
+        Target::Codex => retire_stanza(&root.join("AGENTS.md"), retire, &mut report),
     }
     remove_if_empty(&base);
     report
@@ -380,27 +492,38 @@ pub fn codex_home() -> Option<PathBuf> {
 }
 
 /// Takes out of Codex's machine hooks file the entries an earlier release printed for a person to
-/// paste in: with the plugin's hook beside them, the hook would answer every event twice.
-pub fn retire_codex_hooks(home: &Path) -> Report {
+/// paste in: with the plugin's hook beside them, the hook would answer every event twice. Says
+/// whether none are left, which is when the script they ran can go.
+pub fn retire_codex_hooks(home: &Path) -> (bool, Report) {
     let mut report = Report::default();
     // Written through a link to where it points, so a dotfile manager's link stays one.
     let path = home.join("hooks.json");
     let path = path.canonicalize().unwrap_or(path);
-    let Ok(seen) = std::fs::metadata(&path) else { return report };
-    let Ok(existing) = std::fs::read_to_string(&path) else { return report };
-    match without_hook_entries(&existing) {
-        Ok(None) => {}
+    let Ok(seen) = std::fs::metadata(&path) else { return (true, report) };
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        report.notes.push(format!("{} could not be read; take out the entries that run {LEGACY_HOOK}", path.display()));
+        return (false, report);
+    };
+    let gone = match without_hook_entries(&existing) {
+        Ok(None) => true,
         Ok(Some(rest)) => match replace_config(&path, &seen, &rest) {
             Ok(()) => {
                 report.written += 1;
                 report.paths.push(path.display().to_string());
                 report.notes.push(format!("{}: took out the entries that ran {LEGACY_HOOK}; the plugin runs the hook now", path.display()));
+                true
             }
-            Err(e) => report.notes.push(format!("{} could not be rewritten ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display())),
+            Err(e) => {
+                report.notes.push(format!("{} could not be rewritten ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display()));
+                false
+            }
         },
-        Err(e) => report.notes.push(format!("{} is left as it is ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display())),
-    }
-    report
+        Err(e) => {
+            report.notes.push(format!("{} is left as it is ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display()));
+            false
+        }
+    };
+    (gone, report)
 }
 
 /// An editor or CLI that reads a project MCP file and an instructions file, and none of the
@@ -1017,7 +1140,8 @@ mod tests {
     #[test]
     fn each_harness_installs_the_plugin_through_its_own_cli_marketplace_first() {
         for (target, wanted) in [
-            (Target::Claude, vec!["claude plugin marketplace add devmaxxx/zerograph".to_string(), "claude plugin install zerograph@zerograph".to_string()]),
+            (Target::Claude, vec!["claude plugin marketplace add devmaxxx/zerograph".to_string(), "claude plugin marketplace update zerograph".to_string(),
+                "claude plugin install zerograph@zerograph".to_string(), "claude plugin update zerograph@zerograph".to_string()]),
             (Target::Codex, vec![format!("codex plugin marketplace add devmaxxx/zerograph --ref v{VERSION}"), "codex plugin add zerograph@zerograph".to_string()]),
         ] {
             let calls = std::cell::RefCell::new(Vec::<String>::new());
@@ -1033,7 +1157,7 @@ mod tests {
         let (ok, r) = install_plugin(Path::new("."), Target::Claude, &|_, _, _| None);
         assert!(!ok);
         assert!(r.notes[0].contains("`claude` is not on PATH"), "{:?}", r.notes);
-        assert!(r.notes[0].contains("  claude plugin marketplace add devmaxxx/zerograph\n  claude plugin install zerograph@zerograph"), "{:?}", r.notes);
+        assert!(r.notes[0].contains("  claude plugin marketplace add devmaxxx/zerograph\n  claude plugin marketplace update zerograph\n  claude plugin install zerograph@zerograph\n  claude plugin update zerograph@zerograph"), "{:?}", r.notes);
     }
 
     #[test]
@@ -1049,6 +1173,46 @@ mod tests {
         assert!(r.notes[0].contains("network down") && r.notes[0].contains("codex plugin add zerograph@zerograph"), "{:?}", r.notes);
     }
 
+    #[test]
+    fn a_codex_marketplace_pinned_to_an_older_release_is_repinned_to_this_one() {
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let run = |_: &str, _: &Path, args: &[String]| {
+            let call = args.join(" ");
+            let first = !calls.borrow().iter().any(|c| c == &call);
+            calls.borrow_mut().push(call.clone());
+            if call.starts_with("plugin marketplace add") && first {
+                return Some(std::process::Output { stderr: b"Error: marketplace 'zerograph' is already added from a different source; remove it before adding this source".to_vec(), ..exited(1, "") });
+            }
+            Some(exited(0, ""))
+        };
+        let (ok, r) = install_plugin(Path::new("."), Target::Codex, &run);
+        assert!(ok, "{r:?}");
+        let add = format!("plugin marketplace add devmaxxx/zerograph --ref v{VERSION}");
+        assert_eq!(calls.into_inner(), vec![add.clone(), "plugin marketplace remove zerograph".to_string(), add, "plugin add zerograph@zerograph".to_string()]);
+    }
+
+    #[test]
+    fn any_other_failure_removes_nothing() {
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let run = |_: &str, _: &Path, args: &[String]| {
+            calls.borrow_mut().push(args.join(" "));
+            Some(std::process::Output { stderr: b"network down".to_vec(), ..exited(1, "") })
+        };
+        let (ok, _) = install_plugin(Path::new("."), Target::Codex, &run);
+        assert!(!ok);
+        assert!(!calls.into_inner().iter().any(|c| c.contains("remove")));
+    }
+
+    /// What a retirement of an older install reaches in a test: no git, so nothing is committed.
+    const OLD: Retire = Retire { committed: false, machine_hooks_gone: true };
+
+    /// The hook as 0.6.4 wrote it for `command`: the command resolved, the stamp under the shebang.
+    fn old_hook(command: &str) -> String {
+        let script = LEGACY_HOOK_TEXT.replacen("const COMMAND = \"zerograph\";", &format!("const COMMAND = {};", serde_json::Value::from(command)), 1);
+        let (shebang, rest) = script.split_once('\n').unwrap();
+        format!("{shebang}\n// zerograph 0.6.4 wrote: SessionStart=startup|resume|clear|compact\n{rest}")
+    }
+
     /// A repository as `install-agent --claude` and `--codex` of 0.7.0's predecessors left it.
     fn older_install(root: &Path, command: &str) {
         let w = |rel: &str, text: &str| {
@@ -1057,7 +1221,7 @@ mod tests {
             std::fs::write(p, text).unwrap();
         };
         for dir in [".claude", ".codex"] {
-            w(&format!("{dir}/hooks/zerograph-hook.mjs"), "#!/usr/bin/env node\n");
+            w(&format!("{dir}/hooks/zerograph-hook.mjs"), &old_hook(command));
             w(&format!("{dir}/hooks/rule.txt"), &with_command(LEGACY_RULE, command));
             w(&format!("{dir}/skills/zerograph/SKILL.md"), &with_command(LEGACY_SKILL, command).replace("{{version}}", "0.6.4"));
         }
@@ -1076,7 +1240,7 @@ mod tests {
     fn a_re_run_over_an_older_install_takes_out_what_it_wrote_and_keeps_the_rest() {
         let dir = root();
         older_install(dir.path(), "pnpm exec zerograph");
-        let r = retire_repo_install(dir.path(), Target::Claude);
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
         assert!(!dir.path().join(".claude/hooks").exists(), "{r:?}");
         assert!(!dir.path().join(".claude/skills").exists(), "{r:?}");
         assert!(!dir.path().join(".claude/agents").exists(), "{r:?}");
@@ -1086,11 +1250,11 @@ mod tests {
         assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), "# House rules\n\nBe kind.\n\n## After\n");
         assert!(dir.path().join("AGENTS.md").exists(), "Codex's stanza is the Codex pass's");
 
-        let r = retire_repo_install(dir.path(), Target::Codex);
+        let r = retire_repo_install(dir.path(), Target::Codex, OLD);
         assert!(!dir.path().join(".codex").exists(), "{r:?}");
         assert!(!dir.path().join("AGENTS.md").exists(), "a file that held only the stanza goes");
 
-        let again = retire_repo_install(dir.path(), Target::Claude);
+        let again = retire_repo_install(dir.path(), Target::Claude, OLD);
         assert_eq!((again.written, again.notes.len()), (0, 0), "{again:?}");
     }
 
@@ -1102,11 +1266,73 @@ mod tests {
         std::fs::write(&settings, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#).unwrap();
         std::fs::write(dir.path().join(".claude/skills/zerograph/SKILL.md"), "---\nname: zerograph\n---\nOur own words.\n").unwrap();
         std::fs::write(dir.path().join(".claude/agents/repo-scout.md"), "a scout of our own\n").unwrap();
-        let r = retire_repo_install(dir.path(), Target::Claude);
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
         assert!(!settings.exists(), "{r:?}");
         assert!(dir.path().join(".claude/skills/zerograph/SKILL.md").exists());
         assert!(dir.path().join(".claude/agents/repo-scout.md").exists());
         assert_eq!(r.notes.iter().filter(|n| n.contains("was left")).count(), 2, "{r:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_hook_script_stays_while_an_entry_still_runs_it() {
+        let dir = root();
+        older_install(dir.path(), "zerograph");
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::rename(&settings, dir.path().join("shared.json")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("shared.json"), &settings).unwrap();
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(dir.path().join(".claude/hooks/zerograph-hook.mjs").exists(), "{r:?}");
+        assert!(dir.path().join(".claude/hooks/rule.txt").exists(), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("hook entries that run it are still in place")), "{r:?}");
+
+        let r = retire_repo_install(dir.path(), Target::Codex, Retire { machine_hooks_gone: false, ..OLD });
+        assert!(dir.path().join(".codex/hooks/zerograph-hook.mjs").exists(), "Codex's entries live in its home: {r:?}");
+    }
+
+    #[test]
+    fn codex_entries_left_in_place_keep_the_script_they_run() {
+        let dir = root();
+        assert!(retire_codex_hooks(dir.path()).0, "no hooks file runs nothing");
+        std::fs::write(dir.path().join("hooks.json"), "{ not json").unwrap();
+        let (gone, r) = retire_codex_hooks(dir.path());
+        assert!(!gone, "{r:?}");
+    }
+
+    #[test]
+    fn an_edited_hook_script_stays() {
+        let dir = root();
+        older_install(dir.path(), "pnpm exec zerograph");
+        let script = dir.path().join(".claude/hooks/zerograph-hook.mjs");
+        assert!(generated_hook(&std::fs::read_to_string(&script).unwrap()), "every command the install was given");
+        assert!(generated_hook(LEGACY_HOOK_TEXT), "0.6.0-0.6.3 wrote no stamp");
+        std::fs::write(&script, old_hook("zerograph") + "// ours\n").unwrap();
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(script.exists(), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("is not the hook an earlier zerograph wrote")), "{r:?}");
+    }
+
+    #[test]
+    fn files_git_tracks_stay_for_the_team_until_asked_for() {
+        let dir = root();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        older_install(dir.path(), "zerograph");
+        git(&["add", ".claude/hooks/zerograph-hook.mjs", ".claude/settings.json", "CLAUDE.md"]);
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        for rel in [".claude/settings.json", "CLAUDE.md"] {
+            assert!(dir.path().join(rel).exists(), "{rel}: {r:?}");
+            assert!(r.committed.iter().any(|p| p.ends_with(rel)), "{rel}: {r:?}");
+        }
+        assert!(dir.path().join(".claude/hooks/zerograph-hook.mjs").exists(), "the entries kept in settings still run it: {r:?}");
+        assert!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap().contains(BEGIN), "a tracked file is not rewritten either");
+        assert!(!dir.path().join(".claude/skills/zerograph").exists(), "an untracked file still goes: {r:?}");
+
+        let r = retire_repo_install(dir.path(), Target::Claude, Retire { committed: true, ..OLD });
+        assert!(!dir.path().join(".claude/hooks").exists(), "{r:?}");
+        assert!(!std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap().contains(LEGACY_HOOK), "{r:?}");
+        assert!(!std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap().contains(BEGIN), "{r:?}");
+        assert!(r.committed.is_empty());
     }
 
     #[test]
@@ -1114,7 +1340,7 @@ mod tests {
         let dir = root();
         older_install(dir.path(), "zerograph");
         install_editor(dir.path(), Editor::Opencode, "zerograph").unwrap();
-        retire_repo_install(dir.path(), Target::Codex);
+        retire_repo_install(dir.path(), Target::Codex, OLD);
         assert!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap().contains(BEGIN));
     }
 
@@ -1125,7 +1351,7 @@ mod tests {
         older_install(dir.path(), "zerograph");
         std::fs::remove_file(dir.path().join("CLAUDE.md")).unwrap();
         std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
-        let r = retire_repo_install(dir.path(), Target::Claude);
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
         assert!(r.notes.iter().any(|n| n.contains("is a symlink")), "{r:?}");
         assert!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap().contains(BEGIN));
     }
@@ -1145,11 +1371,11 @@ mod tests {
         let dir = root();
         let path = dir.path().join("hooks.json");
         std::fs::write(&path, r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"node '/r/.codex/hooks/zerograph-hook.mjs'"}]},{"hooks":[{"type":"command","command":"gitnexus"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"node /r/.codex/hooks/zerograph-hook.mjs"}]}]}}"#).unwrap();
-        let r = retire_codex_hooks(dir.path());
+        let r = retire_codex_hooks(dir.path()).1;
         assert_eq!(r.written, 1, "{r:?}");
         assert_eq!(read_json(&path), serde_json::json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "gitnexus" }] }] } }));
-        assert_eq!(retire_codex_hooks(dir.path()).written, 0);
-        assert_eq!(retire_codex_hooks(&dir.path().join("none")).written, 0);
+        assert_eq!(retire_codex_hooks(dir.path()).1.written, 0);
+        assert_eq!(retire_codex_hooks(&dir.path().join("none")).1.written, 0);
     }
 
     #[test]
@@ -1168,7 +1394,7 @@ mod tests {
         let home = dir.path().join("home");
         std::fs::create_dir(&home).unwrap();
         std::os::unix::fs::symlink(&dotfiles, home.join("hooks.json")).unwrap();
-        assert_eq!(retire_codex_hooks(&home).written, 1);
+        assert_eq!(retire_codex_hooks(&home).1.written, 1);
         assert!(is_symlink(&home.join("hooks.json")), "the link stays a link");
         assert_eq!(read_json(&dotfiles), serde_json::json!({ "x": 1 }));
 
@@ -1177,7 +1403,7 @@ mod tests {
         let shared = dir.path().join("shared.json");
         std::fs::write(&shared, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#).unwrap();
         std::os::unix::fs::symlink(&shared, repo.join(".claude").join("settings.json")).unwrap();
-        let r = retire_repo_install(&repo, Target::Claude);
+        let r = retire_repo_install(&repo, Target::Claude, OLD);
         assert!(is_symlink(&repo.join(".claude").join("settings.json")), "{r:?}");
         assert!(r.notes.iter().any(|n| n.contains("is a symlink")), "{r:?}");
     }
