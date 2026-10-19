@@ -147,7 +147,9 @@ inside the checkout: a cloned repository that commits a `zerograph.toml` and an 
 `node_modules/.bin/zerograph` would otherwise have that file started as soon as a session opened
 in it. A project-local install (`pnpm add -D zerograph`) puts no `zerograph` on `PATH`, so set
 `ZEROGRAPH_BIN` to its absolute path, written out, in the environment the agent starts from, or
-install globally; without either the hook stays silent. A relative `ZEROGRAPH_BIN`, and a `PATH`
+install globally. Without either, a checkout that asked for an index hears at session start that
+zerograph is not installed, with the two install commands, and nothing more; any other stays
+silent. A relative `ZEROGRAPH_BIN`, and a `PATH`
 entry that is relative or lies anywhere inside the checkout, are skipped, since each names the
 checkout's own file. On Windows a `zerograph.exe` anywhere on `PATH` is taken before npm's
 `zerograph.cmd` shim, which only `cmd` can start; when the shim is all there is, a call that runs

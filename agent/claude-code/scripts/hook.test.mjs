@@ -286,7 +286,7 @@ test('a cloned repository that ships an executable node_modules/.bin/zerograph n
   copyFileSync(w.launcher, join(shim, 'zerograph'));
   chmodSync(join(shim, 'zerograph'), 0o755);
   const env = { PATH: join(w.root, 'nothing-here') };
-  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null, 'no binary of its own: no build claimed');
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env).systemMessage, MISSING_MESSAGE, 'no binary of its own: no build claimed');
   fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } }, env);
   await new Promise((r) => setTimeout(r, 300));
   assert.deepEqual(argv(w), [], 'the shipped shim ran');
@@ -506,11 +506,35 @@ test('the plugin\'s binary option names the binary when ZEROGRAPH_BIN does not',
   assert.equal(c, 'zerograph: 3 doc nodes');
 });
 
-test('an opted-in checkout with no binary to start claims no build', { skip: WIN }, async () => {
+const MISSING_MESSAGE = '▲ zerograph is not installed — this repository uses it\n  npm i -g zerograph · pnpm add -g zerograph';
+
+test('an opted-in checkout with no binary says so to the person, claims no build, and tells the model the tools are out', () => {
+  for (const store of [false, true]) {
+    const w = world({ store });
+    mkdirSync(join(w.root, '.git'));
+    writeFileSync(join(w.root, 'zerograph.toml'), '');
+    const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' });
+    assert.equal(out.systemMessage, MISSING_MESSAGE, `store ${store}`);
+    const c = context(out);
+    assert.equal(c.split('\n').length, 1, c);
+    assert.match(c, /not installed/);
+    assert.doesNotMatch(c, /being built/, 'nothing was started');
+  }
+});
+
+test('the missing binary is only the context line under Codex', () => {
   const w = world({ store: false });
   mkdirSync(join(w.root, '.git'));
   writeFileSync(join(w.root, 'zerograph.toml'), '');
-  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here') }), null);
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' }, HOOK, ['--codex']);
+  assert.equal(out.systemMessage, undefined);
+  assert.match(context(out), /not installed/);
+});
+
+test('a repository that never asked for zerograph hears nothing about a missing binary', () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' }), null);
 });
 
 test('while the first session builds, a search is told the build is under way, not to start one', () => {

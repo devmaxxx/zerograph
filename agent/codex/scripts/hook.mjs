@@ -479,11 +479,28 @@ function updateNotice(root) {
   const entry = isExact(current) && Object.hasOwn(versions, current) ? versions[current] : null;
   const latest = entry?.checked ? entry.latest : null;
   if (!isExact(latest) || !newer(latest, current)) return null;
-  const npm = `npm i -g zerograph@${latest}`;
-  const pnpm = `pnpm add -g zerograph@${latest}`;
+  const [npm, pnpm] = installCommands(`zerograph@${latest}`);
   return {
     brief: `zerograph: ${latest} is out and this is ${current}; \`${npm}\` or \`${pnpm}\`.`,
     message: `▲ zerograph ${latest} available (you have ${current})\n  ${npm} · ${pnpm}`,
+  };
+}
+
+function installCommands(spec) {
+  return [`npm i -g ${spec}`, `pnpm add -g ${spec}`];
+}
+
+/**
+ * For a checkout that asked for an index and has no binary to run, built or not: a teammate who got
+ * the plugin from the repository's settings would otherwise get a silent hook and never learn why.
+ */
+function missingNotice(cwd) {
+  const checkout = cwd && checkoutRoot(cwd);
+  if (!checkout || !optedIn(checkout) || binaryFound(checkout)) return null;
+  const [npm, pnpm] = installCommands('zerograph');
+  return {
+    brief: `zerograph: this repository uses zerograph and it is not installed here, so \`${COMMAND}\` and the graph tools are unavailable until \`${npm}\` or \`${pnpm}\` installs it.`,
+    message: `▲ zerograph is not installed — this repository uses it\n  ${npm} · ${pnpm}`,
   };
 }
 
@@ -563,9 +580,9 @@ const handlers = {
       if (!autostartServe(root)) startUpdate(root);
       text = brief(root);
     }
-    const update = updateNotice(root);
-    if (!update) return text;
-    return { additionalContext: [text, update.brief].filter(Boolean).join('\n'), systemMessage: update.message };
+    const notice = missingNotice(p.cwd || root) ?? updateNotice(root);
+    if (!notice) return text;
+    return { additionalContext: [text, notice.brief].filter(Boolean).join('\n'), systemMessage: notice.message };
   },
   SubagentStart: (p, root) => (built(root) ? rule() : null),
   PreToolUse: (p, root, key) => {
