@@ -34,6 +34,16 @@ keys and keystores, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, cloud cre
 `*.tfvars`, `*.tfstate` and `secrets.{yaml,json,toml,…}` — their content would otherwise reach the store, a
 `--rerank` prompt sent to a model, and the answers.
 
+A credential written inside a file that is read — a token in a source file, a key exported in a
+shell script, a private key pasted into a README — is replaced with `[REDACTED_SECRET]` before the
+file is extracted, by the bundled rules of
+[secrets_scanner](https://crates.io/crates/secrets_scanner) (gitleaks-compatible). The rest of the
+file is still read and keeps its line numbers; `update` logs how many were redacted in which file.
+An inline `gitleaks:allow` does not exempt one; the rules' own path allowlist does — images, fonts,
+lockfiles, `vendor/` and `node_modules/` trees are not scanned. A run compiles only the rules whose keywords the
+files it re-reads contain — a few dozen for a one-file update, tens of milliseconds, where all ~1,000
+would cost 1.8 s.
+
 The store writes its own `.gitignore` holding `*`, so `.zerograph/` stays out of a commit in a
 repository that never listed it.
 

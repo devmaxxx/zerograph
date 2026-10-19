@@ -19,6 +19,7 @@ mod prime;
 mod priority;
 mod query;
 mod refresh;
+mod secrets;
 mod serve;
 mod status;
 mod store;
@@ -279,6 +280,9 @@ pub(crate) struct UpdateReport {
     pub graph_at: Option<walk::Stamp>,
 }
 
+/// How much file text is held before it is scanned for secrets and extracted.
+const REDACT_BATCH_BYTES: usize = 64 << 20;
+
 /// Re-extracts what the diff names, drops what is gone, and writes the store back. Nothing else
 /// is read: every citation a file holds was extracted when the file was read, whatever prefix it
 /// names, and which of them a reader may follow is decided on the graph by `settle` — so a family
@@ -348,6 +352,27 @@ pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &m
     work.sort_by(|a, b| a.rel.cmp(&b.rel));
     let reread = co_declared.iter().map(|rel| by_rel[rel]);
     let mut unread = false;
+    // The scanner compiles only the rules whose keywords a batch of texts holds, so a one-file
+    // update pays for a few dozen regexes, not ~1,000. Texts are held a batch at a time: every
+    // text of the tree at once would be the largest allocation of a build. An empty batch builds
+    // no scanner, which keeps the no-op update a commit hook fires free of the rules.
+    let mut batch: Vec<(&walk::Entry, String)> = Vec::new();
+    let mut batch_bytes = 0;
+    let mut extract_batch = |batch: &mut Vec<(&walk::Entry, String)>| {
+        if batch.is_empty() { return; }
+        let redactor = secrets::Redactor::for_texts(batch.iter().map(|(_, text)| text.as_str()));
+        for (e, text) in batch.drain(..) {
+            let (text, redacted) = redactor.redact(&e.rel, &text);
+            if redacted > 0 { eprintln!("{}", log_line(&format!("{}: {redacted} secret(s) redacted", e.rel))); }
+            let extractor = match e.kind {
+                walk::FileKind::Doc => &ex.doc,
+                walk::FileKind::Code => &ex.code,
+                walk::FileKind::Registry => &ex.registry,
+                walk::FileKind::Text => &ex.text,
+            };
+            graph.apply(extractor.extract(&e.rel, &text));
+        }
+    };
     for e in work.into_iter().chain(reread) {
         let text = match std::fs::read(repo.join(&e.rel)) {
             // NUL is legal inside a TypeScript string literal; only invalid UTF-8 marks a binary.
@@ -359,14 +384,14 @@ pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &m
             // that would not open is one this pass has no reading of at all.
             Err(err) => { eprintln!("{}", log_line(&format!("read {}: {err}", e.rel))); unread = true; continue; }
         };
-        let extractor = match e.kind {
-            walk::FileKind::Doc => &ex.doc,
-            walk::FileKind::Code => &ex.code,
-            walk::FileKind::Registry => &ex.registry,
-            walk::FileKind::Text => &ex.text,
-        };
-        graph.apply(extractor.extract(&e.rel, &text));
+        batch_bytes += text.len();
+        batch.push((e, text));
+        if batch_bytes >= REDACT_BATCH_BYTES {
+            extract_batch(&mut batch);
+            batch_bytes = 0;
+        }
     }
+    extract_batch(&mut batch);
     // Whether anything was re-extracted or dropped. Nothing else can move a family, so on a
     // no-op update — the one a commit hook fires — the settle below would read every node and
     // rebuild the whole edge set to arrive at what is already there.
@@ -1448,6 +1473,25 @@ mod tests {
 
     fn built(repo: &std::path::Path, cfg: &config::Config) {
         run_update(repo, cfg, true).unwrap();
+    }
+
+    #[test]
+    fn a_secret_written_in_a_document_reaches_no_file_of_the_store() {
+        let token = format!("ghp_{}", "R7xK2mQ9vT4wL8nB3cF6hJ1pS5dG0aZyEuXo");
+        let dir = doc_repo(&format!("# A\n\n**FR-PAY-22 · MUST · cancellation window**\n\nCall with `{token}`.\n"));
+        let (repo, cfg) = (dir.path(), config::Config::default());
+        built(repo, &cfg);
+        let (graph, _) = store::Store::new(repo).load().unwrap();
+        assert!(graph.nodes.contains_key("FR-PAY-22"), "the rest of the document is still read");
+        let leaked: Vec<_> = walkdir_files(&repo.join(".zerograph")).into_iter()
+            .filter(|p| std::fs::read(p).unwrap().windows(token.len()).any(|w| w == token.as_bytes()))
+            .collect();
+        assert!(leaked.is_empty(), "{leaked:?}");
+    }
+
+    fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        ignore::WalkBuilder::new(dir).standard_filters(false).build().flatten()
+            .filter(|e| e.file_type().is_some_and(|t| t.is_file())).map(|e| e.into_path()).collect()
     }
 
     /// The report exists to say the one thing a configuration-shaped answer would hide: a store

@@ -82,6 +82,11 @@ ast-grep-language = { version = "=0.45.3", default-features = false, features = 
     "tree-sitter-ruby", "tree-sitter-elixir", "tree-sitter-scala",
 ] }
 postcard = { version = "=1.1.3", features = ["use-std"] }
+# Credentials inside files that are read (src/secrets.rs). Without `native`: its CLI, walker, logger and
+# thread pool are not needed to scan a string, and the walk here is `ignore`'s.
+secrets_scanner = { version = "=0.2.3", default-features = false }
+# Already in the tree through `regex`; named here to find which rules a text's keywords call for.
+aho-corasick = "=1.1.5"
 
 [dev-dependencies]
 tempfile = "=3.27.0"
@@ -102,3 +107,14 @@ windows-sys = { version = "=0.61.2", features = ["Win32_Foundation", "Win32_Stor
 
 [profile.release]
 lto = "thin"
+
+# The secret scanner compiles hundreds of regexes, which an unoptimised regex-automata does seven
+# times slower: every test that builds a store would pay that, not only the scanner's own.
+[profile.dev.package.regex-automata]
+opt-level = 3
+[profile.dev.package.regex-syntax]
+opt-level = 3
+[profile.dev.package.aho-corasick]
+opt-level = 3
+[profile.dev.package.secrets_scanner]
+opt-level = 3
