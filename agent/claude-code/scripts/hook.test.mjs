@@ -616,6 +616,41 @@ test('a legacy entry silences the plugin only where its matcher matches', () => 
   assert.ok(argv(w2).some((a) => a.includes('ask')), 'Bash is not in Grep|Glob|Agent, so the plugin asks');
 });
 
+test('a linked worktree stands down on its main worktree\'s 0.6.x hook, and on its own from a subdirectory', () => {
+  const w = world({ store: false, answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  const main = mkdtempSync(join(tmpdir(), 'zerograph-main-'));
+  const linked = join(main, '.git', 'worktrees', 'wt');
+  mkdirSync(linked, { recursive: true });
+  writeFileSync(join(linked, 'commondir'), '../..\n');
+  writeFileSync(join(w.root, '.git'), `gitdir: ${linked}\n`);
+  legacyClaude({ root: main }, ['PreToolUse']);
+  const grep = { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } };
+  assert.equal(fire(w, grep), null, 'without CLAUDE_PROJECT_DIR the main worktree\'s entries still answer');
+  assert.deepEqual(argv(w), []);
+
+  const own = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  mkdirSync(join(own.root, '.git'));
+  mkdirSync(join(own.root, 'apps', 'web'), { recursive: true });
+  legacyClaude(own, ['PreToolUse']);
+  assert.equal(fire(own, { ...grep, cwd: join(own.root, 'apps', 'web') }), null, 'a cd below the checkout still finds its settings');
+});
+
+test('standing down at SessionStart keeps the notices the 0.6.x hook never shows, and nothing else', () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  legacyClaude(w, ['SessionStart']);
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { ...updateHome(w, CACHED), CLAUDE_PROJECT_DIR: w.root });
+  assert.match(out.systemMessage, /^▲ zerograph 0\.7\.1 available/);
+  assert.match(context(out), /^zerograph: 0\.7\.1 is out/, 'no brief: the old hook gave it');
+  assert.deepEqual(argv(w).map((l) => l.split(' ').pop()), ['--version'], 'no serve, no update, no prime');
+
+  const bare = world({ store: false });
+  mkdirSync(join(bare.root, '.git'));
+  legacyClaude(bare, ['SessionStart']);
+  const missing = fire(bare, { hook_event_name: 'SessionStart', source: 'startup' },
+    { CLAUDE_PROJECT_DIR: bare.root, PATH: join(bare.root, 'nothing-here'), ZEROGRAPH_BIN: '' });
+  assert.equal(missing.systemMessage, MISSING_MESSAGE);
+});
+
 /** A machine `hooks.json` as 0.6.x printed it for Codex, running `script` as spelled. */
 function legacyCodex(home, spelled, matcher = 'startup|resume|clear|compact') {
   writeFileSync(join(home, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ matcher, hooks: [{ type: 'command', command: `node '${spelled}'` }] }] } }));

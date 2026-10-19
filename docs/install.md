@@ -69,7 +69,10 @@ is left too, and listed in one line: it is the team's, and serves every teammate
 yet. Once all of them have it, `zerograph install-agent --claude --retire-repo` (or `--codex
 --retire-repo`) takes those out as well, for a commit of their own. Until then the plugin's hook
 stays silent on every event the committed entries in `.claude/settings.json` still answer — in
-Codex, the entries left in `$CODEX_HOME/hooks.json` — so a session hears one brief, not two. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
+the checkout or, from a linked worktree, in its main worktree; in Codex, the entries left in
+`$CODEX_HOME/hooks.json` — so a session hears one brief, not two. At session start it still shows
+the two notices the old hook has no word for: that zerograph is not installed, and that a newer
+release is out. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
 hooks, deleting a hook that held nothing else. The install runs only once the plugin installed: when
 the `claude` or `codex` CLI is missing or a step fails, it prints the commands to run by hand and
 leaves the older install in place.

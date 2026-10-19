@@ -504,6 +504,10 @@ function missingNotice(cwd) {
   };
 }
 
+function sessionNotice(p, root) {
+  return missingNotice(p.cwd || root) ?? updateNotice(root);
+}
+
 /** Whether `a` is a later release than `b`: by the three numbers, then a release over its pre-release. */
 function newer(a, b) {
   const split = (v) => { const [core, pre] = v.split('+')[0].split(/-(.*)/s); return [core.split('.').map(Number), pre]; };
@@ -580,7 +584,7 @@ const handlers = {
       if (!autostartServe(root)) startUpdate(root);
       text = brief(root);
     }
-    const notice = missingNotice(p.cwd || root) ?? updateNotice(root);
+    const notice = sessionNotice(p, root);
     if (!notice) return text;
     return { additionalContext: [text, notice.brief].filter(Boolean).join('\n'), systemMessage: notice.message };
   },
@@ -658,9 +662,12 @@ function legacyAnswers(event, payload, root, harness) {
       return Boolean(path) && isAbsolute(path) && existsSync(path);
     });
   }
-  const project = process.env.CLAUDE_PROJECT_DIR || root;
-  return existsSync(join(project, '.claude', 'hooks', LEGACY_HOOK))
-    && hookCommands(join(project, '.claude', 'settings.json'), event, payload).some((cmd) => cmd.includes(LEGACY_HOOK));
+  // A linked worktree may run the main worktree's settings, and the hook may be started without
+  // CLAUDE_PROJECT_DIR; the script and the entries that run it count only when they sit together.
+  const checkout = checkoutRoot(root);
+  const dirs = new Set([process.env.CLAUDE_PROJECT_DIR || root, checkout, checkout && mainCheckout(checkout)].filter(Boolean));
+  return [...dirs].some((dir) => existsSync(join(dir, '.claude', 'hooks', LEGACY_HOOK))
+    && hookCommands(join(dir, '.claude', 'settings.json'), event, payload).some((cmd) => cmd.includes(LEGACY_HOOK)));
 }
 
 async function readStdin() {
@@ -677,13 +684,22 @@ async function main({ harness = process.argv.includes('--codex') ? 'codex' : 'cl
   if (!handler) return;
   // The harness's cwd follows a `cd` into a subdirectory, which has no `.zerograph/` of its own.
   const root = (payload.cwd && indexRoot(payload.cwd)) || payload.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  if (legacyAnswers(event, payload, root, harness)) { debug('legacy hook answers', event); return; }
+  let answer = handler;
+  if (legacyAnswers(event, payload, root, harness)) {
+    debug('legacy hook answers', event);
+    if (event !== 'SessionStart') return;
+    // The old hook has no notice of either kind, so standing down keeps those and drops the rest.
+    answer = (p, r) => {
+      const notice = sessionNotice(p, r);
+      return notice && { additionalContext: notice.brief, systemMessage: notice.message };
+    };
+  }
   // The subagent's own id is in the key: a subagent shares its parent's session_id, so a counter
   // keyed by session alone finds the count already past zero on a subagent's first call and says
   // nothing — which is a second reason 140 unprimed subagents went on grepping.
   const sessionKey = `${payload.session_id || 'nosession'}-${payload.agent_id || 'main'}`;
   let out;
-  try { out = handler(payload, root, sessionKey); } catch (e) { debug('handler', e); return; }
+  try { out = answer(payload, root, sessionKey); } catch (e) { debug('handler', e); return; }
   if (!out) return;
   // `systemMessage` is a top-level field Claude Code shows the person; Codex is given only context.
   const { systemMessage, ...rest } = typeof out === 'string' ? { additionalContext: out } : out;
