@@ -767,17 +767,23 @@ fn a_server_catches_up_with_the_tree_once_a_slow_0_6_4_server_has_stopped() {
     let dir = repo_with_docs();
     std::fs::write(dir.path().join("docs/new.md"), "**FR-PAY-2 · MUST · Возврат аванса**\n\nАванс возвращается при отмене салоном.\n").unwrap();
     let (release, sent) = serve_0_6_4_held(dir.path());
-    let _server = serve(dir.path(), &["--every", "3600", "--idle", "60"]);
+    let mut server = serve(dir.path(), &["--every", "3600", "--idle", "60"]);
+    let (line_tx, lines) = std::sync::mpsc::channel();
+    let stderr = server.stderr.take().unwrap();
+    std::thread::spawn(move || for line in BufReader::new(stderr).lines().map_while(Result::ok) { let _ = line_tx.send(line); });
     // A resident answer means the start-up is behind it, with the old server still holding.
     let (before, err) = ask_until_resident_with(dir.path(), &["--stale"], &["возврат", "аванса"]);
     assert!(!before.contains("FR-PAY-2"), "the server wrote while the old one was still up: {before}\n{err}");
     release.send(()).unwrap();
     assert_eq!(sent.recv_timeout(Duration::from_secs(20)).expect("the old server was never sent the stop line").trim(), r#"{"stop":true}"#);
+    // The server's own word that the stop is over is the last thing its stopping thread does, so
+    // the very next question has to be answered from the caught-up tree, with no retry to hide a
+    // first answer that was not.
     let start = Instant::now();
-    loop {
-        let (after, err) = ask_until_resident_with(dir.path(), &["--stale"], &["возврат", "аванса"]);
-        if after.contains("FR-PAY-2") { break; }
-        assert!(start.elapsed() < Duration::from_secs(20), "the server never caught up once the old one stopped: {after}\n{err}");
-        std::thread::sleep(Duration::from_millis(50));
+    while !lines.recv_timeout(Duration::from_secs(20)).expect("the server never said the old one stopped").contains("stopped a 0.6.4 server") {
+        assert!(start.elapsed() < Duration::from_secs(20), "the server never said the old one stopped");
     }
+    let (after, err) = ask(dir.path(), &["--stale"], &["возврат", "аванса"]);
+    assert!(err.contains("serve: answered by the resident process"), "{err}");
+    assert!(after.contains("FR-PAY-2"), "the first answer after the old server stopped missed the catch-up: {after}\n{err}");
 }
