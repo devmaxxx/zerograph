@@ -77,15 +77,16 @@ jobs:
           [ "$mod" = "$crate" ] || { echo "::error::agent/claude-code is at $mod, Cargo.toml at $crate"; exit 1; }
           [ "$ref" = "v$crate" ] || { echo "::error::the marketplace pins $ref, Cargo.toml is at $crate"; exit 1; }
 
-      # The agent hook is JavaScript and ships with the binary that installs it, so it is tested on
-      # the same three platforms: a hook that throws on Windows is a hook that fires on nobody.
+      # The agent hook ships with the binary that installs it, and the plugin starts its MCP server
+      # through a Node launcher, so both are tested on the same three platforms: a hook or a
+      # launcher that throws on Windows fires on nobody.
       # `!cancelled()` for the same reason as the suites above, and with no OS clause beside it: a
       # red Python suite must not skip the hook on the one platform it also runs on.
       - if: ${{ !cancelled() }}
         uses: actions/setup-node@v4
         with: { node-version: '20' }
       - if: ${{ !cancelled() }}
-        run: node --test agent/hook.test.mjs npm/zerograph/test/launcher.test.js
+        run: node --test agent/hook.test.mjs agent/claude-code/scripts/mcp.test.mjs npm/zerograph/test/launcher.test.js
 
       # A default Git for Windows install puts `git` on PATH and not `sh` — the Unix tools are an
       # opt-in — so `ask --rerank` looks for one. Route 1: Git's shell directories

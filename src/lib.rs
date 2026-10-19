@@ -232,8 +232,8 @@ enum Cmd {
         action: CacheAction,
     },
     /// A stdio MCP server: `ask`, `explain`, `impact`, `trace` and `changes` as tools, plus
-    /// `status` (what the index is behind by and how far a background refresh has got), `reindex`
-    /// and `switch_model`. Protocol on stdout, diagnostics on stderr; `install-agent` registers it.
+    /// `status` (what the index is behind by and how far a background refresh has got), `reindex`,
+    /// `cache_status` and `switch_model`. Protocol on stdout, diagnostics on stderr; `install-agent` registers it.
     Mcp,
 }
 

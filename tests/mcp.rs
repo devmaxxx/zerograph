@@ -44,7 +44,7 @@ fn a_session_over_stdio_reaches_the_read_tools_and_stdout_is_only_protocol() {
     assert!(server.wait().unwrap().success(), "end of input is a clean exit");
     assert_eq!(replies.len(), 6, "the notification gets none, the malformed line gets an error: {replies:?}");
     assert_eq!(replies[0]["result"]["protocolVersion"], "2025-06-18");
-    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 8);
+    assert_eq!(replies[1]["result"]["tools"].as_array().unwrap().len(), 9);
     let text = |i: usize| replies[i]["result"]["content"][0]["text"].as_str().unwrap().to_string();
     assert!(text(2).contains("refresh: none running"), "{}", text(2));
     assert!(text(3).contains("FR-PAY-1"), "{}", text(3));

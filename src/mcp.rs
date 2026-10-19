@@ -153,6 +153,7 @@ impl Server {
             "changes" => self.changes(args),
             "status" => self.status(),
             "reindex" => self.reindex(),
+            "cache_status" => crate::cache_command(crate::CacheAction::Status),
             "switch_model" => self.switch_model(args),
             _ => bail!("no tool {name:?}"),
         }
@@ -264,6 +265,8 @@ impl Server {
 
     fn reindex(&self) -> Result<String> {
         let store = store::Store::new(&self.repo);
+        // Asked before the lock, which makes the directory it would be asking about.
+        let run = refresh_command(&store);
         match (store.try_lock_writer()?, self.spawn_in_flight()) {
             (None, _) => Ok(format!("a refresh is already running ({}); `status` follows it", progress(&self.repo))),
             (Some(_), true) => Ok("a refresh is already running (starting); `status` follows it".to_string()),
@@ -271,8 +274,8 @@ impl Server {
                 // Released first: the child takes the lock itself, and waits on this process for it
                 // if it is still held when the child asks.
                 drop(lock);
-                self.remember(refresh::spawn_detached(&self.repo, self.no_dense, &["update"])?);
-                Ok("refresh started in the background; `status` shows how far it has got".to_string())
+                self.remember(refresh::spawn_detached(&self.repo, self.no_dense, &[run])?);
+                Ok(format!("`{run}` started in the background; `status` shows how far it has got"))
             }
         }
     }
@@ -317,6 +320,12 @@ fn with_notices(mut text: String, notices: Vec<String>) -> String {
     text.push('\n');
     for n in notices { text.push_str(&n); text.push('\n'); }
     text
+}
+
+/// What a `reindex` runs: the first `build` where no store stands, else an `update`, each taking
+/// the writer lock in its own process as it does on the command line.
+fn refresh_command(store: &store::Store) -> &'static str {
+    if store.stands() { "update" } else { "build" }
 }
 
 /// How far the running refresh has got, for a reply that says one is already running.
@@ -388,7 +397,8 @@ fn tools() -> Vec<Value> {
             "stale": stale,
         }), &[]),
         tool("status", "The index's state: size, files behind the tree, the model that wrote the vectors against the configured one, and whether a background refresh is running and how far it has got.", json!({}), &[]),
-        tool("reindex", "Starts a background refresh of the index and returns at once; says so when one is already running. Follow it with `status`.", json!({}), &[]),
+        tool("reindex", "Starts a background refresh of the index and returns at once: a first build where there is no index, else an update. Says so when one is already running. Follow it with `status`.", json!({}), &[]),
+        tool("cache_status", "The machine's vector cache, which every checkout reads before it embeds: where it is, its cap, and the rows and bytes it holds per model. Reads only.", json!({}), &[]),
         tool("switch_model", "Re-embeds the index under another embedding model, in the background. Only catalogued models and ones the user has trusted with `zerograph model <id>`; any other id is refused.", json!({
             "model": { "type": "string", "description": "A hub id." },
         }), &["model"]),
@@ -450,7 +460,7 @@ mod tests {
         let (_dir, server) = served();
         let reply = send(&server, json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }));
         let names: Vec<&str> = reply["result"]["tools"].as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, ["ask", "explain", "impact", "trace", "changes", "status", "reindex", "switch_model"]);
+        assert_eq!(names, ["ask", "explain", "impact", "trace", "changes", "status", "reindex", "cache_status", "switch_model"]);
         for t in reply["result"]["tools"].as_array().unwrap() {
             assert_eq!(t["inputSchema"]["type"], "object", "{t}");
         }
@@ -611,6 +621,25 @@ mod tests {
         let (is_error, text) = call(&server, "reindex", json!({}));
         assert!(!is_error && text.contains("already running"), "{text}");
         assert!(!dir.path().join(".zerograph/background.log").exists(), "nothing was spawned to write a log");
+    }
+
+    #[test]
+    fn reindex_builds_where_no_store_stands_and_updates_where_one_does() {
+        let bare = tempfile::tempdir().unwrap();
+        assert_eq!(refresh_command(&store::Store::new(bare.path())), "build");
+        let (dir, _server) = served();
+        assert_eq!(refresh_command(&store::Store::new(dir.path())), "update");
+    }
+
+    #[test]
+    fn cache_status_is_the_report_the_command_line_prints() {
+        let (_dir, server) = served();
+        let (is_error, text) = call(&server, "cache_status", json!({}));
+        let printed = crate::cache_command(crate::CacheAction::Status).map_err(|e| format!("{e:#}"));
+        match printed {
+            Ok(printed) => assert!(!is_error && text == crate::terminal_safe(&printed), "{text}"),
+            Err(err) => assert!(is_error && text == err, "{text}"),
+        }
     }
 
     #[test]
