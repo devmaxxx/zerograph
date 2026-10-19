@@ -197,3 +197,62 @@ test('a session opened through a link finds the checkout by its real path, as th
   symlinkSync(join(w.checkout, 'packages', 'app'), link);
   assert.strictEqual(checkoutOf(link), w.checkout);
 });
+
+/**
+ * A fake that reports the version in `version.txt` beside it and answers every tool call; before
+ * answering the request named `upgradeAt` it writes `next` there and moves its own mtime, as an
+ * install over it would.
+ */
+function versioned(w, { first = '0.7.1', next = '0.8.0', upgradeAt = 0 } = {}) {
+  const fake = join(w.machine, 'zerograph');
+  const versionFile = join(w.machine, 'version.txt');
+  writeFileSync(versionFile, first);
+  writeFileSync(fake, `#!/usr/bin/env node
+const { readFileSync, writeFileSync, utimesSync } = require('node:fs');
+if (process.argv.includes('--version')) { process.stdout.write('zerograph ' + readFileSync(${JSON.stringify(versionFile)}, 'utf8') + '\\n'); process.exit(0); }
+let buf = '';
+process.stdin.on('data', (d) => { buf += d; });
+// One answer per 150 ms, so the launcher has read each before the next request can upgrade the file.
+process.stdin.on('end', async () => {
+  for (const raw of buf.trim().split('\\n')) {
+    const req = JSON.parse(raw);
+    if (req.id === ${upgradeAt}) { writeFileSync(${JSON.stringify(versionFile)}, ${JSON.stringify(next)}); utimesSync(__filename, new Date(), new Date(Date.now() + 60000)); }
+    const result = req.method === 'tools/call' ? { content: [{ type: 'text', text: 'answer ' + req.id }] } : {};
+    process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: req.id, result }) + '\\n');
+    await new Promise((r) => setTimeout(r, 150));
+  }
+});
+`);
+  chmodSync(fake, 0o755);
+  return (requests) => {
+    const r = spawnSync(process.execPath, [LAUNCHER, ''], {
+      cwd: w.base,
+      input: requests.map((q) => JSON.stringify({ jsonrpc: '2.0', ...q }) + '\n').join(''),
+      env: { PATH: [dirname(process.execPath), w.machine].join(sep), CLAUDE_PROJECT_DIR: w.checkout },
+      encoding: 'utf8',
+    });
+    assert.strictEqual(r.status, 0, r.stderr);
+    return r.stdout.trim().split('\n').map((l) => JSON.parse(l));
+  };
+}
+
+const call = (id) => ({ id, method: 'tools/call', params: { name: 'status', arguments: {} } });
+const STALE = 'zerograph was updated to 0.8.0 (this session runs 0.7.1) — restart the session or run /reload-plugins';
+
+test('a binary updated under a running server is named on every tool result after it, as one line', { skip: WIN && 'a POSIX launcher for the fake' }, () => {
+  const w = world();
+  const out = versioned(w, { upgradeAt: 2 })([call(1), { id: 9, method: 'ping' }, call(2), call(3)]);
+  const texts = (id) => out.find((m) => m.id === id).result.content?.map((c) => c.text);
+  assert.deepStrictEqual(texts(1), ['answer 1']);
+  assert.deepStrictEqual(out.find((m) => m.id === 9).result, {}, 'a result with no content is not a tool result');
+  assert.deepStrictEqual(texts(2), [STALE, 'answer 2']);
+  assert.deepStrictEqual(texts(3), [STALE, 'answer 3']);
+});
+
+test('a binary that did not move leaves every result as the server wrote it', { skip: WIN && 'a POSIX launcher for the fake' }, () => {
+  const w = world();
+  const out = versioned(w)([call(1), call(2)]);
+  assert.deepStrictEqual(out.map((m) => m.result.content.map((c) => c.text)), [['answer 1'], ['answer 2']]);
+  const same = versioned(world(), { next: '0.7.1', upgradeAt: 1 })([call(1), call(2)]);
+  assert.deepStrictEqual(same.map((m) => m.result.content.length), [1, 1], 'touched but the same release');
+});
