@@ -122,7 +122,7 @@ def main():
         canvas = Image.new("RGB", (s.size[0], h), BG)
         canvas.paste(s, (0, 0))
         frames.append(canvas.quantize(colors=64, method=Image.MEDIANCUT))
-    frames[0].save(OUT, save_all=True, append_images=frames[1:], duration=2500, loop=0, optimize=True)
+    frames[0].save(OUT, save_all=True, append_images=frames[1:], duration=5000, loop=0, optimize=True)
     print(OUT, frames[0].size, f"{os.path.getsize(OUT) // 1024} KiB", file=sys.stderr)
 
 
