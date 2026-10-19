@@ -32,27 +32,34 @@ npm install -g zerograph                   # or: pnpm add -D zerograph
 echo .zerograph/ >> .gitignore             # the graph is built per checkout
 zerograph build                            # first run downloads the embedding model
 zerograph ask cancellation policy          # stays fresh with your edits
-zerograph install-agent --claude           # optional: MCP server + session hook
+zerograph install-agent --claude           # optional: the Claude Code plugin
 ```
 
-`install-agent` also takes `--codex`, `--cursor`, `--copilot`, `--gemini` and `--opencode`. On
-Windows, see the [Windows notes](docs/install.md#windows-notes).
+`install-agent` also takes `--codex` (the Codex plugin), `--cursor`, `--copilot`, `--gemini` and
+`--opencode`. On Windows, see the [Windows notes](docs/install.md#windows-notes).
 
 ## Claude Code plugin
 
-A status mod for Claude Code puts the index's state under the prompt: `◇ zerograph · in sync`, a
-progress bar while a refresh runs, the files behind and whether `serve` answers. `/zerograph`
-prints the full `zerograph status` report.
+The plugin is how zerograph wires into Claude Code: it starts zerograph's MCP server for the
+session, briefs each session and subagent on the index, answers a concept grep from the graph
+before it runs, and keeps the graph fresh after edits. A status mod puts the index's state under
+the prompt: `◇ zerograph · in sync`, a progress bar while a refresh runs, the files behind and
+whether `serve` answers. `/zerograph` prints the full `zerograph status` report.
 
 ```
 /plugin install zerograph --marketplace devmaxxx/zerograph
 ```
 
-It is pinned to the latest release, so `claude plugin update zerograph` moves it with zerograph.
-It starts zerograph's MCP server for the session and adds `/zerograph:ask`, `/zerograph:impact`,
-`/zerograph:trace`, `/zerograph:changes`, `/zerograph:explain`, `/zerograph:status` and
-`/zerograph:refresh`, each of which calls that server's tools and reads the top hits. With the
-plugin, skip `install-agent --claude`'s MCP server; see [the plugin](docs/install.md#claude-code-plugin).
+`zerograph install-agent --claude` runs the same install through the `claude` CLI and removes what
+older releases wrote into the checkout. The plugin is pinned to the latest release, so
+`claude plugin update zerograph` moves it with zerograph. It adds `/zerograph:ask`,
+`/zerograph:impact`, `/zerograph:trace`, `/zerograph:changes`, `/zerograph:explain`,
+`/zerograph:status` and `/zerograph:refresh`, each of which calls the server's tools and reads the
+top hits; see [the plugin](docs/install.md#claude-code-plugin).
+
+Codex gets the same as a Codex plugin, `zerograph install-agent --codex`: the MCP server, the
+session hooks, and the commands as skills (`$zerograph:ask`, `$zerograph:impact`, …); see
+[the Codex plugin](docs/install.md#codex-plugin).
 
 ## In action
 

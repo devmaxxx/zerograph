@@ -2,34 +2,26 @@
 
 ```bash
 zerograph mcp                    # a stdio MCP server (protocol 2025-06-18) over the current repository
-claude mcp add zerograph -- zerograph --repo /path/to/checkout mcp   # what `install-agent --claude` runs, per checkout
+zerograph --repo /path/to/checkout mcp
 ```
 
 The [Claude Code plugin](install.md#claude-code-plugin) starts this server itself, once per
-session, as `mcp__plugin_zerograph_zerograph__*`, and its slash commands call these tools. With the
-plugin installed, `install-agent --claude`'s registration below is a second copy of the same
-server: remove it with `claude mcp remove zerograph -s local`
-([why](install.md#claude-code-plugin)).
+session, as `mcp__plugin_zerograph_zerograph__*`, and its slash commands call these tools. The
+[Codex plugin](install.md#codex-plugin) starts it the same way for a Codex session.
+`install-agent --claude` and `--codex` install those plugins and register no server of their own.
 
-`install-agent --claude` registers the server through the `claude` CLI, at local scope, once for
-every checkout of the clone that `git worktree list` names, each with its own `--repo`. Local scope
-is keyed by the project's path, so a session opened in a worktree sees only what was registered for
-that worktree; a worktree added later gets its server from the next `install-agent` run. A
-registration that already says the same is left alone, and the command to run by hand is printed
-where `claude` is not on `PATH`. One that says something else is replaced only in the local scope: a
-differing `zerograph` in the user scope or a tracked `.mcp.json` is left as its owner wrote it, the
-local one is added beside it and wins in that project, and the run says so in one note.
+Both start it through the plugin's `scripts/mcp.mjs`, which finds the checkout around the session's
+project directory (`CLAUDE_PROJECT_DIR` under Claude Code, the working directory Codex starts it
+in) and runs `zerograph --repo <checkout> mcp`, so a session opened in a package of a monorepo
+serves the whole repository.
 
-The same run prunes `~/.claude.json` (or `.claude.json` in `CLAUDE_CONFIG_DIR`): a `zerograph` server
-it registered for a checkout that is no longer on disk — a removed worktree — is taken out.
-`claude mcp remove` cannot do this, since it finds
-the project by a working directory that is gone. Nothing else in the file is changed, though its keys
-are written back in sorted order.
-
-Why not one project-scope `.mcp.json` with no `--repo`: Claude Code's
-[MCP documentation](https://code.claude.com/docs/en/mcp) does not say which working directory a
-stdio server starts in, so a server that found its checkout from its working directory would be
-relying on something undocumented.
+Releases before 0.7.0 registered the server through `claude mcp add` at local scope, once per
+worktree. A re-run of `install-agent --claude` removes those registrations from `~/.claude.json`
+(or `.claude.json` in `CLAUDE_CONFIG_DIR`) for the checkout and its worktrees, and for a checkout
+no longer on disk — a removed worktree, which `claude mcp remove` cannot reach, since it finds the
+project by a working directory that is gone. A differing `zerograph` in the user scope or a tracked
+`.mcp.json` is left as its owner wrote it. Nothing else in the file is changed, though its keys are
+written back in sorted order.
 
 The protocol is newline-delimited JSON-RPC on stdout and nothing else; diagnostics go to stderr. A
 tool that fails returns an `isError` result and the server carries on.

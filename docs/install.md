@@ -6,9 +6,10 @@ npm install -g zerograph           # or globally; pnpm add -g zerograph works th
 cargo install --path .             # from source; Rust 1.98, pinned in rust-toolchain.toml
 ```
 
-The session hooks `install-agent` writes run the `zerograph` on `PATH` and never one inside the
-checkout, so a global install is the simplest route. With only a project-local install (`pnpm add
--D`), set `ZEROGRAPH_BIN` to that binary's absolute path, written out
+The plugins `install-agent --claude` and `--codex` install run the `zerograph` on `PATH` and never
+one inside the checkout, so a global install is the simplest route. With only a project-local
+install (`pnpm add -D`), name that binary's absolute path: in the Claude Code plugin's `binary`
+option (`/config`), or in `ZEROGRAPH_BIN`, written out
 (`export ZEROGRAPH_BIN=/home/me/work/app/node_modules/.bin/zerograph`). A relative path is ignored,
 and `$PWD` in a shell profile names whichever checkout a shell opens in, so a cloned repository
 would supply the binary again. See [the session hook](keeping-fresh.md#the-session-hook).
@@ -50,15 +51,23 @@ npmjs.com links the workflow run that built it, and `npm audit signatures` check
 
 ## Upgrading
 
-Re-run `zerograph install-agent` with the flags you used before. It replaces its own instructions
-stanza and settings entries rather than adding second ones, and takes the
-`post-merge`/`post-checkout` block an earlier release wrote out of the git hooks, deleting a hook
-that held nothing else.
+Re-run `zerograph install-agent` with the flags you used before. For the editors it replaces its
+own instructions stanza rather than adding a second one. For Claude Code and Codex it installs the
+plugin, then takes out what releases before 0.7.0 wrote, which the plugin now does:
 
-Since 0.6.4 the skill is `zerograph`, in `.claude/skills/zerograph/` and
-`.codex/skills/zerograph/`, with the release that wrote it as `metadata.version`. The install removes
-the `repo-query` directory beside it when it holds only the `SKILL.md` 0.6.0–0.6.3 wrote; an edited
-one, a link or one with files of its own is left and named.
+- `--claude`: the `zerograph` server registered for the checkout and its worktrees in
+  `~/.claude.json`, the hook entries in `.claude/settings.json` (the file goes when nothing else is
+  left in it), `.claude/hooks/zerograph-hook.mjs` and its `rule.txt`, the `zerograph` and
+  `repo-query` skills, the `repo-scout` subagent, and the zerograph stanza in `CLAUDE.md`.
+- `--codex`: the zerograph hook entries in `~/.codex/hooks.json` (or under `$CODEX_HOME`),
+  `.codex/hooks/zerograph-hook.mjs`, the `.codex/skills/zerograph/` and `repo-query` skills, and
+  the stanza in `AGENTS.md` unless `--opencode` still reads it there.
+
+A skill or subagent somebody edited, a link, or a directory with files of its own is left and
+named. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
+hooks, deleting a hook that held nothing else. The install runs only once the plugin installed: when
+the `claude` or `codex` CLI is missing or a step fails, it prints the commands to run by hand and
+leaves the older install in place.
 
 <a id="claude-code-status-mod"></a>
 
@@ -99,13 +108,16 @@ directory above holding a `.zerograph/`, else the project directory. Claude Code
 by name from its own `PATH`, which the plugin cannot pin; a checkout whose directory is on that
 `PATH`, or on Windows the directory the server starts in, could put its own `node` there.
 
-**With `install-agent --claude`.** The plugin's server replaces the one `install-agent --claude`
-registers. Claude Code connects a plugin's server beside a local-scope one of the same name when
-their commands differ, so the two would both run, and the model would see every tool twice, as
-`mcp__zerograph__*` and as `mcp__plugin_zerograph_zerograph__*`. With the plugin installed, remove
-the local one in each checkout that has it: `claude mcp remove zerograph -s local`. The session
-hook and the skill `install-agent --claude` wrote can stay; only the server doubles. A later
-`install-agent --claude` registers the server again, so remove it again after one.
+**With `install-agent --claude`.** It installs this plugin through the `claude` CLI (`claude plugin
+marketplace add devmaxxx/zerograph`, then `claude plugin install zerograph@zerograph`) and removes
+the server, hook, skill and stanza an older `install-agent --claude` wrote (see
+[Upgrading](#upgrading)), so the model never sees the tools twice, as `mcp__zerograph__*` and as
+`mcp__plugin_zerograph_zerograph__*`.
+
+The plugin's hooks are the [session hook](keeping-fresh.md#the-session-hook): at session start the
+index brief, for each subagent the rule to ask the graph first, before a concept grep the graph's
+answer, and after an edit a background refresh. A checkout hears from them only once it has a
+`zerograph.toml` or an index of its own, or is a worktree of a main checkout that has one.
 
 It asks the `zerograph` on `PATH` by its absolute path, and never a binary inside the project: a
 cloned repository that ships `node_modules/.bin/zerograph` or `target/*/zerograph` does not get it
@@ -133,6 +145,25 @@ moves with zerograph: `claude plugin update zerograph` then `/reload-plugins` ta
 latest release, and nothing merged to `main` reaches an install before its tag. A version bump
 changes `Cargo.toml`, `agent/claude-code/.claude-plugin/plugin.json` and the `ref` in
 `.claude-plugin/marketplace.json` together; CI fails when they disagree.
+
+## Codex plugin
+
+`agent/codex/` is the same integration as a Codex plugin, listed by `.agents/plugins/marketplace.json`:
+
+```bash
+codex plugin marketplace add devmaxxx/zerograph --ref v0.7.0
+codex plugin add zerograph@zerograph
+```
+
+`zerograph install-agent --codex` runs those two and the clean-up in [Upgrading](#upgrading). The
+plugin starts the MCP server (`scripts/mcp.mjs`, the Claude Code plugin's, found under
+`$CODEX_HOME/plugins/cache/zerograph/zerograph/<version>/`), runs the session hook at session start,
+for each subagent and after an `apply_patch`, and carries the commands as skills: `$zerograph:ask`,
+`$zerograph:impact`, `$zerograph:trace`, `$zerograph:changes`, `$zerograph:explain`,
+`$zerograph:status` and `$zerograph:refresh` run only when named, and `use-the-graph` is the one the
+model picks up by itself. Codex asks once before it trusts a plugin's hooks. Codex hands the server
+only `CODEX_HOME` and `ZEROGRAPH_BIN` from the environment, so a project-local binary goes in
+`ZEROGRAPH_BIN`. Codex has no hook before a shell command, so nothing answers a grep before it runs.
 
 ## Windows notes
 

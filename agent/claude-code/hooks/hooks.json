@@ -1,1 +1,9 @@
-{ "modules": ["./register.ts"] }
+{
+  "modules": ["./register.ts"],
+  "hooks": {
+    "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"], "timeout": 10 }] }],
+    "SubagentStart": [{ "matcher": ".*", "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"], "timeout": 5 }] }],
+    "PreToolUse": [{ "matcher": "Bash|Grep|Glob|Agent", "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"], "timeout": 10 }] }],
+    "PostToolUse": [{ "matcher": "Edit|Write|MultiEdit", "hooks": [{ "type": "command", "command": "node", "args": ["${CLAUDE_PLUGIN_ROOT}/scripts/hook.mjs"], "timeout": 10 }] }]
+  }
+}

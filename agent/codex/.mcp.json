@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "zerograph": {
+      "command": "node",
+      "env_vars": [
+        "CODEX_HOME",
+        "ZEROGRAPH_BIN"
+      ],
+      "args": [
+        "--input-type=module",
+        "-e",
+        "import{homedir}from'node:os';import{join}from'node:path';import{pathToFileURL}from'node:url';const m=await import(pathToFileURL(join(process.env.CODEX_HOME||join(homedir(),'.codex'),'plugins','cache','zerograph','zerograph','0.7.0','scripts','mcp.mjs')).href);m.main();"
+      ]
+    }
+  }
+}

@@ -17,12 +17,14 @@
  * ZEROGRAPH_HOOK_DEBUG. Every call it waits on is --no-dense, and every one but `changes` is --stale;
  * what it starts and leaves running — a `serve`, an `update --detach` — is neither.
  */
-import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync, statSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstatSync } from 'node:fs';
 import { spawn, spawnSync } from 'node:child_process';
-import { join, dirname, relative, delimiter, isAbsolute } from 'node:path';
+import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
+
+import { binaryOf, childEnv as cutEnv, commandOf, pathKey } from './launcher.mjs';
 
 const MAX_INJECTIONS = 12;   // 12 × ~107 tokens: a third of the CLAUDE.md sections this replaces
 const SEEDS = 3;
@@ -40,22 +42,10 @@ const HOOK_BUDGET = 2;
 const SERVE_IDLE = 1800;
 const SERVE_IDLE_MODEL = 300;   // measured on the 33.5k-row copy: 0.08 s resident, 0.77 s after a drop
 
-/**
- * How this repository runs the binary, in every hint the hook prints. `install-agent --command`
- * rewrites this one line with the command JSON-encoded, so nothing in it reaches the script as code.
- * A workspace that installs zerograph as a dependency has no bare `zerograph` on PATH, and a hint
- * naming a program the shell cannot find is one the agent runs, fails, and pays for twice.
- */
-const COMMAND = "zerograph";
+const COMMAND = 'zerograph';
 
-const HERE = dirname(fileURLToPath(import.meta.url));
-
-/**
- * The rule handed to every subagent. Read from `rule.txt` beside this file when the installer put
- * one there, and otherwise the copy below — the two are compared by a test, so a hook installed
- * without its text still says the same thing.
- */
-const RULE_FALLBACK = `This repository has a zerograph index. Ask it before grepping for a concept: \`${COMMAND} ask <words>\`
+/** The rule handed to every subagent. */
+const RULE = `This repository has a zerograph index. Ask it before grepping for a concept: \`${COMMAND} ask <words>\`
 answers by meaning, \`${COMMAND} impact <Symbol>\` names who calls a symbol, \`${COMMAND} changes\` maps
 your diff onto the callers it reaches. Read only the \`path:line\` those answers print, and cite one
 for every claim; when nothing printed holds it, say so.
@@ -73,8 +63,7 @@ const BUILD_NOTICE =
   'afterwards; until then this notice is all it can say.';
 
 function rule() {
-  const beside = join(HERE, 'rule.txt');
-  try { return existsSync(beside) ? readFileSync(beside, 'utf8') : RULE_FALLBACK; } catch { return RULE_FALLBACK; }
+  return RULE;
 }
 
 function env(suffix) {
@@ -85,98 +74,43 @@ function debug(...args) {
   if (env('HOOK_DEBUG')) console.error('[zerograph-hook]', ...args);
 }
 
+const WIN = process.platform === 'win32';
+
+/** The checkout `root` is in, or `root` outside git: what a PATH entry must stay out of. */
+function checkoutOf(root) {
+  return root && (checkoutRoot(root) ?? root);
+}
+
 /**
- * The `zerograph` the machine's own PATH resolves, as an absolute path, or null. A relative entry
- * (`.`, `node_modules/.bin`) resolves against the repository the hook runs in, so it is the
- * repository's file and not the machine's. Resolved here rather than by the spawn: `execvp` walks
- * those relative entries too, and Windows looks in the working directory before PATH at all. An
- * absolute entry inside the checkout, the kind an `.envrc` adds, is the checkout's file as well —
- * the whole checkout, not only the package whose store the hook found.
- *
- * On Windows every `.exe` on PATH outranks every `.cmd`: npm's global shim is a `.cmd`, and the
- * shell a batch file needs is the path `spawnable` describes, with its costs.
+ * The `zerograph` the machine's own PATH resolves, as an absolute path, or null; never one in the
+ * checkout, which the hook runs in every repository a session opens. On Windows every `.exe`
+ * outranks every `.cmd`.
  */
 function onPath(root, platform = process.platform) {
-  const win = platform === 'win32';
-  const dirs = machineDirs(root);
-  for (const n of win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph']) {
-    for (const d of dirs) {
-      const p = join(d, n);
-      try { const s = statSync(p); if (s.isFile() && (win || (s.mode & 0o111))) return p; } catch {}
-    }
-  }
-  return null;
+  return binaryOf('', { path: process.env[pathKey(process.env)], checkout: checkoutOf(root), win: platform === 'win32' }).bin ?? null;
 }
 
 /**
- * PATH's absolute entries outside the checkout `root` is in: the machine's, not the repository's.
- * Compared as spelled and with every link followed, so neither a symlinked alias of the checkout
- * on PATH nor a session opened through one lets the checkout's file through.
- */
-function machineDirs(root) {
-  const checkout = root && (checkoutRoot(root) ?? root);
-  const resolved = checkout && real(checkout);
-  return (process.env.PATH || '').split(delimiter)
-    .filter((d) => d && isAbsolute(d) && !inside(checkout, d) && !inside(resolved, real(d)));
-}
-
-/** `p` with every link followed, or as given when it does not resolve. */
-function real(p) {
-  try { return realpathSync.native(p); } catch { return p; }
-}
-
-/**
- * The environment the binary starts in, with PATH cut to the machine's entries. npm's launcher
- * finds `node` through PATH — `#!/usr/bin/env node`, or the `.cmd` shim's bare `node` — so an
- * entry an `.envrc` put inside the checkout would start the checkout's `node` one step on.
- */
-function childEnv(root, extra = {}) {
-  const key = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
-  return { ...process.env, [key]: machineDirs(root).join(delimiter), ...extra };
-}
-
-/**
- * `ZEROGRAPH_BIN`, then PATH, and nothing else; null when neither names one, and then nothing is
- * spawned. The checkout is never asked: the hook runs machine-wide in every repository a session
- * opens, and one that commits a `zerograph.toml` and an executable `node_modules/.bin/zerograph`
- * would have that file started the moment a session began. A project-local install names its
- * binary through `ZEROGRAPH_BIN`, by an absolute path.
+ * `ZEROGRAPH_BIN`, else the plugin's `binary` option, else PATH; null when none names one, and
+ * then nothing is spawned. The rules are the MCP server's, from `launcher.mjs`: a relative path
+ * names the checkout's file and is refused.
  */
 function binary(root) {
-  const named = env('BIN');
-  // A relative name resolves against whatever checkout the session opened, which makes it that
-  // checkout's file.
-  if (named && !isAbsolute(named)) { debug('ZEROGRAPH_BIN is not an absolute path; ignored'); return null; }
-  return named || onPath(root);
+  const named = env('BIN') || process.env.CLAUDE_PLUGIN_OPTION_BINARY || '';
+  const found = binaryOf(named, { path: process.env[pathKey(process.env)], checkout: checkoutOf(root), win: WIN });
+  if (found.error) debug(found.error);
+  return found.bin ?? null;
 }
 
-/** Whether `dir` is `root` or below it; on Windows `relative` already ignores case. */
-function inside(root, dir) {
-  if (!root) return false;
-  const rel = relative(root, dir);
-  return rel === '' || (!rel.startsWith('..') && !isAbsolute(rel));
+function childEnv(root, extra = {}) {
+  return cutEnv(process.env, checkoutOf(root), WIN, extra);
 }
 
-/**
- * How to hand one command to `spawn`. A `.cmd` or `.bat` is read by the command interpreter rather
- * than by `CreateProcess`, and Node has refused to spawn one without a shell since CVE-2024-27980.
- * The shell joins the file and its arguments into one command line without quoting them, so they
- * are quoted here — and nothing that reaches this can close a quote: a Windows path may not contain
- * one, and the words come from `queryWords`, which keeps letters, digits, `_` and `-` and nothing
- * else. Everything that is not a batch file is spawned as it always was.
- *
- * One thing the quoting does not buy. `cmd` expands `%NAME%` inside quotes and the command line has
- * no escape for it — only a batch file's own `%%` — so a repository under a directory that pairs two
- * `%` around an environment variable's name is asked about by the expanded path. npm's global
- * install is a `.cmd`, so this is the path a Windows machine without a `zerograph.exe` on PATH
- * takes; `onPath` prefers any `.exe` to keep it the exception.
- */
-function spawnable(bin, args) {
-  // Windows and a batch file, both: the extension alone would open the shell on a POSIX machine
-  // whose `ZEROGRAPH_BIN` happens to end in `.cmd`, where a repository path may contain a quote
-  // and the sentence above stops being true.
-  if (process.platform !== 'win32' || !/\.(cmd|bat)$/i.test(bin)) return { file: bin, args, opts: {} };
-  return { file: `"${bin}"`, args: args.map((a) => `"${a}"`), opts: { shell: true } };
+/** `bin args` as an argv `spawn` takes without a shell, or null when `cmd` would read an argument as code. */
+function command(bin, args) {
+  const c = commandOf(bin, args, process.env.ComSpec);
+  if (c.error) debug(c.error);
+  return c.argv ? c : null;
 }
 
 /**
@@ -192,13 +126,13 @@ function readerBudget(root) {
   return String(smallest);
 }
 
-// Runs a command through the shell and, once `ms` pass, hands the shell's pid to `kill`. Run in a
-// Node of its own because `spawnSync`'s timeout kills only the shell: the `zerograph` a batch file
+// Starts a command and, once `ms` pass, hands its pid to `kill`. Run in a Node of its own because
+// `spawnSync`'s timeout kills only the process it started: the `zerograph` a batch file's `cmd`
 // started would outlive the five seconds this hook waits, and go on holding the store.
 const BOUNDED = `
 const { spawn, spawnSync } = require('node:child_process');
 const [file, args, ms, kill] = JSON.parse(process.argv[1]);
-const child = spawn(file, args, { shell: true, stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
+const child = spawn(file, args, { stdio: ['ignore', 'inherit', 'inherit'], windowsHide: true });
 const timer = setTimeout(() => {
   spawnSync(kill[0], [...kill.slice(1), String(child.pid)], { stdio: 'ignore', windowsHide: true });
   process.exit(124);
@@ -207,7 +141,7 @@ child.on('error', () => process.exit(127));
 child.on('exit', (code) => { clearTimeout(timer); process.exit(code ?? 1); });
 `;
 
-/** `spawnSync` of a shell command whose whole process tree `kill` ends after `ms`. */
+/** `spawnSync` of a command whose whole process tree `kill` ends after `ms`. */
 function bounded(file, args, options, kill, ms = TIMEOUT_MS) {
   // The outer timeout is only a backstop for the helper itself.
   return spawnSync(process.execPath, ['-e', BOUNDED, JSON.stringify([file, args, ms, kill])], { ...options, timeout: ms + 2000 });
@@ -220,8 +154,9 @@ function treeKill() {
 
 function run(root, args) {
   const bin = binary(root);
-  if (!bin) return '';
-  const { file, args: argv, opts } = spawnable(bin, ['--repo', root, '--no-dense', ...args]);
+  const c = bin && command(bin, ['--repo', root, '--no-dense', ...args]);
+  if (!c) return '';
+  const [file, ...argv] = c.argv;
   const options = {
     // Never the checkout: npm's Windows `.cmd` shim runs a bare `node` through `cmd`, which looks
     // in the working directory first. The binary is told its repository by `--repo`.
@@ -229,7 +164,7 @@ function run(root, args) {
     encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true,
     env: childEnv(root, { ZEROGRAPH_READER_BUDGET: readerBudget(root) }),
   };
-  const r = opts.shell ? bounded(file, argv, options, treeKill()) : spawnSync(file, argv, { ...options, timeout: TIMEOUT_MS });
+  const r = c.batch ? bounded(file, argv, options, treeKill()) : spawnSync(file, argv, { ...options, timeout: TIMEOUT_MS });
   if (r.status !== 0) debug('exit', r.status, args.join(' '), (r.stderr || '').slice(0, 200));
   // Identifiers and headings in the answer are the repository's text, and it is about to enter an
   // agent's context and possibly a terminal log; control characters other than tab and newline carry nothing.
@@ -265,22 +200,19 @@ function checkoutRoot(start) {
 }
 
 /**
- * Whether a checkout asked for an index: it carries the hook `install-agent` writes, or a
- * `zerograph.toml`. Codex runs one copy of this hook in every repository a session opens, and a
- * build started in each of them would be the cost a git hook used to pay on every worktree add.
+ * Whether a checkout asked for an index: it carries a `zerograph.toml`, its main worktree has a
+ * built index, or either holds the hook an older `install-agent` wrote. The plugin runs this hook
+ * in every repository a session opens, and a build started in each of them would be the cost a git
+ * hook used to pay on every worktree add.
  */
 function optedIn(checkout) {
-  const asked = (dir) => ['.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs', 'zerograph.toml']
+  const asked = (dir) => ['zerograph.toml', '.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs']
     .some((p) => existsSync(join(dir, ...p.split('/'))));
   const main = mainCheckout(checkout);
-  return asked(checkout) || (main !== null && asked(main));
+  return asked(checkout) || (main !== null && (asked(main) || built(main)));
 }
 
-/**
- * The main worktree of a linked one, read off its `.git` file and the `commondir` beside it, or
- * null. `install-agent --codex` puts the Codex hook there, so a linked worktree whose own tree does
- * not carry it has still asked for an index.
- */
+/** The main worktree of a linked one, read off its `.git` file and the `commondir` beside it, or null. */
 function mainCheckout(checkout) {
   try {
     const gitdir = readFileSync(join(checkout, '.git'), 'utf8').match(/^gitdir:\s*(.+?)\s*$/m)?.[1];
@@ -537,8 +469,10 @@ function detached(root, args) {
   const bin = binary(root);
   if (!bin) return false;
   try {
-    const { file, args: argv, opts } = spawnable(bin, args);
-    const child = spawn(file, argv, { cwd: dirname(bin), detached: true, stdio: 'ignore', windowsHide: true, env: childEnv(root), ...opts });
+    const c = command(bin, args);
+    if (!c) return false;
+    const [file, ...argv] = c.argv;
+    const child = spawn(file, argv, { cwd: dirname(bin), detached: true, stdio: 'ignore', windowsHide: true, env: childEnv(root) });
     // A spawn that fails reports it as an event, not as a throw, and an unheard `error` event ends
     // this process — which would turn "no binary on PATH" into a hook that dies on stderr at every
     // session start. The listener is what keeps the contract: exit 0, and say nothing.
@@ -585,9 +519,11 @@ const handlers = {
     }
     if (!built(root)) {
       if (!isWatchedCall(p.tool_name, p.tool_input) || !once(key, 'build', 'once')) return null;
-      // SessionStart already started the build there; a `build` on top of it would embed twice.
+      // A machine-wide plugin says nothing in a repository that never asked for an index.
       const checkout = p.cwd && checkoutRoot(p.cwd);
-      return checkout && optedIn(checkout) && binaryFound(checkout) ? BUILDING_NOTICE : BUILD_NOTICE;
+      if (!checkout || !optedIn(checkout)) return null;
+      // SessionStart already started the build there; a `build` on top of it would embed twice.
+      return binaryFound(checkout) ? BUILDING_NOTICE : BUILD_NOTICE;
     }
     return intercept(p, root, key) ?? reminder(p, key);
   },
@@ -632,4 +568,4 @@ if (invokedDirectly()) {
   main();
 }
 
-export { rule, RULE_FALLBACK, COMMAND, binary, onPath, bounded, intercept, riskLine, handlers, MAX_INJECTIONS };
+export { rule, RULE, COMMAND, binary, onPath, bounded, intercept, riskLine, handlers, MAX_INJECTIONS };
