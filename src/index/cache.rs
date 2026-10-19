@@ -704,7 +704,7 @@ mod tests {
         let d = tempfile::tempdir().unwrap();
         let root = d.path().join("vectors");
         let c = VectorCache::for_status(root.clone(), 1 << 20).unwrap();
-        assert!(c.status().is_empty());
+        assert_eq!(c.status(), Status { models: vec![], other: 0 });
         assert!(!root.exists(), "a report does not create the directory it reports on");
     }
 
