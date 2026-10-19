@@ -5,29 +5,9 @@ use std::path::{Path, PathBuf};
 
 pub struct Store { repo: PathBuf }
 
-/// The store's directory, and the name it had before the rename. A store under the old name is
-/// read where it stands and moved by the first write, so an upgrade neither rebuilds nor re-embeds.
 pub(crate) const DIR: &str = ".zerograph";
-pub(crate) const LEGACY_DIR: &str = ".repograph";
 
-fn present(p: &Path) -> bool { std::fs::symlink_metadata(p).is_ok() }
-
-/// Where the store is right now: `.zerograph` whenever anything stands at that name, else a
-/// `.repograph` no write has moved yet, else `.zerograph` for a store not built. Resolved on each
-/// call and never kept, so a server or an MCP process that outlives the move follows it.
-pub(crate) fn dir_of(repo: &Path) -> PathBuf {
-    let dir = repo.join(DIR);
-    if present(&dir) { return dir; }
-    let legacy = repo.join(LEGACY_DIR);
-    if present(&legacy) { legacy } else { dir }
-}
-
-/// [`dir_of`]'s name, for a line that tells the reader which directory to open: a store the move
-/// could not reach stays under the old name, and a line that said `.zerograph` would send them to
-/// a directory that is not there.
-pub(crate) fn dir_name_of(repo: &Path) -> &'static str {
-    if dir_of(repo).ends_with(LEGACY_DIR) { LEGACY_DIR } else { DIR }
-}
+pub(crate) fn dir_of(repo: &Path) -> PathBuf { repo.join(DIR) }
 
 /// Where a load got its value. The JSON is what a store is defined by and what any other
 /// binary reads; the mirror is a postcard copy of the same value written beside it, because
@@ -114,7 +94,8 @@ pub(crate) fn open_unlinked(o: &mut std::fs::OpenOptions, p: &Path) -> std::io::
 pub(crate) fn prepare_private_dir(dir: &Path) -> Result<()> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
     if let Some(above) = dir.parent() {
-        std::fs::create_dir_all(above).with_context(|| format!("create {}", above.display()))?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(above)
+            .with_context(|| format!("create {}", above.display()))?;
     }
     match std::fs::DirBuilder::new().mode(0o700).create(dir) {
         Ok(()) => {}
@@ -128,6 +109,95 @@ pub(crate) fn prepare_private_dir(dir: &Path) -> Result<()> {
         anyhow::bail!("{} is not a directory private to this user", dir.display());
     }
     Ok(())
+}
+
+/// `dir` with its parent's links resolved, or a refusal when another user could move it: an
+/// ancestor they can write lets them rename the path away and put their own directory in its
+/// place after `prepare_private_dir` has checked it. That is one another user owns, one anyone may
+/// write without the sticky bit, or one a group may write unless the group is this user's own
+/// private one: on macOS every user shares `staff`. The parents `prepare_private_dir` makes are
+/// 0700 whatever the umask, so only a directory made by hand is refused for its group. Both the ancestors as spelled and those the links
+/// lead to are asked about, since either is a place the path can be moved from. Ancestors that do
+/// not exist yet are made by this user. `dir` itself is left unresolved, so that
+/// `prepare_private_dir` still refuses it when it is a link.
+#[cfg(unix)]
+pub(crate) fn refuse_shared_ancestors(dir: &Path) -> Result<PathBuf> {
+    let (Some(parent), Some(name)) = (dir.parent(), dir.file_name()) else { return Ok(dir.to_path_buf()) };
+    let real = resolve_existing(parent).join(name);
+    for spelled in [dir, real.as_path()] {
+        for above in spelled.ancestors().skip(1) {
+            if let Some(reason) = shared_with_others(above) {
+                anyhow::bail!("{} sits under {}, which {reason}", dir.display(), above.display());
+            }
+        }
+    }
+    Ok(real)
+}
+
+/// `path` with the part of it that exists canonicalized and the rest appended as spelled.
+#[cfg(unix)]
+fn resolve_existing(path: &Path) -> PathBuf {
+    let mut rest = Vec::new();
+    let mut at = path;
+    loop {
+        if let Ok(real) = at.canonicalize() {
+            return rest.iter().rev().fold(real, |p, part| p.join(part));
+        }
+        match (at.parent(), at.file_name()) {
+            (Some(up), Some(part)) => { rest.push(part.to_os_string()); at = up; }
+            _ => return path.to_path_buf(),
+        }
+    }
+}
+
+#[cfg(unix)]
+fn shared_with_others(dir: &Path) -> Option<&'static str> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = std::fs::metadata(dir).ok()?;
+    // SAFETY: geteuid has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    let mode = meta.permissions().mode();
+    let group_writes = mode & 0o020 != 0 && mode & 0o1000 == 0;
+    others_may_move(meta.uid(), me, mode, group_writes && user_private_group(meta.gid(), me))
+}
+
+/// Why others may move what is under a directory of `owner`'s with `mode`, if they may.
+#[cfg(unix)]
+fn others_may_move(owner: u32, me: u32, mode: u32, group_is_mine: bool) -> Option<&'static str> {
+    // Its owner may always rename what is in it, whatever its mode.
+    if owner != me && owner != 0 { return Some("another user owns"); }
+    if mode & 0o1000 != 0 { return None; }
+    if mode & 0o002 != 0 { return Some("anyone can write without the sticky bit"); }
+    if mode & 0o020 != 0 && !group_is_mine { return Some("a group other than this user's own can write"); }
+    None
+}
+
+/// Whether `gid` is `me`'s user-private group: their primary group, named after them, with no
+/// other member. Anyone else whose primary group it is would not be listed as a member, so the
+/// name is what rules out a shared group such as `staff`.
+#[cfg(unix)]
+fn user_private_group(gid: u32, me: u32) -> bool {
+    use std::ffi::CStr;
+    let mut buf = vec![0 as libc::c_char; 1 << 16];
+    // SAFETY: the structs are plain C data that the _r calls fill in, the buffer outlives every
+    // pointer read from them, and a null result or error is checked before any is followed.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        if libc::getpwuid_r(me, &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) != 0 || found.is_null() { return false; }
+        if pw.pw_gid != gid { return false; }
+        let name = CStr::from_ptr(pw.pw_name).to_bytes().to_vec();
+        let mut gr: libc::group = std::mem::zeroed();
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        if libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut found) != 0 || found.is_null() { return false; }
+        if CStr::from_ptr(gr.gr_name).to_bytes() != name.as_slice() { return false; }
+        let mut member = gr.gr_mem;
+        while !member.is_null() && !(*member).is_null() {
+            if CStr::from_ptr(*member).to_bytes() != name.as_slice() { return false; }
+            member = member.add(1);
+        }
+        true
+    }
 }
 
 /// The profile directory's own ACL is what keeps others out on Windows; all that is owed here is
@@ -216,19 +286,9 @@ impl Store {
 
     pub(crate) fn dir(&self) -> PathBuf { dir_of(&self.repo) }
 
-    /// Runs `read` against the store where it stands, and once more against `.zerograph` when it
-    /// `missed` in a `.repograph` that a writer moved away meanwhile: that is the same store under
-    /// its new name, not an absent one.
-    fn reading<T>(&self, read: impl Fn(&Path) -> Result<T>, missed: impl Fn(&Result<T>) -> bool) -> Result<T> {
-        let dir = self.dir();
-        let got = read(&dir);
-        let new = self.repo.join(DIR);
-        if dir != new && missed(&got) && present(&new) { read(&new) } else { got }
-    }
-
     pub fn load(&self) -> Result<(Graph, Manifest)> { self.load_traced().map(|(g, m, _)| (g, m)) }
 
-    /// Whether a store directory stands under either name. A reader that finds none has nothing
+    /// Whether a store directory stands. A reader that finds none has nothing
     /// to answer from and creates nothing: the lock it would take makes the directory.
     pub(crate) fn stands(&self) -> bool { dir_of(&self.repo).is_dir() }
 
@@ -262,7 +322,7 @@ impl Store {
 
     /// A JSON store file, read through its mirror when the mirror still describes these bytes.
     pub fn load_mirrored<T: serde::de::DeserializeOwned>(&self, json: &str) -> Result<(Option<T>, Source)> {
-        self.reading(|dir| Self::load_mirrored_in(dir, json), |got| !matches!(got, Ok((Some(_), _))))
+        Self::load_mirrored_in(&self.dir(), json)
     }
 
     fn load_mirrored_in<T: serde::de::DeserializeOwned>(dir: &Path, json: &str) -> Result<(Option<T>, Source)> {
@@ -298,62 +358,26 @@ impl Store {
     /// Whether the store or its lock is a link, which every writer refuses: a reader that finds the
     /// lock refused for this reason writes nothing, where a read-only checkout writes unlocked.
     pub(crate) fn has_link(&self) -> bool {
-        is_link(&self.repo.join(DIR)) || is_link(&self.repo.join(LEGACY_DIR)) || is_link(&self.dir().join("writer.lock"))
-    }
-
-    /// A store directory that is itself a link is refused for the same reason a link inside it
-    /// is: every write and every unlink under it would land wherever the clone pointed it. Both
-    /// names, because a write may move the old one onto the new.
-    fn refuse_linked_dir(&self) -> Result<()> {
-        for dir in [self.repo.join(DIR), self.repo.join(LEGACY_DIR)] {
-            if is_link(&dir) {
-                anyhow::bail!("{} is a symlink; refusing to write through it — remove it and run again", dir.display());
-            }
-        }
-        Ok(())
+        is_link(&self.dir()) || is_link(&self.dir().join("writer.lock"))
     }
 
     /// The store ready for a write in place, for a process that touches the directory without
-    /// going through `ensure_dir` first: neither name a link, and a store under the old name
-    /// moved to the new one. Returns where the store is, which is `.zerograph` unless the move
-    /// could not be made.
+    /// going through `ensure_dir` first. A store directory that is itself a link is refused for
+    /// the same reason a link inside it is: every write and every unlink under it would land
+    /// wherever the clone pointed it.
     pub(crate) fn settle(&self) -> Result<PathBuf> {
-        self.refuse_linked_dir()?;
-        let dir = self.migrate()?;
-        // Again after the move: a rename moves a link as readily as a directory.
-        self.refuse_linked_dir()?;
-        Ok(dir)
-    }
-
-    /// Moves a `.repograph` built before the rename to `.zerograph` by one rename in the same
-    /// parent — never a copy, never a delete — so whatever stops it, the store is whole under one
-    /// name or the other.
-    fn migrate(&self) -> Result<PathBuf> {
-        let dir = self.repo.join(DIR);
-        let legacy = self.repo.join(LEGACY_DIR);
-        let legacy_is_dir = || std::fs::symlink_metadata(&legacy).is_ok_and(|m| m.is_dir());
-        if present(&dir) || !legacy_is_dir() { return Ok(dir); }
-        match std::fs::rename(&legacy, &dir) {
-            Ok(()) => Ok(dir),
-            // Another process moved it first, or built a new store there: either way it is the one.
-            Err(_) if present(&dir) => Ok(dir),
-            // Windows refuses to rename a directory while a file inside it is open, which a
-            // resident server can keep so for hours. Writing in place keeps the store working,
-            // and a later write tries the move again.
-            Err(_) if legacy_is_dir() => Ok(legacy),
-            Err(e) => Err(e).with_context(|| format!("move {} to {}", legacy.display(), dir.display())),
+        let dir = self.dir();
+        if is_link(&dir) {
+            anyhow::bail!("{} is a symlink; refusing to write through it — remove it and run again", dir.display());
         }
+        Ok(dir)
     }
 
     /// The store holds passages of the repository's documents and code, so it carries its own `.gitignore`: a `git add -A` in a repository that
     /// never listed `.zerograph/` would otherwise commit it. Returns the directory to write in.
     pub(crate) fn ensure_dir(&self) -> Result<PathBuf> {
         let dir = self.settle()?;
-        // The old name comes back only as a directory that stands. Making it again here would put
-        // an empty one where another process has just moved the store from, and split it in two.
-        if dir != self.repo.join(LEGACY_DIR) {
-            std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
-        }
+        std::fs::create_dir_all(&dir).with_context(|| format!("create {}", dir.display()))?;
         let ignore = dir.join(".gitignore");
         match open_unlinked(std::fs::OpenOptions::new().write(true).create_new(true), &ignore) {
             Ok(mut f) => {
@@ -453,18 +477,17 @@ impl Store {
     /// Whether a store file is there with something in it — a metadata read, so a caller can
     /// decide about a 50 MB file without loading it.
     pub fn has(&self, name: &str) -> bool {
-        self.reading(|dir| Ok(std::fs::metadata(dir.join(name)).is_ok_and(|m| m.len() > 0)), |got| matches!(got, Ok(false))).unwrap_or(false)
+        std::fs::metadata(self.dir().join(name)).is_ok_and(|m| m.len() > 0)
     }
 
     /// What a `stat` says about a store file, for a poller that wants to know whether someone
     /// else has written it without reading megabytes to find out.
     pub fn stamp(&self, name: &str) -> Option<crate::walk::Stamp> {
-        let at = |dir: &Path| Ok(std::fs::metadata(dir.join(name)).ok().and_then(|m| crate::walk::stamp_of(&m)));
-        self.reading(at, |got| matches!(got, Ok(None))).ok().flatten()
+        std::fs::metadata(self.dir().join(name)).ok().and_then(|m| crate::walk::stamp_of(&m))
     }
 
     pub fn read_bytes(&self, name: &str) -> Result<Option<Vec<u8>>> {
-        self.reading(|dir| read_in(dir, name), |got| !matches!(got, Ok(Some(_))))
+        read_in(&self.dir(), name)
     }
 
     /// A record that has emptied leaves no file behind, so a store never holds one it would not write.
@@ -511,7 +534,7 @@ impl Store {
         Ok(WriterLock(f))
     }
 
-    fn lock_label(&self) -> String { format!("lock {}/writer.lock", dir_name_of(&self.repo)) }
+    fn lock_label(&self) -> String { format!("lock {DIR}/writer.lock") }
 
     /// Never removed: a lock file deleted while one process holds it lets the next process lock
     /// a new file of the same name, and both believe they are the only writer.
@@ -538,6 +561,84 @@ const LEFTOVER_AGE: std::time::Duration = std::time::Duration::from_secs(600);
 mod tests {
     use super::*;
     use crate::model::{EdgeKind, Extraction, NodeKind};
+
+    #[cfg(unix)]
+    #[test]
+    fn a_directory_of_this_users_that_others_can_write_is_refused_unless_it_is_sticky() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let home = tempfile::tempdir().unwrap();
+        let mine = home.path().join("mine");
+        std::fs::create_dir(&mine).unwrap();
+        let cache = mine.join("zerograph").join("vectors");
+        let mode = |m| std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o755);
+        refuse_shared_ancestors(&cache).unwrap();
+        mode(0o777);
+        let err = refuse_shared_ancestors(&cache).unwrap_err().to_string();
+        assert!(err.contains("anyone can write without the sticky bit"), "{err}");
+        mode(0o1777);
+        refuse_shared_ancestors(&cache).unwrap();
+        mode(0o775);
+        let gid = std::fs::metadata(&mine).unwrap().gid();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let private = user_private_group(gid, unsafe { libc::geteuid() });
+        assert_eq!(refuse_shared_ancestors(&cache).is_ok(), private, "a group may write it unless the group is this user's alone");
+        mode(0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_parents_a_first_run_made_are_private_and_a_second_run_accepts_them() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = tempfile::tempdir().unwrap();
+        let cache = home.path().join("a").join("b").join("vectors");
+        prepare_private_dir(&refuse_shared_ancestors(&cache).unwrap()).unwrap();
+        let mode = std::fs::metadata(home.path().join("a")).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "a parent this run made is private to the user, so a umask of 0002 cannot open it to a group");
+        prepare_private_dir(&refuse_shared_ancestors(&cache).unwrap()).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_ancestor_is_refused_when_anyone_but_this_user_could_write_it() {
+        let (me, them) = (501, 502);
+        assert_eq!(others_may_move(me, me, 0o755, false), None);
+        assert!(others_may_move(them, me, 0o755, false).is_some(), "its owner can rename what is in it");
+        assert!(others_may_move(me, me, 0o777, false).is_some(), "anyone can, without the sticky bit");
+        assert_eq!(others_may_move(me, me, 0o1777, false), None);
+        assert!(others_may_move(me, me, 0o775, false).is_some(), "a shared group such as staff can");
+        assert_eq!(others_may_move(me, me, 0o775, true), None, "this user's private group is this user");
+        assert!(others_may_move(0, me, 0o777, false).is_some());
+        assert!(others_may_move(0, me, 0o775, false).is_some());
+        assert_eq!(others_may_move(0, me, 0o1777, false), None, "as /tmp is");
+        assert_eq!(others_may_move(0, me, 0o755, false), None);
+        assert!(others_may_move(0, 0, 0o777, false).is_some(), "root is held to the same rules");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_group_is_never_taken_for_this_users_own() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert!(!user_private_group(u32::MAX - 1, me), "a group that does not exist");
+        // Every macOS user's primary group is staff, which is not named after any of them.
+        #[cfg(target_os = "macos")]
+        assert!(!user_private_group(20, me));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_link_in_the_parent_is_resolved_and_the_path_itself_is_not() {
+        let home = tempfile::tempdir().unwrap();
+        let real = home.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let alias = home.path().join("alias");
+        std::os::unix::fs::symlink(&real, &alias).unwrap();
+        let resolved = refuse_shared_ancestors(&alias.join("zerograph").join("vectors")).unwrap();
+        assert_eq!(resolved, real.canonicalize().unwrap().join("zerograph").join("vectors"));
+        assert_eq!(refuse_shared_ancestors(&alias).unwrap(), home.path().canonicalize().unwrap().join("alias"),
+            "the override itself stays a link, for prepare_private_dir to refuse");
+    }
 
     #[test]
     fn the_store_ignores_itself_so_a_commit_of_everything_leaves_it_out() {
@@ -1026,125 +1127,6 @@ mod tests {
         let f = std::fs::File::create(&p).unwrap();
         f.set_len(MAX_STORE_FILE + 1).unwrap();
         assert!(read_capped(open_for_read(&p).unwrap().unwrap(), &p).is_err());
-    }
-
-    /// A store saved as this release saves it, then put under the name it had before the rename.
-    fn legacy_store(repo: &Path) -> Graph {
-        let g = graph("до переименования");
-        Store::new(repo).save(&g, &Manifest::default()).unwrap();
-        Store::new(repo).write_atomic("vectors.f32", b"rows").unwrap();
-        std::fs::rename(repo.join(DIR), repo.join(LEGACY_DIR)).unwrap();
-        g
-    }
-
-    #[test]
-    fn a_store_under_the_old_name_is_read_where_it_stands() {
-        let d = tempfile::tempdir().unwrap();
-        let g = legacy_store(d.path());
-        let store = Store::new(d.path());
-        let (read, _, source) = store.load_traced().unwrap();
-        assert_eq!(read.nodes, g.nodes);
-        assert_eq!(source, Source::Mirror);
-        assert!(store.has("vectors.f32") && store.stamp("vectors.f32").is_some());
-        assert_eq!(store.read_bytes("vectors.f32").unwrap().as_deref(), Some(&b"rows"[..]));
-        assert!(!d.path().join(DIR).exists(), "a read moves nothing");
-    }
-
-    #[test]
-    fn the_first_write_moves_the_old_store_to_the_new_name_whole() {
-        let d = tempfile::tempdir().unwrap();
-        let g = legacy_store(d.path());
-        #[cfg(unix)]
-        let inode = { use std::os::unix::fs::MetadataExt; std::fs::metadata(d.path().join(LEGACY_DIR)).unwrap().ino() };
-        let store = Store::new(d.path());
-        assert_eq!(dir_name_of(d.path()), LEGACY_DIR);
-        let _lock = store.lock_writer().unwrap();
-        assert_eq!(dir_name_of(d.path()), DIR);
-        assert!(!d.path().join(LEGACY_DIR).exists(), "moved, not copied");
-        let dir = d.path().join(DIR);
-        #[cfg(unix)]
-        { use std::os::unix::fs::MetadataExt; assert_eq!(std::fs::metadata(&dir).unwrap().ino(), inode, "the same directory, renamed"); }
-        assert_eq!(std::fs::read(dir.join("vectors.f32")).unwrap(), b"rows");
-        assert!(dir.join("writer.lock").exists() && dir.join(".gitignore").exists());
-        assert_eq!(store.load().unwrap().0.nodes, g.nodes);
-    }
-
-    #[test]
-    fn with_both_names_present_the_new_one_is_used_and_the_old_one_left_alone() {
-        let d = tempfile::tempdir().unwrap();
-        let old = legacy_store(d.path());
-        let built = tempfile::tempdir().unwrap();
-        let g = graph("после");
-        Store::new(built.path()).save(&g, &Manifest::default()).unwrap();
-        std::fs::rename(built.path().join(DIR), d.path().join(DIR)).unwrap();
-        let store = Store::new(d.path());
-        assert_eq!(store.load().unwrap().0.nodes, g.nodes);
-        store.write_atomic("vectors.f32", b"new rows").unwrap();
-        assert_eq!(store.read_bytes("vectors.f32").unwrap().as_deref(), Some(&b"new rows"[..]));
-        let legacy = d.path().join(LEGACY_DIR);
-        let left: Graph = serde_json::from_slice(&std::fs::read(legacy.join("graph.json")).unwrap()).unwrap();
-        assert_eq!(left.nodes, old.nodes, "the old store is never written, moved over or removed");
-        assert_eq!(std::fs::read(legacy.join("vectors.f32")).unwrap(), b"rows");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_link_at_either_name_is_refused_and_nothing_is_moved() {
-        let d = tempfile::tempdir().unwrap();
-        let elsewhere = d.path().join("elsewhere");
-        std::fs::create_dir_all(&elsewhere).unwrap();
-        std::fs::write(elsewhere.join("manifest.json"), "{}").unwrap();
-        let repo = d.path().join("repo");
-        std::fs::create_dir_all(&repo).unwrap();
-        std::os::unix::fs::symlink(&elsewhere, repo.join(LEGACY_DIR)).unwrap();
-        let store = Store::new(&repo);
-        assert!(store.has_link());
-        assert!(store.ensure_dir().is_err());
-        assert!(store.lock_writer().is_err());
-        assert!(!repo.join(DIR).exists(), "the link was not moved to the new name");
-        assert!(repo.join(LEGACY_DIR).symlink_metadata().unwrap().file_type().is_symlink());
-        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
-
-        std::fs::remove_file(repo.join(LEGACY_DIR)).unwrap();
-        legacy_store(&repo);
-        std::os::unix::fs::symlink(&elsewhere, repo.join(DIR)).unwrap();
-        assert!(store.has_link());
-        assert!(store.save(&Graph::default(), &Manifest::default()).is_err());
-        assert!(repo.join(LEGACY_DIR).join("graph.json").exists(), "the old store stays where it was");
-        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1);
-    }
-
-    #[test]
-    fn a_read_that_finds_the_old_store_moved_away_reads_it_under_the_new_name() {
-        let d = tempfile::tempdir().unwrap();
-        legacy_store(d.path());
-        let store = Store::new(d.path());
-        let first = std::cell::Cell::new(true);
-        // Another process's first write lands between this read resolving the directory and
-        // opening the file in it.
-        let got = store.reading(|dir| {
-            if first.replace(false) {
-                assert!(dir.ends_with(LEGACY_DIR));
-                std::fs::rename(d.path().join(LEGACY_DIR), d.path().join(DIR)).unwrap();
-            }
-            read_in(dir, "vectors.f32")
-        }, |got| !matches!(got, Ok(Some(_)))).unwrap();
-        assert_eq!(got.as_deref(), Some(&b"rows"[..]));
-    }
-
-    #[test]
-    fn writers_racing_to_move_the_old_store_all_land_in_the_new_one() {
-        let d = tempfile::tempdir().unwrap();
-        legacy_store(d.path());
-        let repo = d.path().to_path_buf();
-        let writers: Vec<_> = (0..8).map(|i| {
-            let repo = repo.clone();
-            std::thread::spawn(move || Store::new(&repo).write_atomic(&format!("w{i}"), b"x"))
-        }).collect();
-        for w in writers { w.join().unwrap().unwrap(); }
-        assert!(!repo.join(LEGACY_DIR).exists());
-        for i in 0..8 { assert!(repo.join(DIR).join(format!("w{i}")).exists(), "w{i}"); }
-        assert_eq!(std::fs::read(repo.join(DIR).join("vectors.f32")).unwrap(), b"rows");
     }
 
     #[test]

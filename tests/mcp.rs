@@ -3,7 +3,7 @@ use std::process::{Command, Stdio};
 
 fn zerograph() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph"));
-    c.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS");
+    c.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS");
     c
 }
 

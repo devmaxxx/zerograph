@@ -2,7 +2,7 @@
 
 | page | what is in it |
 | --- | --- |
-| [install](install.md) | npm and cargo, what the npm package carries, coming from repograph, and the release workflow |
+| [install](install.md) | npm and cargo, what the npm package carries, upgrading, and the release workflow |
 | [commands](commands.md) | every command with examples, `--json` shapes, exit codes, `explain`, `verify`, `import-legacy`, `bench` |
 | [keeping fresh](keeping-fresh.md) | the self-healing `ask`, `reader_budget`, detached refreshes, the session hook, hand-written git hooks |
 | [serve](serve.md) | the resident process, its idles, socket path and measured latency |

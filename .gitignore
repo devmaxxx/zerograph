@@ -1,7 +1,5 @@
 /target
 /.zerograph
-# A store built under the old name, which stays until a write moves it to .zerograph.
-/.repograph
 /.superpowers
 /dist
 /npm/zerograph/bin/*/

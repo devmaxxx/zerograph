@@ -1,5 +1,7 @@
 # feat/borrow-sibling-vectors
 
+> Superseded by the machine-wide vector cache (#241).
+
 ## Tickets
 - **#211: Borrow vectors from sibling worktrees instead of re-embedding** (GitHub issue, free-text task, tracker=none)
   - Description: a fresh worktree pays a full cold build, and a cold build is 99.6% embedding

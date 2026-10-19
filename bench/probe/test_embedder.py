@@ -34,14 +34,12 @@ def sourced(snippet, model=None, **env):
 def run(argv, cwd, model, **env):
     """One environment for both callers here. `model` is the whole of the declaration — `None` means
     it is absent, and this machine's own value never leaks in behind it — and whatever else a script
-    reads off the environment rides on `env`. The renamed variable is absent the same way, unless
+    reads off the environment rides on `env`. The pre-rename variable is absent the same way, unless
     a case passes it."""
-    e = {k: v for k, v in os.environ.items() if k != "ZEROGRAPH_EMBED_MODEL"}
+    e = {k: v for k, v in os.environ.items() if k not in ("ZEROGRAPH_EMBED_MODEL", "REPOGRAPH_EMBED_MODEL")}
+    if model is not None:
+        e["ZEROGRAPH_EMBED_MODEL"] = model
     e.update(env)
-    if model is None:
-        e.pop("REPOGRAPH_EMBED_MODEL", None)
-    else:
-        e["REPOGRAPH_EMBED_MODEL"] = model
     return subprocess.run(argv, cwd=cwd, capture_output=True, text=True, env=e)
 
 
@@ -64,15 +62,15 @@ class Declaration(unittest.TestCase):
         # Declared as a plain shell variable and not in the environment, which is what makes the
         # assertion bite: what a row is read under is what the binary's own process sees, and a
         # declaration that stopped at the script would leave the binary on the built-in default.
-        r = sourced(f"REPOGRAPH_EMBED_MODEL={SMALL}; embedder_declared && "
-                    "bash -c 'echo child sees $REPOGRAPH_EMBED_MODEL'", None)
+        r = sourced(f"ZEROGRAPH_EMBED_MODEL={SMALL}; embedder_declared && "
+                    "bash -c 'echo child sees $ZEROGRAPH_EMBED_MODEL and $REPOGRAPH_EMBED_MODEL'", None)
         self.assertEqual(r.returncode, 0, r.stderr)
-        self.assertIn(f"child sees {SMALL}", r.stdout)
+        self.assertIn(f"child sees {SMALL} and {SMALL}", r.stdout, "a pinned pre-rename binary reads the old name")
 
     def test_an_absent_declaration_refuses_and_says_what_to_export(self):
         r = sourced("embedder_declared", None)
         self.assertEqual(r.returncode, 2, r.stdout)
-        self.assertIn("REPOGRAPH_EMBED_MODEL", r.stderr)
+        self.assertIn("ZEROGRAPH_EMBED_MODEL", r.stderr)
         self.assertIn(SMALL, r.stderr)
 
     def test_another_model_refuses_and_names_both(self):
@@ -86,7 +84,7 @@ class Declaration(unittest.TestCase):
             with self.subTest(script=name):
                 r = self.script(name, None)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-                self.assertIn("REPOGRAPH_EMBED_MODEL", r.stderr)
+                self.assertIn("ZEROGRAPH_EMBED_MODEL", r.stderr)
 
     def test_every_script_refuses_a_declaration_naming_another_model(self):
         for name in SCRIPTS:
@@ -95,27 +93,27 @@ class Declaration(unittest.TestCase):
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
                 self.assertIn(OTHER, r.stderr)
 
-    def test_the_renamed_variable_naming_another_model_outranks_the_declaration_and_is_refused(self):
-        r = sourced("embedder_declared", SMALL, ZEROGRAPH_EMBED_MODEL=OTHER)
+    def test_a_declaration_set_to_nothing_is_refused_as_absent(self):
+        r = sourced("embedder_declared", "")
         self.assertEqual(r.returncode, 2, r.stdout)
         self.assertIn("ZEROGRAPH_EMBED_MODEL", r.stderr)
+
+    def test_the_pre_rename_variable_naming_another_model_is_refused(self):
+        r = sourced("embedder_declared", SMALL, REPOGRAPH_EMBED_MODEL=OTHER)
+        self.assertEqual(r.returncode, 2, r.stdout)
+        self.assertIn("REPOGRAPH_EMBED_MODEL", r.stderr)
         self.assertIn(OTHER, r.stderr)
 
-    def test_the_renamed_variable_set_to_nothing_still_outranks_the_declaration(self):
-        r = sourced("embedder_declared", SMALL, ZEROGRAPH_EMBED_MODEL="")
-        self.assertEqual(r.returncode, 2, r.stdout)
-        self.assertIn("ZEROGRAPH_EMBED_MODEL", r.stderr)
-
-    def test_the_renamed_variable_agreeing_with_the_declaration_passes(self):
-        r = sourced("embedder_declared", SMALL, ZEROGRAPH_EMBED_MODEL=SMALL)
+    def test_the_pre_rename_variable_agreeing_with_the_declaration_passes(self):
+        r = sourced("embedder_declared", SMALL, REPOGRAPH_EMBED_MODEL=SMALL)
         self.assertEqual(r.returncode, 0, r.stderr)
 
-    def test_every_script_refuses_when_the_renamed_variable_disagrees(self):
+    def test_every_script_refuses_when_the_pre_rename_variable_disagrees(self):
         for name in SCRIPTS:
             with self.subTest(script=name):
-                r = self.script(name, SMALL, ZEROGRAPH_EMBED_MODEL=OTHER)
+                r = self.script(name, SMALL, REPOGRAPH_EMBED_MODEL=OTHER)
                 self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-                self.assertIn("ZEROGRAPH_EMBED_MODEL", r.stderr)
+                self.assertIn("REPOGRAPH_EMBED_MODEL", r.stderr)
 
     def test_the_line_a_transcript_carries_is_not_read_back_as_a_row(self):
         # It sits in `summary.txt` beside the rows `judge.py medians` takes its medians over, the

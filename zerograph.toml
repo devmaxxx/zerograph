@@ -3,7 +3,7 @@
 # README's Configure section walks through.
 doc_globs = ["**/*.md"]
 code_globs = ["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.kt", "**/*.java", "**/*.cs", "**/*.rs", "**/*.py", "**/*.dart", "**/*.swift", "**/*.gql", "**/*.graphql", "**/*.sql", "**/*.bicep", "**/*.tf", "**/*.hcl", "**/*.sh", "**/*.bash", "**/*.vue"]
-skip = ["**/node_modules/**", "**/dist/**", "**/*.min.js", "**/.yarn/**", "**/.pnp.*", "**/target/**", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.terraform/**", "**/.dart_tool/**", "**/Pods/**", "**/TRACKER.md", "graphify-out/**", ".zerograph/**", ".repograph/**"]
+skip = ["**/node_modules/**", "**/dist/**", "**/*.min.js", "**/.yarn/**", "**/.pnp.*", "**/target/**", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.terraform/**", "**/.dart_tool/**", "**/Pods/**", "**/TRACKER.md", "graphify-out/**", ".zerograph/**"]
 registries = ["docs/constitution.yaml"]
 
 # There is no key for id families: they are the prefixes the documents define —
@@ -25,11 +25,10 @@ registries = ["docs/constitution.yaml"]
 # ~/.config/zerograph/config.toml, or for one run with ZEROGRAPH_RERANK_MODEL.
 rerank_model = "haiku"
 
-# `ask --rerank-local`: a local cross-encoder over the same 200-deep pool, zero tokens. Empty
-# means ~/.cache/zerograph/reranker, where `optimum-cli export onnx` was pointed. Measured and
-# rejected against a bar of one second: 17.9 s a question, and keyword 39/40 — for tokens being
-# impossible, not for tokens being expensive.
-reranker_dir = ""
+# `ask --rerank-local`: a local cross-encoder over the same 200-deep pool, zero tokens, read from
+# ~/.cache/zerograph/reranker unless the machine config's `reranker_dir` names another directory
+# (a repository's is ignored). Measured and rejected against a bar of one second: 17.9 s a
+# question, and keyword 39/40 — for tokens being impossible, not for tokens being expensive.
 
 # A store records the model its vectors were written with and `ask` opens that one, so this key
 # decides only what new rows are written with, not what an existing store answers by. The small

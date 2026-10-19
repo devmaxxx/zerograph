@@ -60,8 +60,8 @@ fn write_tree(repo: &Path) {
 fn build(repo: &Path) -> BTreeSet<String> {
     let mut cmd = Command::new(env!("CARGO_BIN_EXE_zerograph"));
     // As `tests/common` strips them: globs a shell exported would stand in for the defaults under test.
-    cmd.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL")
-        .env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS").env_remove("ZEROGRAPH_TEXT_GLOBS").env_remove("REPOGRAPH_TEXT_GLOBS");
+    cmd.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL")
+        .env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("ZEROGRAPH_TEXT_GLOBS");
     let out = cmd.arg("--no-dense").arg("--repo").arg(repo).arg("build").output().unwrap();
     assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
     let graph: serde_json::Value = serde_json::from_slice(&std::fs::read(repo.join(".zerograph").join("graph.json")).unwrap()).unwrap();

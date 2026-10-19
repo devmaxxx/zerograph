@@ -67,8 +67,8 @@ class Suite(unittest.TestCase):
     def run_suite(self, worktree="wt", **env):
         return subprocess.run(["bash", "probe/readers.sh", "./bin/zerograph", worktree, "log", "1"],
                               cwd=self.tmp, capture_output=True, text=True,
-                              env={**{k: v for k, v in os.environ.items() if k != "ZEROGRAPH_EMBED_MODEL"},
-                                   "REPOGRAPH_EMBED_MODEL": SMALL, **env})
+                              env={**{k: v for k, v in os.environ.items() if k != "REPOGRAPH_EMBED_MODEL"},
+                                   "ZEROGRAPH_EMBED_MODEL": SMALL, **env})
 
     def test_a_medians_step_that_refused_is_not_reported_as_a_suite_that_passed(self):
         self.judge.write_text(JUDGE_REFUSES)
@@ -100,7 +100,7 @@ class Suite(unittest.TestCase):
 
     def test_the_file_the_medians_are_taken_from_names_the_embedder(self):
         self.run_suite()
-        self.assertIn(f"embedder: REPOGRAPH_EMBED_MODEL={SMALL}", (self.tmp / "log" / "summary.txt").read_text())
+        self.assertIn(f"embedder: ZEROGRAPH_EMBED_MODEL={SMALL}", (self.tmp / "log" / "summary.txt").read_text())
 
     def test_the_medians_that_become_the_reference_name_it_too_and_still_read_back(self):
         # `medians.txt` is what is copied out as the reference, so it is the file that has to say
@@ -108,7 +108,7 @@ class Suite(unittest.TestCase):
         # would refuse a suite outright if the line entered one of their tables as a row.
         self.run_suite()
         medians = self.tmp / "log" / "medians.txt"
-        self.assertIn(f"embedder: REPOGRAPH_EMBED_MODEL={SMALL}", medians.read_text())
+        self.assertIn(f"embedder: ZEROGRAPH_EMBED_MODEL={SMALL}", medians.read_text())
         self.assertEqual(list(judge.read_medians(medians)), ["ask-fused"])
 
 

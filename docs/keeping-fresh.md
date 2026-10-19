@@ -81,8 +81,11 @@ this machine has already built embeds only the rows no checkout here has embedde
 dense: 4512 rows from the vector cache
 ```
 
-A row is keyed by the blake3 hash of its text plus the model id and dimension, so a row of another
-model, variant or width never crosses. A cached vector is the one this checkout would have embedded
+A row is keyed by the blake3 hash of its text plus the model id, the hub commit its files were
+fetched at, the dimension and the cache's format version, so a row of another model, variant,
+revision or width never crosses. A model that follows the hub's `main` writes under a new
+revision once its weights move; rows of an older cache format are listed by `cache status` and
+dropped by the next prune. A cached vector is the one this checkout would have embedded
 up to the last digits — batch padding makes two embeds of the same text near-identical, not
 bit-identical — so answers do not move.
 
@@ -96,11 +99,24 @@ is skipped, never returned.
 The cache holds `vector_cache_max` bytes (machine file only, default `4G`), least recently used
 rows going first. A write that takes it over the cap starts `zerograph cache prune` in a background
 process, which trims it to 80% of the cap, so the answer that wrote the row never waits on the
-prune. `zerograph cache status` shows what it holds per model. `0` turns the cache off: nothing
-reads or writes it from then on, and `zerograph cache prune` empties what it already holds.
+prune; a long-lived `serve` or MCP server starts one at most every 10 minutes. Every prune also
+drops repeated and torn records and rows of an older format, so `cache prune` under the cap can
+still report rows removed: its line says how many went for each reason. `zerograph cache status`
+shows what it holds per model, and apart from that the bytes of shards a later release wrote or
+nothing can read, which count against the cap too. `0` turns the cache off: nothing reads or
+writes it from then on, and `zerograph cache prune` empties what it already holds.
 
-`ZEROGRAPH_VECTOR_CACHE` points one run at another directory, which must be absolute. On Windows it
-must also sit under `%LOCALAPPDATA%`, because Windows does not check who owns the directory. An
+An `ask` reads at most 32 of the cache's shards, those holding the most of its rows first, since
+it reads each one whole before its budget is weighed. The rows it did not look up are owed like
+any other: embedded in the answer when they fit its budget, and otherwise left to the refresh it
+starts, which looks them up first.
+
+`ZEROGRAPH_VECTOR_CACHE` points one run at another directory, which must be absolute. On Unix
+every directory above it, as spelled and where its links lead, must belong to the user or to root
+and be writable by nobody else unless it has the sticky bit, as `/tmp` does. A directory its group
+can write passes only when that group is the user's own private group; on macOS every user shares
+`staff`, so a `0775` directory there is refused. The parents zerograph creates are `0700`. On Windows it must sit under `%LOCALAPPDATA%`, because Windows
+does not check who owns the directory. An
 override that breaks either rule turns the cache off for that run and says so once on stderr.
 
 ### The session hook

@@ -227,15 +227,13 @@ pub fn hunks_from_git(repo: &Path, base: &str) -> anyhow::Result<Vec<Hunk>> {
     // Before `--`, git reads a leading dash as an option: `--output=<file>` would write anywhere.
     anyhow::ensure!(!base.starts_with('-'), "changes: base `{base}` is not a revision");
     // The store is written by every refresh, so in a repository that does not ignore it, it would
-    // be reported as changed by the command that just wrote it. Both names: a store built before
-    // the rename stays under the old one until a write moves it.
-    const NEW: &str = ":(exclude).zerograph";
-    const OLD: &str = ":(exclude).repograph";
-    let mut hunks = parse(&git(repo, &["diff", "-U0", "--no-color", "--no-ext-diff", base, "--", ".", NEW, OLD])?);
+    // be reported as changed by the command that just wrote it.
+    const STORE: &str = ":(exclude).zerograph";
+    let mut hunks = parse(&git(repo, &["diff", "-U0", "--no-color", "--no-ext-diff", base, "--", ".", STORE])?);
     // NUL rather than lines: turning the quoting off reaches the bytes above ASCII and no
     // further, so a name holding a newline still arrived quoted and matched nothing. Separated
     // this way it arrives as itself, and the line it holds cannot be read as a second file.
-    for f in git(repo, &["ls-files", "-z", "--others", "--exclude-standard", "--", ".", NEW, OLD])?.split('\0').filter(|f| !f.is_empty()) {
+    for f in git(repo, &["ls-files", "-z", "--others", "--exclude-standard", "--", ".", STORE])?.split('\0').filter(|f| !f.is_empty()) {
         hunks.push(Hunk::code(f, 1, u32::MAX));
     }
     Ok(hunks)
@@ -579,10 +577,8 @@ mod tests {
     #[test]
     fn the_store_is_not_a_change_even_when_nothing_ignores_it() {
         let dir = quoting_repo();
-        for store in [".zerograph", ".repograph"] {
-            std::fs::create_dir_all(dir.path().join(store)).unwrap();
-            std::fs::write(dir.path().join(store).join("graph.bin"), "x").unwrap();
-        }
+        std::fs::create_dir_all(dir.path().join(".zerograph")).unwrap();
+        std::fs::write(dir.path().join(".zerograph/graph.bin"), "x").unwrap();
         std::fs::write(dir.path().join("docs/new.ts"), "one\n").unwrap();
         assert_eq!(
             hunks_from_git(dir.path(), "HEAD").unwrap(),

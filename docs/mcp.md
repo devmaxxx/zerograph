@@ -21,8 +21,8 @@ differing `zerograph` in the user scope or a tracked `.mcp.json` is left as its 
 local one is added beside it and wins in that project, and the run says so in one note.
 
 The same run prunes `~/.claude.json` (or `.claude.json` in `CLAUDE_CONFIG_DIR`): a `zerograph` server
-it registered for a checkout that is no longer on disk — a removed worktree — is taken out, and so is
-one registered as `repograph` before the rename. `claude mcp remove` cannot do this, since it finds
+it registered for a checkout that is no longer on disk — a removed worktree — is taken out.
+`claude mcp remove` cannot do this, since it finds
 the project by a working directory that is gone. Nothing else in the file is changed, though its keys
 are written back in sorted order.
 

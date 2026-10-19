@@ -26,19 +26,19 @@ Two directories, both locked: `~/bench/beauty-crm-502e8a6d`, the pinned fixture,
   and refuse; `reset.sh` and `arms.sh` measure no wall clock and do not.
 - `embedder.sh` — sourced, never run: the one place that names which weights every row here is read
   under, and the refusal when the environment does not say so. `reset.sh`, `readers.sh`, `embed.sh`
-  and `arms.sh` each source it and refuse with exit 2 unless `REPOGRAPH_EMBED_MODEL` is exported and
+  and `arms.sh` each source it and refuse with exit 2 unless `ZEROGRAPH_EMBED_MODEL` is exported and
   names `intfloat/multilingual-e5-small`, so every invocation of the kit reads
-  `REPOGRAPH_EMBED_MODEL=intfloat/multilingual-e5-small bench/probe/<script> …` (or exports it once
-  for the session). Declared in the environment rather than in a `repograph.toml` beside the store
+  `ZEROGRAPH_EMBED_MODEL=intfloat/multilingual-e5-small bench/probe/<script> …` (or exports it once
+  for the session). Declared in the environment rather than in a `zerograph.toml` beside the store
   for two reasons the file could not give: the variable outranks the model a store records, so a
   store restored under a changed built-in default is still read and embedded with the weights the
   reading names — the default was `e5-large` between `35357c1` and 2026-09-07 under ADR-002 — and it
-  leaves the corpus worktree with no file of ours in it, where an untracked `repograph.toml` is a
+  leaves the corpus worktree with no file of ours in it, where an untracked `zerograph.toml` is a
   changed path `changes` reads and every `changes` row would map two paths instead of the one it
   touched. Unset is refused rather than defaulted, so a row can never be read under whatever the
   built-in default happens to be that month, and a value naming another model is refused rather than
-  replaced. So is a `ZEROGRAPH_EMBED_MODEL` set to anything else, even to nothing: a renamed binary
-  reads it before the old name. The declaration travels onto each row's transcript — a line in `summary.txt` beside the
+  replaced. The declaration is exported as `REPOGRAPH_EMBED_MODEL` too, the only name a pinned
+  pre-rename binary reads, and one already set to other weights is refused. The declaration travels onto each row's transcript — a line in `summary.txt` beside the
   quiet line for `readers.sh` and `embed.sh`, the head of each arm's own output for `arms.sh` — and
   onto `readers.sh`'s `medians.txt`, which is the file copied out as the reference every later
   reading is judged against, so a reference cannot be compared against a suite read under other
@@ -48,7 +48,7 @@ Two directories, both locked: `~/bench/beauty-crm-502e8a6d`, the pinned fixture,
   store copied in, stamps settled by one `--no-dense update`. Refuses any directory that is not the
   locked worktree at `502e8a6d`. Before every arm, reader suites included.
   What it leaves has nothing untracked in it — `git status --porcelain` is empty — which is what the
-  `changes` rows need, and it removes a `repograph.toml` an earlier reset of this kit wrote.
+  `changes` rows need, and it removes a `zerograph.toml` (or pre-rename `repograph.toml`) an earlier reset of this kit wrote.
 - `measure.sh NAME LOG -- cmd…` — one command: wall, user, sys, max RSS, sampled peak CPU and threads.
 - `readers.sh BIN WORKTREE LOG [N]` — the ten reader rows, N runs each, every row `--stale`, medians
   in `LOG/medians.txt`. In the writable worktree straight after `reset.sh`; the suite writes nothing,

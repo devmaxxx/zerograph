@@ -10,10 +10,10 @@ use std::time::{Duration, Instant};
 
 fn reader(repo: &Path, budget: &str, args: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_zerograph"))
-        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO")
-        .env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL")
-        .env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS")
-        .env_remove("ZEROGRAPH_TEXT_GLOBS").env_remove("REPOGRAPH_TEXT_GLOBS")
+        .env_remove("ZEROGRAPH_BENCH_REPO")
+        .env_remove("ZEROGRAPH_EMBED_MODEL")
+        .env_remove("ZEROGRAPH_CODE_GLOBS")
+        .env_remove("ZEROGRAPH_TEXT_GLOBS")
         .env("ZEROGRAPH_READER_BUDGET", budget)
         .arg("--no-dense")
         .arg("--repo")

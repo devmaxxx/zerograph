@@ -23,7 +23,7 @@ quoted in comments. It answers questions about that structure in a few lines of 
 - **Built for agents.** Every reader takes `--json`, there is an MCP server, and a session hook keeps
   the graph fresh.
 
-[![zerograph against graphify and GitNexus](docs/assets/comparison.png)](docs/benchmarks.md)
+[![zerograph against graphify and GitNexus](docs/assets/comparison.gif)](docs/bench/2026-09-04-three-graphs-results.md)
 
 ## Get started
 
@@ -36,8 +36,7 @@ zerograph install-agent --claude           # optional: MCP server + session hook
 ```
 
 `install-agent` also takes `--codex`, `--cursor`, `--copilot`, `--gemini` and `--opencode`. On
-Windows, see the [Windows notes](docs/install.md#windows-notes). If you are coming from repograph,
-see [coming from repograph](docs/install.md#coming-from-repograph).
+Windows, see the [Windows notes](docs/install.md#windows-notes).
 
 ## Claude Code plugin
 
@@ -77,11 +76,13 @@ zerograph explain FR-PAY-22                # one node and everything attached to
 
 ## Worktrees
 
-Each checkout keeps its own graph in `.zerograph/`, so worktrees, clones and branches never share
-state or see each other's edits.
+Each checkout keeps its own graph and index in `.zerograph/` (nodes, edges, BM25 and its vectors),
+so worktrees, clones and branches never share state or see each other's edits. The only thing
+shared is a cache of embeddings.
 
-- **A new worktree builds in seconds.** Every vector this machine embeds goes into a cache shared by
-  all checkouts (`~/.cache/zerograph/vectors`), so a new worktree or clone embeds only the rows no
+- **A new worktree builds in seconds.** The cache (`~/.cache/zerograph/vectors`) holds text hash →
+  vector per model and nothing else: no paths, edges or branches. A checkout copies the hits into its own
+  `vectors.f32` and embeds only the misses, so a new worktree or clone embeds only the rows no
   checkout here has embedded before. On zerograph itself, a clone builds in 1.5 s instead of 46 s,
   with the same answers.
 - **Parallel agents are safe.** One writer lock per checkout means two agents in one worktree never
