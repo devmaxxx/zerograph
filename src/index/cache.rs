@@ -328,9 +328,9 @@ impl VectorCache {
     }
 
     /// `get` over at most `shards` of the shards the wanted rows fall in, those holding the most
-    /// of them first, and whether any were left unread. Each shard is read whole, so a reader that
-    /// owes a pull's worth of rows would otherwise read most of the cache before its budget is
-    /// weighed; the rows in the shards left unread are the refresh's to look up.
+    /// of them first, and whether a shard left unread exists, so might have held some. Each shard
+    /// is read whole, so a reader that owes a pull's worth of rows would otherwise read most of the
+    /// cache before its budget is weighed.
     pub fn get_within(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: usize) -> (HashMap<String, Vec<f32>>, bool) {
         self.get_at(model, revision, dims, wanted, Some(shards), now_minutes())
     }
@@ -345,7 +345,7 @@ impl VectorCache {
         let mut by_shard: Vec<(String, HashSet<[u8; KEY]>)> = by_shard.into_iter().collect();
         by_shard.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
         let most = shards.unwrap_or(usize::MAX);
-        let cut = by_shard.len() > most;
+        let cut = by_shard.iter().skip(most).any(|(shard, _)| dir.join(format!("{shard}.rows")).exists());
         by_shard.truncate(most);
         for (shard, mut keys) in by_shard {
             let path = dir.join(format!("{shard}.rows"));
@@ -624,8 +624,10 @@ fn make_dir(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// `records` appended to one shard under its lock, less those whose key the shard already holds
-/// as a whole record: another checkout may have embedded the same text since this one looked.
+/// `records` appended to one shard under its lock, less those whose key the shard already holds:
+/// another checkout may have embedded the same text since this one looked. Only keys are compared,
+/// to keep the work under the lock to a scan; a held record that fails its check is the prune's
+/// to drop, after which the row is embedded and stored again.
 /// A shard that does not start with this layout's header — new or garbage — is started over; a
 /// torn tail a crash left is cut back to the last whole record first, or every record after it
 /// would be read out of step. A shard whose header names another format is left alone and nothing
@@ -655,10 +657,12 @@ fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<(u
         true => {
             f.seek(std::io::SeekFrom::Start(0)).with_context(|| format!("seek {}", path.display()))?;
             let bytes = read_all(&mut f).with_context(|| format!("read {}", path.display()))?;
-            let held: HashSet<&[u8]> = layout.records(&bytes)
-                .filter(|(_, rec)| layout.row_of(rec).is_some())
-                .map(|(_, rec)| &rec[..KEY]).collect();
-            records.chunks(layout.record_len()).filter(|rec| !held.contains(&rec[..KEY])).flatten().copied().collect()
+            let mut new: HashSet<&[u8]> = records.chunks(layout.record_len()).map(|rec| &rec[..KEY]).collect();
+            for (_, rec) in layout.records(&bytes) {
+                if new.is_empty() { break; }
+                new.remove(&rec[..KEY]);
+            }
+            records.chunks(layout.record_len()).filter(|rec| new.contains(&rec[..KEY])).flatten().copied().collect()
         }
         false => records.to_vec(),
     };
@@ -862,6 +866,10 @@ mod tests {
         assert_eq!(got, first, "the shard holding the most wanted rows is read first, then the lowest named");
         assert_eq!(c.get_within("m", REV, 2, &wanted, 4), (c.get("m", REV, 2, &wanted), false));
         assert_eq!(c.get_within("m", REV, 2, &wanted, 4).0.len(), 5);
+        let (absent, unseen) = (hash(9, 9), hash(10, 10));
+        assert!(!c.get_within("m", REV, 2, &[&absent, &unseen, &rows[0]], 1).1,
+            "a shard left unread that does not exist held nothing to miss");
+        assert_eq!(c.get_within("other", REV, 2, &wanted, 1), (HashMap::new(), false), "nor does a model with no directory");
     }
 
     #[test]

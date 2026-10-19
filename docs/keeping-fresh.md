@@ -107,12 +107,15 @@ nothing can read, which count against the cap too. `0` turns the cache off: noth
 writes it from then on, and `zerograph cache prune` empties what it already holds.
 
 An `ask` reads at most 32 of the cache's shards, those holding the most of its rows first, since
-it reads each one whole before its budget is weighed. When it had to leave some unread it embeds
-nothing itself: the rows still owed are left to the refresh it starts, which looks them up first.
+it reads each one whole before its budget is weighed. The rows it did not look up are owed like
+any other: embedded in the answer when they fit its budget, and otherwise left to the refresh it
+starts, which looks them up first.
 
 `ZEROGRAPH_VECTOR_CACHE` points one run at another directory, which must be absolute. On Unix
-every directory above it, as spelled and where its links lead, must belong to the user, or to root
-and be writable by nobody else unless it has the sticky bit, as `/tmp` does. On Windows it must sit under `%LOCALAPPDATA%`, because Windows
+every directory above it, as spelled and where its links lead, must belong to the user or to root
+and be writable by nobody else unless it has the sticky bit, as `/tmp` does. A directory its group
+can write passes only when that group is the user's own private group; on macOS every user shares
+`staff`, so a `0775` directory there is refused. The parents zerograph creates are `0700`. On Windows it must sit under `%LOCALAPPDATA%`, because Windows
 does not check who owns the directory. An
 override that breaks either rule turns the cache off for that run and says so once on stderr.
 

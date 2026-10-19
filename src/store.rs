@@ -132,10 +132,11 @@ pub(crate) fn prepare_private_dir(dir: &Path) -> Result<()> {
 }
 
 /// `dir` with its parent's links resolved, or a refusal when another user could move it: an
-/// ancestor another user owns, or one of root's that others may write without the sticky bit,
-/// lets them rename the path away and put their own directory in its place after
-/// `prepare_private_dir` has checked it. This user's own ancestors are theirs whatever the mode,
-/// which a umask of 0002 leaves group-writable. Both the ancestors as spelled and those the links
+/// ancestor they can write lets them rename the path away and put their own directory in its
+/// place after `prepare_private_dir` has checked it. That is one another user owns, one anyone may
+/// write without the sticky bit, or one a group may write unless the group is this user's own
+/// private one: on macOS every user shares `staff`. The parents `prepare_private_dir` makes are
+/// 0700 whatever the umask, so only a directory made by hand is refused for its group. Both the ancestors as spelled and those the links
 /// lead to are asked about, since either is a place the path can be moved from. Ancestors that do
 /// not exist yet are made by this user. `dir` itself is left unresolved, so that
 /// `prepare_private_dir` still refuses it when it is a link.
@@ -174,15 +175,49 @@ fn shared_with_others(dir: &Path) -> Option<&'static str> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = std::fs::metadata(dir).ok()?;
     // SAFETY: geteuid has no preconditions and cannot fail.
-    others_may_move(meta.uid(), unsafe { libc::geteuid() }, meta.permissions().mode())
+    let me = unsafe { libc::geteuid() };
+    let mode = meta.permissions().mode();
+    let group_writes = mode & 0o020 != 0 && mode & 0o1000 == 0;
+    others_may_move(meta.uid(), me, mode, group_writes && user_private_group(meta.gid(), me))
 }
 
+/// Why others may move what is under a directory of `owner`'s with `mode`, if they may.
 #[cfg(unix)]
-fn others_may_move(owner: u32, me: u32, mode: u32) -> Option<&'static str> {
-    if owner == me { return None; }
-    // Another user may always rename what is in a directory they own, whatever its mode.
-    if owner != 0 { return Some("another user owns"); }
-    (mode & 0o022 != 0 && mode & 0o1000 == 0).then_some("others can write without the sticky bit")
+fn others_may_move(owner: u32, me: u32, mode: u32, group_is_mine: bool) -> Option<&'static str> {
+    // Its owner may always rename what is in it, whatever its mode.
+    if owner != me && owner != 0 { return Some("another user owns"); }
+    if mode & 0o1000 != 0 { return None; }
+    if mode & 0o002 != 0 { return Some("anyone can write without the sticky bit"); }
+    if mode & 0o020 != 0 && !group_is_mine { return Some("a group other than this user's own can write"); }
+    None
+}
+
+/// Whether `gid` is `me`'s user-private group: their primary group, named after them, with no
+/// other member. Anyone else whose primary group it is would not be listed as a member, so the
+/// name is what rules out a shared group such as `staff`.
+#[cfg(unix)]
+fn user_private_group(gid: u32, me: u32) -> bool {
+    use std::ffi::CStr;
+    let mut buf = vec![0 as libc::c_char; 1 << 16];
+    // SAFETY: the structs are plain C data that the _r calls fill in, the buffer outlives every
+    // pointer read from them, and a null result or error is checked before any is followed.
+    unsafe {
+        let mut pw: libc::passwd = std::mem::zeroed();
+        let mut found: *mut libc::passwd = std::ptr::null_mut();
+        if libc::getpwuid_r(me, &mut pw, buf.as_mut_ptr(), buf.len(), &mut found) != 0 || found.is_null() { return false; }
+        if pw.pw_gid != gid { return false; }
+        let name = CStr::from_ptr(pw.pw_name).to_bytes().to_vec();
+        let mut gr: libc::group = std::mem::zeroed();
+        let mut found: *mut libc::group = std::ptr::null_mut();
+        if libc::getgrgid_r(gid, &mut gr, buf.as_mut_ptr(), buf.len(), &mut found) != 0 || found.is_null() { return false; }
+        if CStr::from_ptr(gr.gr_name).to_bytes() != name.as_slice() { return false; }
+        let mut member = gr.gr_mem;
+        while !member.is_null() && !(*member).is_null() {
+            if CStr::from_ptr(*member).to_bytes() != name.as_slice() { return false; }
+            member = member.add(1);
+        }
+        true
+    }
 }
 
 /// The profile directory's own ACL is what keeps others out on Windows; all that is owed here is
@@ -596,19 +631,29 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn a_directory_of_this_users_is_theirs_whatever_its_mode() {
-        use std::os::unix::fs::PermissionsExt;
+    fn a_directory_of_this_users_that_others_can_write_is_refused_unless_it_is_sticky() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         let home = tempfile::tempdir().unwrap();
         let mine = home.path().join("mine");
         std::fs::create_dir(&mine).unwrap();
         let cache = mine.join("zerograph").join("vectors");
-        for mode in [0o755, 0o775, 0o777] {
-            std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(mode)).unwrap();
-            refuse_shared_ancestors(&cache).unwrap();
-        }
-        std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mode = |m| std::fs::set_permissions(&mine, std::fs::Permissions::from_mode(m)).unwrap();
+        mode(0o755);
+        refuse_shared_ancestors(&cache).unwrap();
+        mode(0o777);
+        let err = refuse_shared_ancestors(&cache).unwrap_err().to_string();
+        assert!(err.contains("anyone can write without the sticky bit"), "{err}");
+        mode(0o1777);
+        refuse_shared_ancestors(&cache).unwrap();
+        mode(0o775);
+        let gid = std::fs::metadata(&mine).unwrap().gid();
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let private = user_private_group(gid, unsafe { libc::geteuid() });
+        assert_eq!(refuse_shared_ancestors(&cache).is_ok(), private, "a group may write it unless the group is this user's alone");
+        mode(0o755);
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_parents_a_first_run_made_are_private_and_a_second_run_accepts_them() {
         use std::os::unix::fs::PermissionsExt;
@@ -616,23 +661,39 @@ mod tests {
         let cache = home.path().join("a").join("b").join("vectors");
         prepare_private_dir(&refuse_shared_ancestors(&cache).unwrap()).unwrap();
         let mode = std::fs::metadata(home.path().join("a")).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700, "a parent this run made is private to the user");
-        // As a umask of 0002 would have left them.
-        std::fs::set_permissions(home.path().join("a"), std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert_eq!(mode, 0o700, "a parent this run made is private to the user, so a umask of 0002 cannot open it to a group");
         prepare_private_dir(&refuse_shared_ancestors(&cache).unwrap()).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn an_ancestor_is_refused_when_another_user_owns_it_or_root_lets_others_write_it_unsticky() {
+    fn an_ancestor_is_refused_when_anyone_but_this_user_could_write_it() {
         let (me, them) = (501, 502);
-        assert_eq!(others_may_move(me, me, 0o777), None);
-        assert!(others_may_move(them, me, 0o755).is_some(), "its owner can rename what is in it");
-        assert!(others_may_move(0, me, 0o777).is_some());
-        assert!(others_may_move(0, me, 0o775).is_some(), "a group may too");
-        assert_eq!(others_may_move(0, me, 0o1777), None, "as /tmp is");
-        assert_eq!(others_may_move(0, me, 0o755), None);
+        assert_eq!(others_may_move(me, me, 0o755, false), None);
+        assert!(others_may_move(them, me, 0o755, false).is_some(), "its owner can rename what is in it");
+        assert!(others_may_move(me, me, 0o777, false).is_some(), "anyone can, without the sticky bit");
+        assert_eq!(others_may_move(me, me, 0o1777, false), None);
+        assert!(others_may_move(me, me, 0o775, false).is_some(), "a shared group such as staff can");
+        assert_eq!(others_may_move(me, me, 0o775, true), None, "this user's private group is this user");
+        assert!(others_may_move(0, me, 0o777, false).is_some());
+        assert!(others_may_move(0, me, 0o775, false).is_some());
+        assert_eq!(others_may_move(0, me, 0o1777, false), None, "as /tmp is");
+        assert_eq!(others_may_move(0, me, 0o755, false), None);
+        assert!(others_may_move(0, 0, 0o777, false).is_some(), "root is held to the same rules");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_shared_group_is_never_taken_for_this_users_own() {
+        // SAFETY: geteuid has no preconditions and cannot fail.
+        let me = unsafe { libc::geteuid() };
+        assert!(!user_private_group(u32::MAX - 1, me), "a group that does not exist");
+        // Every macOS user's primary group is staff, which is not named after any of them.
+        #[cfg(target_os = "macos")]
+        assert!(!user_private_group(20, me));
+    }
+
+    #[cfg(unix)]
     #[test]
     fn a_link_in_the_parent_is_resolved_and_the_path_itself_is_not() {
         let home = tempfile::tempdir().unwrap();

@@ -425,17 +425,16 @@ impl Context {
                         let budget = budget.get();
                         // Taken from the cache first, so the budget weighs only the rows that must
                         // be embedded. The lookup is bounded, since it runs before the budget is
-                        // weighed: rows past the bound are owed, and the refresh takes them. The
+                        // weighed: rows past the bound are owed like any other, embedded here
+                        // when they fit the budget and left to the refresh when not. The
                         // deadline was set when the request began, so the lookup's time is already
                         // spent from it; `started` times the embeds alone, whose rate is projected.
                         let lent = idx.take_cached(graph, &skip);
                         let owed = idx.owed(graph, &skip);
                         let started = std::time::Instant::now();
                         // Weighed at an idle machine's rate first, so a pull's worth of rows is
-                        // not started at all; past that, each chunk's own rate decides. A lookup
-                        // cut short may have left cached rows among the owed ones, and embedding
-                        // them here would also write them to the cache a second time.
-                        let synced = match !idx.lookup_cut() && budget.fits(owed, refresh::ROW_COST) {
+                        // not started at all; past that, each chunk's own rate decides.
+                        let synced = match budget.fits(owed, refresh::ROW_COST) {
                             true => idx.sync_chunked(graph, &skip, &mut |texts| emb.embed(texts), READER_CHUNK, &mut |_, p| {
                                 match budget.overrun(p.done, p.total, started.elapsed()) {
                                     true => Err(refresh::OutOfBudget(p.total - p.done).into()),
