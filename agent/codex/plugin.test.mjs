@@ -53,7 +53,9 @@ test('the hooks run the shipped hook, and the marketplace points at this directo
   assert.deepEqual(Object.keys(hooks).sort(), ['PostToolUse', 'SessionStart', 'SubagentStart']);
   for (const groups of Object.values(hooks)) {
     for (const h of groups.flatMap((g) => g.hooks)) {
-      assert.equal(h.command, 'node "${PLUGIN_ROOT}/scripts/hook.mjs"');
+      // Codex sets CLAUDE_PLUGIN_ROOT too, so the command is what tells the hook which harness runs it.
+      assert.equal(h.command, 'node "${PLUGIN_ROOT}/scripts/hook.mjs" --codex');
+      assert.match(h.commandWindows, /main\(\{harness:'codex'\}\)/);
       // `${PLUGIN_ROOT}` is a POSIX shell's expansion; the Windows form reads the variable in node.
       assert.doesNotMatch(h.commandWindows, /\$\{|%PLUGIN_ROOT%|\$env:/);
       assert.match(h.commandWindows, /process\.env\.PLUGIN_ROOT/);

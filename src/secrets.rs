@@ -108,13 +108,26 @@ impl Redactor {
 }
 
 fn redact_found(text: &str, found: &[secrets_scanner::Finding]) -> (String, usize) {
-    redact_spans(text, found.iter().map(|f| (f.secret_start_offset, f.secret_end_offset)).collect())
+    redact_spans(text, found.iter().map(|f| (f.secret_start_offset, f.secret_end_offset, is_database_url(&f.rule_id))).collect())
 }
 
-fn redact_spans(text: &str, found: Vec<(usize, usize)>) -> (String, usize) {
-    let mut spans: Vec<(usize, usize)> = found.into_iter()
-        .filter(|(s, e)| s < e && *e <= text.len())
-        .map(|(s, e)| (floor_boundary(text, s), ceil_boundary(text, e)))
+/// Rules that match a database connection URL by its scheme, whatever the password in it. Only
+/// these may be let through for a local host or a placeholder password: a provider's token in
+/// the same place is still matched by its own rule, and that span is never let through.
+fn is_database_url(id: &str) -> bool {
+    const FAMILIES: &[&str] = &[
+        "kingfisher.postgres.", "kingfisher.mysql.", "kingfisher.mariadb.", "kingfisher.mongodb.", "kingfisher.redis.",
+        "kingfisher.rabbitmq.", "kingfisher.jdbc.", "kingfisher.mssql.", "kingfisher.db2.", "kingfisher.odbc.",
+    ];
+    const RULES: &[&str] = &["mongodb-atlas-db-uri-with-credentials", "snowflake-postgres-connection-string"];
+    RULES.contains(&id) || FAMILIES.iter().any(|f| id.starts_with(f))
+}
+
+/// Spans as `(start, end, from a database URL rule)`.
+fn redact_spans(text: &str, found: Vec<(usize, usize, bool)>) -> (String, usize) {
+    let mut spans: Vec<(usize, usize, bool)> = found.into_iter()
+        .filter(|(s, e, _)| s < e && *e <= text.len())
+        .map(|(s, e, db)| (floor_boundary(text, s), ceil_boundary(text, e), db))
         .collect();
     if spans.is_empty() {
         return (text.to_string(), 0);
@@ -122,7 +135,8 @@ fn redact_spans(text: &str, found: Vec<(usize, usize)>) -> (String, usize) {
     // An id is what the graph is made of: a span holding one would take the node or the edge
     // with it, and no provider issues a token shaped like `FR-CAL-155`.
     let ids: Vec<(usize, usize)> = crate::ids::generic().find_all(text).into_iter().map(|h| (h.start, h.start + h.id.len())).collect();
-    spans.retain(|&(s, e)| !ids.iter().any(|&(a, b)| a < e && s < b) && !local_or_placeholder(text, s, e));
+    spans.retain(|&(s, e, db)| !ids.iter().any(|&(a, b)| a < e && s < b) && !(db && local_or_placeholder(text, s, e)));
+    let mut spans: Vec<(usize, usize)> = spans.into_iter().map(|(s, e, _)| (s, e)).collect();
     if spans.is_empty() {
         return (text.to_string(), 0);
     }
@@ -163,9 +177,24 @@ fn local_or_placeholder(text: &str, start: usize, end: usize) -> bool {
         Some(v6) => v6.split(']').next().unwrap_or(""),
         None => host.split(':').next().unwrap_or(""),
     };
-    let loopback = host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1" || host == "0.0.0.0";
-    let placeholder = password.starts_with(['$', '{', '<']) || password.chars().all(|c| c == '*' || c == '.');
-    loopback || placeholder
+    let loopback = host.eq_ignore_ascii_case("localhost")
+        || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback() || ip.is_unspecified());
+    loopback || placeholder(password)
+}
+
+/// A password that names where the real one comes from, or masks it, rather than being one. The
+/// whole password has to be the shape: `$Xk29…` is a password that happens to start with `$`.
+fn placeholder(password: &str) -> bool {
+    static SHAPES: OnceLock<regex::Regex> = OnceLock::new();
+    let shapes = SHAPES.get_or_init(|| regex::Regex::new(concat!(
+        r"^(?:\$\{[^{}\s]+\}",       // ${VAR}, ${VAR:-default}
+        r"|\$[A-Z_][A-Z0-9_]*",       // $VAR, upper case as environment variables are named
+        r"|%[A-Za-z_][A-Za-z0-9_]*%",  // %VAR%
+        r"|\{\{[^{}]+\}\}",           // {{ template }}
+        r"|<[^<>]+>",                 // <password>
+        r"|\*{3,}|[xX]{3,}|\.{3,})$",  // ***, xxx, ...
+    )).expect("the placeholder shapes compile"));
+    shapes.is_match(password)
 }
 
 fn floor_boundary(text: &str, mut i: usize) -> usize {
@@ -255,8 +284,8 @@ mod tests {
     #[test]
     fn a_span_holding_an_id_is_never_redacted() {
         let text = format!("token {} FR-CAL-155\n", github_token());
-        assert_eq!(super::redact_spans(&text, vec![(6, text.len() - 1)]), (text.clone(), 0));
-        assert_eq!(super::redact_spans(&text, vec![(6, 6 + github_token().len())]).1, 1, "the same token without the id beside it goes");
+        assert_eq!(super::redact_spans(&text, vec![(6, text.len() - 1, false)]), (text.clone(), 0));
+        assert_eq!(super::redact_spans(&text, vec![(6, 6 + github_token().len(), false)]).1, 1, "the same token without the id beside it goes");
     }
 
     #[test]
@@ -273,6 +302,42 @@ mod tests {
             "db:migrate: chain applied on postgres://app_migrator:***@db.prod.example.net:55440/beauty_crm\n",
         ] {
             assert_eq!(redact("ci.yml", local), (local.to_string(), 0), "{local}");
+        }
+    }
+
+    #[test]
+    fn a_provider_token_in_a_local_or_masked_url_is_still_redacted() {
+        for text in [
+            format!("git clone https://x-access-token:{}@localhost:3000/org/repo.git\n", github_token()),
+            format!("BILLING_URL=https://api:{}@127.0.0.1:8080/v1/charges\n", aws_key()),
+            format!("DATABASE_URL=postgres://app:{}@localhost:5432/crm\n", github_token()),
+        ] {
+            let (out, n) = redact("ops.sh", &text);
+            assert!(n >= 1 && !out.contains(&github_token()) && !out.contains(&aws_key()), "{out}");
+        }
+    }
+
+    #[test]
+    fn only_a_real_loopback_host_or_a_whole_placeholder_lets_a_database_url_through() {
+        let scheme = format!("{}://", "postgres");
+        for (url, kept) in [
+            (format!("{scheme}app:Xk29vLq7Rm4t@127.0.0.1:5432/crm"), true),
+            (format!("{scheme}app:Xk29vLq7Rm4t@127.8.9.10:5432/crm"), true),
+            (format!("{scheme}app:Xk29vLq7Rm4t@[::1]:5432/crm"), true),
+            (format!("{scheme}app:Xk29vLq7Rm4t@LOCALHOST:5432/crm"), true),
+            (format!("{scheme}app:Xk29vLq7Rm4t@127.attacker.example.net:5432/crm"), false),
+            (format!("{scheme}app:Xk29vLq7Rm4t@localhost.example.net:5432/crm"), false),
+            (format!("{scheme}app:$DB_PASSWORD@db.prod.example.net:5432/crm"), true),
+            (format!("{scheme}app:%DB_PASSWORD%@db.prod.example.net:5432/crm"), true),
+            (format!("{scheme}app:<password>@db.prod.example.net:5432/crm"), true),
+            (format!("{scheme}app:xxxx@db.prod.example.net:5432/crm"), true),
+            (format!("{scheme}app:$Xk29vLq7Rm4t@db.prod.example.net:5432/crm"), false),
+            (format!("{scheme}app:{{Xk29vLq7Rm4t@db.prod.example.net:5432/crm"), false),
+            (format!("{scheme}app:***Xk29vLq7Rm4t@db.prod.example.net:5432/crm"), false),
+        ] {
+            let text = format!("DATABASE_URL={url}\n");
+            let (out, n) = redact("deploy.sh", &text);
+            assert_eq!(n == 0, kept, "{url} -> {out}");
         }
     }
 

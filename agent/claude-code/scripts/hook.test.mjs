@@ -67,8 +67,8 @@ function harnessless(env) {
   return rest;
 }
 
-function fire(w, payload, env = {}, hook = HOOK) {
-  const r = spawnSync(process.execPath, [hook], {
+function fire(w, payload, env = {}, hook = HOOK, args = []) {
+  const r = spawnSync(process.execPath, [hook, ...args], {
     input: JSON.stringify({ cwd: w.root, session_id: 'sess', ...payload }),
     encoding: 'utf8',
     env: {
@@ -545,11 +545,11 @@ test('every call the hook waits on refreshes in process for less than its timeou
 });
 
 /** A checkout carrying what a 0.6.x `install-agent` committed: the script and its entries for `events`. */
-function legacyClaude(w, events) {
+function legacyClaude(w, events, matchers = {}) {
   mkdirSync(join(w.root, '.claude', 'hooks'), { recursive: true });
   writeFileSync(join(w.root, '.claude', 'hooks', 'zerograph-hook.mjs'), '// 0.6.x\n');
   const entry = { hooks: [{ type: 'command', command: 'node "$CLAUDE_PROJECT_DIR/.claude/hooks/zerograph-hook.mjs"', timeout: 10 }] };
-  const hooks = Object.fromEntries(events.map((e) => [e, [{ matcher: '.*', ...entry }]]));
+  const hooks = Object.fromEntries(events.map((e) => [e, [{ matcher: matchers[e] ?? '.*', ...entry }]]));
   writeFileSync(join(w.root, '.claude', 'settings.json'), JSON.stringify({ hooks }));
 }
 
@@ -572,20 +572,54 @@ test('entries whose script is gone leave the plugin answering', () => {
   assert.ok(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env))?.startsWith('zerograph:'));
 });
 
+test('a legacy entry silences the plugin only where its matcher matches', () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  legacyClaude(w, ['SessionStart', 'PreToolUse'], { SessionStart: 'startup', PreToolUse: 'Grep|Glob|Agent' });
+  const env = { CLAUDE_PROJECT_DIR: w.root, ZEROGRAPH_HOOK_SERVE: '0' };
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null);
+  assert.ok(context(fire(w, { hook_event_name: 'SessionStart', source: 'resume', session_id: 's2' }, env))?.startsWith('zerograph:'),
+    'a resume the old entry does not match is the plugin\'s');
+  assert.equal(fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation' } }, env), null);
+  const w2 = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  legacyClaude(w2, ['PreToolUse'], { PreToolUse: 'Grep|Glob|Agent' });
+  fire(w2, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg -n cancellation' } }, { CLAUDE_PROJECT_DIR: w2.root, ZEROGRAPH_HOOK_SERVE: '0' });
+  assert.ok(argv(w2).some((a) => a.includes('ask')), 'Bash is not in Grep|Glob|Agent, so the plugin asks');
+});
+
+/** A machine `hooks.json` as 0.6.x printed it for Codex, running `script` as spelled. */
+function legacyCodex(home, spelled, matcher = 'startup|resume|clear|compact') {
+  writeFileSync(join(home, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ matcher, hooks: [{ type: 'command', command: `node '${spelled}'` }] }] } }));
+}
+
 test('under Codex the machine hooks file decides, and a repository\'s .claude settings do not', () => {
   const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
   legacyClaude(w, ['SessionStart']);
   const home = mkdtempSync(join(tmpdir(), 'zerograph-codex-home-'));
-  const env = { PLUGIN_ROOT: join(home, 'plugin'), CODEX_HOME: home, ZEROGRAPH_HOOK_SERVE: '0' };
-  assert.ok(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env))?.startsWith('zerograph:'),
+  // What Codex really sets: both roots, so only the plugin's `--codex` argument names the harness.
+  const env = { PLUGIN_ROOT: join(home, 'plugin'), CLAUDE_PLUGIN_ROOT: join(home, 'plugin'), CODEX_HOME: home, ZEROGRAPH_HOOK_SERVE: '0' };
+  const codex = (payload) => fire(w, payload, env, HOOK, ['--codex']);
+  assert.ok(context(codex({ hook_event_name: 'SessionStart', source: 'startup' }))?.startsWith('zerograph:'),
     'Codex never runs .claude/settings.json');
 
   const script = join(w.root, '.codex', 'hooks', 'zerograph-hook.mjs');
   mkdirSync(dirname(script), { recursive: true });
   writeFileSync(script, '// 0.6.x\n');
-  writeFileSync(join(home, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: `node '${script}'` }] }] } }));
-  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null);
-  assert.equal(context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }, env)), RULE);
+  legacyCodex(home, script);
+  assert.equal(codex({ hook_event_name: 'SessionStart', source: 'startup', session_id: 's2' }), null);
+  assert.equal(context(codex({ hook_event_name: 'SubagentStart', agent_id: 'a1' })), RULE);
+});
+
+test('under Codex a legacy entry spelled from the home directory is found', { skip: WIN && 'HOME is not the home directory there' }, () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-home-')));
+  const codexHome = join(home, '.codex');
+  mkdirSync(join(codexHome, 'hooks'), { recursive: true });
+  writeFileSync(join(codexHome, 'hooks', 'zerograph-hook.mjs'), '// 0.6.x\n');
+  const env = { HOME: home, PLUGIN_ROOT: join(home, 'plugin'), CLAUDE_PLUGIN_ROOT: join(home, 'plugin'), ZEROGRAPH_HOOK_SERVE: '0' };
+  ['~/.codex/hooks/zerograph-hook.mjs', '$HOME/.codex/hooks/zerograph-hook.mjs', '${HOME}/.codex/hooks/zerograph-hook.mjs'].forEach((spelled, i) => {
+    legacyCodex(codexHome, spelled);
+    assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup', session_id: `s${i}` }, env, HOOK, ['--codex']), null, spelled);
+  });
 });
 
 test('SubagentStart carries the rule', () => {

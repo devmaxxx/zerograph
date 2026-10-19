@@ -53,8 +53,11 @@ an `https://` URL are **not** caught: on a real repository they flagged dozens o
 a secret, among them a type parameter, a permission name and a comment whose requirement id lost
 its citation with it. Nothing that reads as an id (`FR-CAL-155`, `ADR-024`) is redacted, whatever
 rule matched it. A database URL whose host is `localhost` or a loopback address, or whose password
-is an interpolation (`${DB_PASSWORD:-dev}`) or a mask (`***`), is left as written: it opens
-nothing outside the reader's own machine, and CI files and compose files write them by the dozen.
+is wholly an interpolation (`${DB_PASSWORD:-dev}`, `$DB_PASSWORD`, `%DB_PASSWORD%`), a
+placeholder (`<password>`) or a mask (`***`, `xxx`), is left as written: it opens nothing outside
+the reader's own machine, and CI files and compose files write them by the dozen. That holds for
+the database URL rules only: a provider token used as the password, or in any other URL on
+`localhost`, is still redacted by the provider's own rule.
 
 An inline `gitleaks:allow` does not exempt one; the rules' own path allowlist does — images, fonts,
 lockfiles, `vendor/` and `node_modules/` trees are not scanned. A run compiles only the rules whose keywords the
