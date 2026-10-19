@@ -39,7 +39,8 @@ shell script, a private key pasted into a README — is replaced with `[REDACTED
 file is extracted, by the bundled rules of
 [secrets_scanner](https://crates.io/crates/secrets_scanner) (gitleaks-compatible). The rest of the
 file is still read and keeps its line numbers; `update` logs how many were redacted in which file.
-An inline `gitleaks:allow` does not exempt one. A run compiles only the rules whose keywords the
+An inline `gitleaks:allow` does not exempt one; the rules' own path allowlist does — images, fonts,
+lockfiles, `vendor/` and `node_modules/` trees are not scanned. A run compiles only the rules whose keywords the
 files it re-reads contain — a few dozen for a one-file update, tens of milliseconds, where all ~1,000
 would cost 1.8 s.
 

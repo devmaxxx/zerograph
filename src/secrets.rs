@@ -95,6 +95,7 @@ fn redact_found(text: &str, found: &[secrets_scanner::Finding]) -> (String, usiz
     }
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0;
+    let count = merged.len();
     for (start, end) in merged {
         out.push_str(&text[cursor..start]);
         out.push_str(MARKER);
@@ -102,7 +103,7 @@ fn redact_found(text: &str, found: &[secrets_scanner::Finding]) -> (String, usiz
         cursor = end;
     }
     out.push_str(&text[cursor..]);
-    (out, found.len())
+    (out, count)
 }
 
 fn floor_boundary(text: &str, mut i: usize) -> usize {

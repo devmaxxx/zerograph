@@ -277,6 +277,9 @@ pub(crate) struct UpdateReport {
     pub graph_at: Option<walk::Stamp>,
 }
 
+/// How much file text is held before it is scanned for secrets and extracted.
+const REDACT_BATCH_BYTES: usize = 64 << 20;
+
 /// Re-extracts what the diff names, drops what is gone, and writes the store back. Nothing else
 /// is read: every citation a file holds was extracted when the file was read, whatever prefix it
 /// names, and which of them a reader may follow is decided on the graph by `settle` — so a family
@@ -346,7 +349,27 @@ pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &m
     work.sort_by(|a, b| a.rel.cmp(&b.rel));
     let reread = co_declared.iter().map(|rel| by_rel[rel]);
     let mut unread = false;
-    let mut read = Vec::new();
+    // The scanner compiles only the rules whose keywords a batch of texts holds, so a one-file
+    // update pays for a few dozen regexes, not ~1,000. Texts are held a batch at a time: every
+    // text of the tree at once would be the largest allocation of a build. An empty batch builds
+    // no scanner, which keeps the no-op update a commit hook fires free of the rules.
+    let mut batch: Vec<(&walk::Entry, String)> = Vec::new();
+    let mut batch_bytes = 0;
+    let mut extract_batch = |batch: &mut Vec<(&walk::Entry, String)>| {
+        if batch.is_empty() { return; }
+        let redactor = secrets::Redactor::for_texts(batch.iter().map(|(_, text)| text.as_str()));
+        for (e, text) in batch.drain(..) {
+            let (text, redacted) = redactor.redact(&e.rel, &text);
+            if redacted > 0 { eprintln!("{}", log_line(&format!("{}: {redacted} secret(s) redacted", e.rel))); }
+            let extractor = match e.kind {
+                walk::FileKind::Doc => &ex.doc,
+                walk::FileKind::Code => &ex.code,
+                walk::FileKind::Registry => &ex.registry,
+                walk::FileKind::Text => &ex.text,
+            };
+            graph.apply(extractor.extract(&e.rel, &text));
+        }
+    };
     for e in work.into_iter().chain(reread) {
         let text = match std::fs::read(repo.join(&e.rel)) {
             // NUL is legal inside a TypeScript string literal; only invalid UTF-8 marks a binary.
@@ -358,22 +381,14 @@ pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &m
             // that would not open is one this pass has no reading of at all.
             Err(err) => { eprintln!("{}", log_line(&format!("read {}: {err}", e.rel))); unread = true; continue; }
         };
-        read.push((e, text));
+        batch_bytes += text.len();
+        batch.push((e, text));
+        if batch_bytes >= REDACT_BATCH_BYTES {
+            extract_batch(&mut batch);
+            batch_bytes = 0;
+        }
     }
-    // Every text is read before any is redacted: the scanner compiles only the rules whose
-    // keywords these texts hold, so a one-file update pays for a few dozen regexes, not ~1,000.
-    let redactor = secrets::Redactor::for_texts(read.iter().map(|(_, text)| text.as_str()));
-    for (e, text) in read {
-        let (text, redacted) = redactor.redact(&e.rel, &text);
-        if redacted > 0 { eprintln!("{}", log_line(&format!("{}: {redacted} secret(s) redacted", e.rel))); }
-        let extractor = match e.kind {
-            walk::FileKind::Doc => &ex.doc,
-            walk::FileKind::Code => &ex.code,
-            walk::FileKind::Registry => &ex.registry,
-            walk::FileKind::Text => &ex.text,
-        };
-        graph.apply(extractor.extract(&e.rel, &text));
-    }
+    extract_batch(&mut batch);
     // Whether anything was re-extracted or dropped. Nothing else can move a family, so on a
     // no-op update — the one a commit hook fires — the settle below would read every node and
     // rebuild the whole edge set to arrive at what is already there.

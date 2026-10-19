@@ -37,7 +37,9 @@ pub struct Entry { pub rel: String, pub kind: FileKind, pub hash: String, pub st
 /// 6: every language read by one query engine. Some nodes' spans and bodies differ from what 5's
 /// per-language readers wrote, such as a decorated field's line or the comment kept above a
 /// declaration, so a store stamped 5 is re-read once.
-pub const GRAMMAR: u32 = 6;
+/// 7: a credential written inside a file is replaced before the file is read, so a store stamped 6
+/// still holds the ones its unmoved files carry until it is re-read once.
+pub const GRAMMAR: u32 = 7;
 
 /// Refused as text whatever `text_globs` says: machine output nobody asks a question of, any one of
 /// which would outweigh the hand-written files in the lexical index. Text entries only — `skip`
