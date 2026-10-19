@@ -29,7 +29,7 @@ export function main() {
   // Claude Code passes the option as the one argument, unsubstituted while it is unset; Codex has
   // no options and passes ZEROGRAPH_BIN through.
   const option = process.argv[2] === UNSET_OPTION ? '' : process.argv[2];
-  const found = binaryOf(env.ZEROGRAPH_BIN || option || '', { path: env[pathKey(env)], checkout, win });
+  const found = binaryOf(env.ZEROGRAPH_BIN || option || '', { path: env[pathKey(env, win)], checkout, win });
   const launch = found.error ? found : argvOf(found.bin, checkout, env.ComSpec);
   if (launch.error) {
     // stderr is the server log the harness shows; stdout belongs to the protocol.

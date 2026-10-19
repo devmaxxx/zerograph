@@ -5,6 +5,7 @@
 // `agent/codex/scripts/launcher.mjs` is a copy of this file — a plugin is installed as one
 // directory and cannot import from a sibling — and a test fails when the two differ.
 import { existsSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 
 const UNSET = '${user_config.binary}';
@@ -29,9 +30,23 @@ export function real(p) {
   try { return realpathSync.native(p); } catch { return p; }
 }
 
-/** The nearest directory at or above `start` holding `name`, or null. */
+/**
+ * `p` with the links in its existing part followed: an entry that does not exist yet still names
+ * the checkout when it is spelled through a link to it, such as macOS's `/var` for `/private/var`.
+ */
+function realAbove(p) {
+  const parent = dirname(p);
+  if (existsSync(p) || parent === p) return real(p);
+  return join(realAbove(parent), p.slice(parent.length).replace(/^[\\/]+/, ''));
+}
+
+/**
+ * The nearest directory at or above `start` holding `name`, or null. Walked from the real path, as
+ * the CLI canonicalizes its working directory, so a session opened through a link finds the
+ * checkout the CLI would.
+ */
 export function nearest(start, name) {
-  for (let d = start; ; d = dirname(d)) {
+  for (let d = real(start); ; d = dirname(d)) {
     if (existsSync(join(d, name))) return d;
     if (dirname(d) === d) return null;
   }
@@ -47,9 +62,9 @@ export function checkoutOf(root) {
   return nearest(root, '.git') ?? nearest(root, '.zerograph') ?? root;
 }
 
-/** The PATH variable under whatever case the environment spells it in. */
-export function pathKey(env) {
-  return Object.keys(env).find(k => k.toUpperCase() === 'PATH') ?? 'PATH';
+/** The PATH variable's name: any case on Windows, where the environment ignores it, else `PATH`. */
+export function pathKey(env, win) {
+  return (win && Object.keys(env).find(k => k.toUpperCase() === 'PATH')) || 'PATH';
 }
 
 /**
@@ -58,10 +73,25 @@ export function pathKey(env) {
  * checkout's file through. A relative entry (`.`, `node_modules/.bin`) resolves against the
  * repository the caller runs in, so it is the repository's and not the machine's.
  */
-export function machineDirs(path, checkout, win) {
-  const resolved = checkout && real(checkout);
-  return (path ?? '').split(win ? ';' : ':')
-    .filter(dir => dir && isAbsolute(dir) && !inside(checkout, dir, win) && !inside(resolved, real(dir), win));
+export function machineDirs(path, checkout, win, home = homedir()) {
+  const cut = guarded(checkout, win, home);
+  const resolved = cut && real(checkout);
+  return (path ?? '').split(win ? ';' : ':').filter(entry => {
+    // Windows reads a quoted entry as the directory inside the quotes.
+    const dir = win ? entry.replace(/^"(.*)"$/, '$1') : entry;
+    return dir && isAbsolute(dir) && !(cut && (inside(checkout, dir, win) || inside(resolved, realAbove(dir), win)));
+  });
+}
+
+/**
+ * Whether PATH entries inside `checkout` are cut. Not when it is a filesystem root or holds the home
+ * directory: a `~/.zerograph` or a dotfiles `~/.git` makes the home directory the checkout, and the
+ * cut would then take nvm, cargo and `~/.local/bin` with it, the very places zerograph and `node`
+ * are installed.
+ */
+function guarded(checkout, win, home) {
+  if (!checkout || dirname(checkout) === checkout) return false;
+  return !(home && (inside(checkout, home, win) || inside(real(checkout), real(home), win)));
 }
 
 /**
@@ -70,12 +100,12 @@ export function machineDirs(path, checkout, win) {
  * otherwise have it run the moment a session opened in it. A relative path is refused rather than
  * read against a working directory nobody chose; a bare name means the PATH lookup.
  */
-export function binaryOf(configured, { path, checkout, win }) {
+export function binaryOf(configured, { path, checkout, win, home }) {
   const option = configured === UNSET ? '' : (configured ?? '').trim();
   if (option && /[\\/]/.test(option)) {
     return isAbsolute(option) ? { bin: option } : { error: `the configured binary (${option}) is not an absolute path; name an absolute one in the plugin's binary option or ZEROGRAPH_BIN, or clear it to use PATH` };
   }
-  const dirs = machineDirs(path, checkout, win);
+  const dirs = machineDirs(path, checkout, win, home);
   // Every `.exe` before any `.cmd`: npm's global shim is a `.cmd`, which only `cmd` can start.
   const names = win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph'];
   for (const name of names) {
@@ -115,7 +145,7 @@ export function commandOf(bin, args, comspec) {
  * launcher finds `node` through PATH — `#!/usr/bin/env node`, or the `.cmd` shim's bare `node` — so
  * an entry an `.envrc` put inside the checkout would start the checkout's `node` one step on.
  */
-export function childEnv(env, checkout, win, extra = {}) {
-  const key = pathKey(env);
-  return { ...env, [key]: machineDirs(env[key], checkout, win).join(win ? ';' : ':'), ...extra };
+export function childEnv(env, checkout, win, extra = {}, home = undefined) {
+  const key = pathKey(env, win);
+  return { ...env, [key]: machineDirs(env[key], checkout, win, home).join(win ? ';' : ':'), ...extra };
 }

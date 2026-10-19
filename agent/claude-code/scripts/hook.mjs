@@ -24,7 +24,7 @@ import { fileURLToPath } from 'node:url';
 import { tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 
-import { binaryOf, childEnv as cutEnv, commandOf, pathKey } from './launcher.mjs';
+import { binaryOf, checkoutOf as repositoryOf, childEnv as cutEnv, commandOf, pathKey } from './launcher.mjs';
 
 const MAX_INJECTIONS = 12;   // 12 × ~107 tokens: a third of the CLAUDE.md sections this replaces
 const SEEDS = 3;
@@ -78,7 +78,7 @@ const WIN = process.platform === 'win32';
 
 /** The checkout `root` is in, or `root` outside git: what a PATH entry must stay out of. */
 function checkoutOf(root) {
-  return root && (checkoutRoot(root) ?? root);
+  return root && repositoryOf(root);
 }
 
 /**
@@ -87,7 +87,7 @@ function checkoutOf(root) {
  * outranks every `.cmd`.
  */
 function onPath(root, platform = process.platform) {
-  return binaryOf('', { path: process.env[pathKey(process.env)], checkout: checkoutOf(root), win: platform === 'win32' }).bin ?? null;
+  return binaryOf('', { path: process.env[pathKey(process.env, platform === 'win32')], checkout: checkoutOf(root), win: platform === 'win32' }).bin ?? null;
 }
 
 /**
@@ -97,7 +97,7 @@ function onPath(root, platform = process.platform) {
  */
 function binary(root) {
   const named = env('BIN') || process.env.CLAUDE_PLUGIN_OPTION_BINARY || '';
-  const found = binaryOf(named, { path: process.env[pathKey(process.env)], checkout: checkoutOf(root), win: WIN });
+  const found = binaryOf(named, { path: process.env[pathKey(process.env, WIN)], checkout: checkoutOf(root), win: WIN });
   if (found.error) debug(found.error);
   return found.bin ?? null;
 }
