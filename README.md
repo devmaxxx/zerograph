@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="docs/assets/logo.svg" alt="" width="96" height="96">
+
 # zerograph
 
 **A project knowledge graph that costs zero API tokens to build, keep fresh, and query.**
