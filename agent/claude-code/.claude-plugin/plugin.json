@@ -1,6 +1,6 @@
 {
   "name": "zerograph",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "zerograph in Claude Code: its MCP server, slash commands that call it (ask, impact, trace, changes, explain, status, refresh), a skill that reaches for the graph before grep, and the index's state at the end of the prompt's hint line",
   "author": {
     "name": "devmaxxx"
