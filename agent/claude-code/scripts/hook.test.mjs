@@ -286,7 +286,7 @@ test('a cloned repository that ships an executable node_modules/.bin/zerograph n
   copyFileSync(w.launcher, join(shim, 'zerograph'));
   chmodSync(join(shim, 'zerograph'), 0o755);
   const env = { PATH: join(w.root, 'nothing-here') };
-  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null, 'no binary of its own: no build claimed');
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env).systemMessage, MISSING_MESSAGE, 'no binary of its own: no build claimed');
   fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } }, env);
   await new Promise((r) => setTimeout(r, 300));
   assert.deepEqual(argv(w), [], 'the shipped shim ran');
@@ -506,11 +506,42 @@ test('the plugin\'s binary option names the binary when ZEROGRAPH_BIN does not',
   assert.equal(c, 'zerograph: 3 doc nodes');
 });
 
-test('an opted-in checkout with no binary to start claims no build', { skip: WIN }, async () => {
+const MISSING_MESSAGE = '▲ zerograph is not installed — this repository uses it\n  npm i -g zerograph · pnpm add -g zerograph';
+
+test('an opted-in checkout with no binary says so to the person, claims no build, and tells the model the tools are out', () => {
+  for (const store of [false, true]) {
+    const w = world({ store });
+    mkdirSync(join(w.root, '.git'));
+    writeFileSync(join(w.root, 'zerograph.toml'), '');
+    const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' });
+    assert.equal(out.systemMessage, MISSING_MESSAGE, `store ${store}`);
+    const c = context(out);
+    assert.equal(c.split('\n').length, 1, c);
+    assert.match(c, /not installed/);
+    assert.doesNotMatch(c, /being built/, 'nothing was started');
+  }
+});
+
+test('a checkout opted in by nothing but its own index hears that the binary is missing', () => {
+  const w = world();
+  mkdirSync(join(w.root, '.git'));
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' });
+  assert.equal(out?.systemMessage, MISSING_MESSAGE);
+});
+
+test('the missing binary is only the context line under Codex', () => {
   const w = world({ store: false });
   mkdirSync(join(w.root, '.git'));
   writeFileSync(join(w.root, 'zerograph.toml'), '');
-  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here') }), null);
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' }, HOOK, ['--codex']);
+  assert.equal(out.systemMessage, undefined);
+  assert.match(context(out), /not installed/);
+});
+
+test('a repository that never asked for zerograph hears nothing about a missing binary', () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' }), null);
 });
 
 test('while the first session builds, a search is told the build is under way, not to start one', () => {
@@ -590,6 +621,50 @@ test('a legacy entry silences the plugin only where its matcher matches', () => 
   legacyClaude(w2, ['PreToolUse'], { PreToolUse: 'Grep|Glob|Agent' });
   fire(w2, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg -n cancellation' } }, { CLAUDE_PROJECT_DIR: w2.root, ZEROGRAPH_HOOK_SERVE: '0' });
   assert.ok(argv(w2).some((a) => a.includes('ask')), 'Bash is not in Grep|Glob|Agent, so the plugin asks');
+});
+
+test('only the project Claude Code runs can stand the plugin down: not a main worktree, not a clone the session cd\'d into', () => {
+  const grep = { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } };
+  // The old entries run `$CLAUDE_PROJECT_DIR/.claude/hooks/zerograph-hook.mjs`, so a worktree whose
+  // branch retired the script runs nothing of its main's.
+  const w = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  const main = mkdtempSync(join(tmpdir(), 'zerograph-main-'));
+  const linked = join(main, '.git', 'worktrees', 'wt');
+  mkdirSync(linked, { recursive: true });
+  writeFileSync(join(linked, 'commondir'), '../..\n');
+  writeFileSync(join(w.root, '.git'), `gitdir: ${linked}\n`);
+  legacyClaude({ root: main }, ['PreToolUse']);
+  fire(w, grep, { CLAUDE_PROJECT_DIR: w.root });
+  assert.ok(argv(w).some((a) => a.includes('ask')), 'the plugin answers the worktree');
+
+  const a = world({ store: false });
+  mkdirSync(join(a.root, '.git'));
+  const b = join(a.root, 'vendor', 'b');
+  mkdirSync(join(b, '.git'), { recursive: true });
+  legacyClaude({ root: b }, ['PreToolUse']);
+  assert.notEqual(fire(a, { ...grep, cwd: b }, { CLAUDE_PROJECT_DIR: a.root }), null, 'B\'s settings are not the session\'s');
+
+  const own = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+  mkdirSync(join(own.root, '.git'));
+  mkdirSync(join(own.root, 'apps', 'web'), { recursive: true });
+  legacyClaude(own, ['PreToolUse']);
+  assert.equal(fire(own, { ...grep, cwd: join(own.root, 'apps', 'web') }, { CLAUDE_PROJECT_DIR: own.root }), null, 'a cd below the project changes nothing');
+});
+
+test('standing down at SessionStart keeps the notices the 0.6.x hook never shows, and nothing else', () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  legacyClaude(w, ['SessionStart']);
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { ...updateHome(w, CACHED), CLAUDE_PROJECT_DIR: w.root });
+  assert.match(out.systemMessage, /^▲ zerograph 0\.7\.1 available/);
+  assert.match(context(out), /^zerograph: 0\.7\.1 is out/, 'no brief: the old hook gave it');
+  assert.deepEqual(argv(w).map((l) => l.split(' ').pop()), ['--version'], 'no serve, no update, no prime');
+
+  const bare = world({ store: false });
+  mkdirSync(join(bare.root, '.git'));
+  legacyClaude(bare, ['SessionStart']);
+  const missing = fire(bare, { hook_event_name: 'SessionStart', source: 'startup' },
+    { CLAUDE_PROJECT_DIR: bare.root, PATH: join(bare.root, 'nothing-here'), ZEROGRAPH_BIN: '' });
+  assert.equal(missing.systemMessage, MISSING_MESSAGE);
 });
 
 /** A machine `hooks.json` as 0.6.x printed it for Codex, running `script` as spelled. */

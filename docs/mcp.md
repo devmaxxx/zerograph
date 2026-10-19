@@ -15,6 +15,14 @@ project directory (`CLAUDE_PROJECT_DIR` under Claude Code, the working directory
 in) and runs `zerograph --repo <checkout> mcp`, so a session opened in a package of a monorepo
 serves the whole repository.
 
+A session keeps the server it started with, and a plugin cannot restart it, so after `npm i -g
+zerograph` or `pnpm add -g zerograph` the old binary goes on serving, and writing a store the new
+one owns. `mcp.mjs` asks the binary its version at start and, on each tool result, looks at the
+file it resolved to; when that file has moved and now reports another release, every tool result
+from then on begins with one line, `zerograph was updated to X (this session runs Y) — restart the
+session or run /reload-plugins`. Nothing is stopped or restarted. The hook cannot see which release
+a session's server runs, so the line comes only from the server.
+
 Releases before 0.7.0 registered the server through `claude mcp add` at local scope, once per
 worktree. A re-run of `install-agent --claude` removes those registrations from `~/.claude.json`
 (or `.claude.json` in `CLAUDE_CONFIG_DIR`) for the checkout and its worktrees, and for a checkout

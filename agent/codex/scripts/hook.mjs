@@ -200,8 +200,8 @@ function checkoutRoot(start) {
 }
 
 /**
- * Whether a checkout asked for an index: it carries a `zerograph.toml`, its main worktree has a
- * built index, or either holds the hook an older `install-agent` wrote. The plugin runs this hook
+ * Whether a checkout asked for an index: it carries a `zerograph.toml`, it or its main worktree has
+ * a built index, or either holds the hook an older `install-agent` wrote. The plugin runs this hook
  * in every repository a session opens, and a build started in each of them would be the cost a git
  * hook used to pay on every worktree add.
  */
@@ -209,7 +209,7 @@ function optedIn(checkout) {
   const asked = (dir) => ['zerograph.toml', '.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs']
     .some((p) => existsSync(join(dir, ...p.split('/'))));
   const main = mainCheckout(checkout);
-  return asked(checkout) || (main !== null && (asked(main) || built(main)));
+  return asked(checkout) || built(checkout) || (main !== null && (asked(main) || built(main)));
 }
 
 /** The main worktree of a linked one, read off its `.git` file and the `commondir` beside it, or null. */
@@ -479,12 +479,33 @@ function updateNotice(root) {
   const entry = isExact(current) && Object.hasOwn(versions, current) ? versions[current] : null;
   const latest = entry?.checked ? entry.latest : null;
   if (!isExact(latest) || !newer(latest, current)) return null;
-  const npm = `npm i -g zerograph@${latest}`;
-  const pnpm = `pnpm add -g zerograph@${latest}`;
+  const [npm, pnpm] = installCommands(`zerograph@${latest}`);
   return {
     brief: `zerograph: ${latest} is out and this is ${current}; \`${npm}\` or \`${pnpm}\`.`,
     message: `▲ zerograph ${latest} available (you have ${current})\n  ${npm} · ${pnpm}`,
   };
+}
+
+function installCommands(spec) {
+  return [`npm i -g ${spec}`, `pnpm add -g ${spec}`];
+}
+
+/**
+ * For a checkout that asked for an index and has no binary to run, built or not: a teammate who got
+ * the plugin from the repository's settings would otherwise get a silent hook and never learn why.
+ */
+function missingNotice(cwd) {
+  const checkout = cwd && checkoutRoot(cwd);
+  if (!checkout || !optedIn(checkout) || binaryFound(checkout)) return null;
+  const [npm, pnpm] = installCommands('zerograph');
+  return {
+    brief: `zerograph: this repository uses zerograph and it is not installed here, so \`${COMMAND}\` and the graph tools are unavailable until \`${npm}\` or \`${pnpm}\` installs it.`,
+    message: `▲ zerograph is not installed — this repository uses it\n  ${npm} · ${pnpm}`,
+  };
+}
+
+function sessionNotice(p, root) {
+  return missingNotice(p.cwd || root) ?? updateNotice(root);
 }
 
 /** Whether `a` is a later release than `b`: by the three numbers, then a release over its pre-release. */
@@ -563,9 +584,9 @@ const handlers = {
       if (!autostartServe(root)) startUpdate(root);
       text = brief(root);
     }
-    const update = updateNotice(root);
-    if (!update) return text;
-    return { additionalContext: [text, update.brief].filter(Boolean).join('\n'), systemMessage: update.message };
+    const notice = sessionNotice(p, root);
+    if (!notice) return text;
+    return { additionalContext: [text, notice.brief].filter(Boolean).join('\n'), systemMessage: notice.message };
   },
   SubagentStart: (p, root) => (built(root) ? rule() : null),
   PreToolUse: (p, root, key) => {
@@ -641,6 +662,9 @@ function legacyAnswers(event, payload, root, harness) {
       return Boolean(path) && isAbsolute(path) && existsSync(path);
     });
   }
+  // Only the project Claude Code read its settings from: the old entries run the script under
+  // `$CLAUDE_PROJECT_DIR`, so a main worktree's copy, or a nested clone's the session cd'd into,
+  // answers nothing here.
   const project = process.env.CLAUDE_PROJECT_DIR || root;
   return existsSync(join(project, '.claude', 'hooks', LEGACY_HOOK))
     && hookCommands(join(project, '.claude', 'settings.json'), event, payload).some((cmd) => cmd.includes(LEGACY_HOOK));
@@ -660,13 +684,22 @@ async function main({ harness = process.argv.includes('--codex') ? 'codex' : 'cl
   if (!handler) return;
   // The harness's cwd follows a `cd` into a subdirectory, which has no `.zerograph/` of its own.
   const root = (payload.cwd && indexRoot(payload.cwd)) || payload.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
-  if (legacyAnswers(event, payload, root, harness)) { debug('legacy hook answers', event); return; }
+  let answer = handler;
+  if (legacyAnswers(event, payload, root, harness)) {
+    debug('legacy hook answers', event);
+    if (event !== 'SessionStart') return;
+    // The old hook has no notice of either kind, so standing down keeps those and drops the rest.
+    answer = (p, r) => {
+      const notice = sessionNotice(p, r);
+      return notice && { additionalContext: notice.brief, systemMessage: notice.message };
+    };
+  }
   // The subagent's own id is in the key: a subagent shares its parent's session_id, so a counter
   // keyed by session alone finds the count already past zero on a subagent's first call and says
   // nothing — which is a second reason 140 unprimed subagents went on grepping.
   const sessionKey = `${payload.session_id || 'nosession'}-${payload.agent_id || 'main'}`;
   let out;
-  try { out = handler(payload, root, sessionKey); } catch (e) { debug('handler', e); return; }
+  try { out = answer(payload, root, sessionKey); } catch (e) { debug('handler', e); return; }
   if (!out) return;
   // `systemMessage` is a top-level field Claude Code shows the person; Codex is given only context.
   const { systemMessage, ...rest } = typeof out === 'string' ? { additionalContext: out } : out;
