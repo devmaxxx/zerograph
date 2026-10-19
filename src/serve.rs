@@ -430,18 +430,32 @@ fn stop_legacy(repo: &Path) -> Result<bool> {
 /// when the rerank is done — up to `RERANK_TIMEOUT` and `STOP_WAIT` on top — and every question
 /// asked meanwhile would wait that long behind it. Answers go on; it is the watcher's writes, which
 /// that server would race without the lock, that wait for it to be gone.
-struct Legacy(Option<std::thread::JoinHandle<Result<bool>>>);
+struct Legacy {
+    stop: Option<std::thread::JoinHandle<Result<bool>>>,
+    /// The start-up catch-up is held back while the old server is up, not cancelled: with a long
+    /// `--every` no poll would make up for it, and a `--stale` question would be answered from
+    /// the tree as it stood before this process started.
+    behind: bool,
+}
 
 impl Legacy {
     fn spawn(stop: impl FnOnce() -> Result<bool> + Send + 'static) -> Legacy {
-        Legacy(Some(std::thread::spawn(stop)))
+        Legacy { stop: Some(std::thread::spawn(stop)), behind: true }
+    }
+
+    fn catch_up(&mut self, watcher: &mut crate::Watcher, ctx: &mut ask::Context, batch: usize) -> Result<()> {
+        if self.behind && self.gone() {
+            adopt_if_moved(watcher, ctx, batch)?;
+            self.behind = false;
+        }
+        Ok(())
     }
 
     /// Whether the old server is gone, never waiting to find out. A stop that failed is reported
     /// once and counts as gone: refusing to write would leave the checkout to that server alone.
     fn gone(&mut self) -> bool {
-        if self.0.as_ref().is_some_and(|h| !h.is_finished()) { return false; }
-        if let Some(h) = self.0.take() {
+        if self.stop.as_ref().is_some_and(|h| !h.is_finished()) { return false; }
+        if let Some(h) = self.stop.take() {
             match h.join() {
                 Ok(Ok(_)) => {}
                 Ok(Err(e)) => eprintln!("serve: {e:#}"),
@@ -573,7 +587,7 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     // within seconds: waiting `--every` for the first poll handed that question everything a pull
     // changed — 1469 vectors, 17 s on beauty-crm. Catching up now spends the same time before
     // anyone has asked.
-    if legacy.gone() { adopt_if_moved(&mut watcher, &mut ctx, batch)?; }
+    legacy.catch_up(&mut watcher, &mut ctx, batch)?;
     log(&mut ctx);
     eprintln!("serve: {} every {every}s, batch {batch}, idle {idle}s, model idle {idle_model}s; Ctrl-C stops", path.display());
     let (mut last_poll, mut last_request) = (Instant::now(), Instant::now());
@@ -583,7 +597,7 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
             // a liveness probe — another `serve` deciding whether to bind, a client that gave
             // up — and treating one as a request keeps this process resident, holding 1.3 GB,
             // for as long as anything at all polls the socket.
-            Ok(stream) => match answer(stream, &mut watcher, &mut ctx, build, &mut legacy) {
+            Ok(stream) => match answer(stream, &mut watcher, &mut ctx, build, &mut legacy, batch) {
                 Ok(asked) => if asked { last_request = Instant::now(); },
                 Err(e) => { last_request = Instant::now(); eprintln!("serve: {e:#}"); }
             },
@@ -593,6 +607,8 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
         // Ahead of the poll: a poll that embeds a pull can outlast `stop`'s wait, and a stop
         // reported as failed while the server is in fact leaving sends the caller to kill it.
         if terminated() { eprintln!("serve: terminated, exiting"); return Ok(()); }
+        // For when the old server leaves with nobody asking; a question does its own in `answer`.
+        legacy.catch_up(&mut watcher, &mut ctx, batch)?;
         if last_poll.elapsed() >= Duration::from_secs(every) {
             last_poll = Instant::now();
             // The configuration is read once, at start: an id family added, a model or a rerank
@@ -725,7 +741,7 @@ fn hello_line_within(stream: &sys::Stream, total: Duration) -> Option<String> {
 
 /// Whether a question was asked, which is what `--idle` counts — a peer that vanished before
 /// its hello asked nothing.
-fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::Context, build: Option<crate::walk::Stamp>, legacy: &mut Legacy) -> Result<bool> {
+fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::Context, build: Option<crate::walk::Stamp>, legacy: &mut Legacy, batch: usize) -> Result<bool> {
     let Some(line) = hello_line(&stream) else { return Ok(false) };
     // Through the same flag a SIGTERM sets, so the exit is the one every other path takes.
     if serde_json::from_str::<Stop>(&line).is_ok_and(|s| s.stop) {
@@ -747,8 +763,12 @@ fn answer(mut stream: sys::Stream, watcher: &mut crate::Watcher, ctx: &mut ask::
     log(ctx);
     ctx.begin();
     // Until a 0.6.4 server is gone this one writes nothing: the answer is a `--stale` one, which
-    // skips the dense sync and the detached refresh it may start, as well as the walk.
-    if !legacy.gone() { hello.req.stale = true; }
+    // skips the dense sync and the detached refresh it may start, as well as the walk. The
+    // catch-up is decided here, on the same reading of the old server the answer is: a server
+    // seen gone only between the loop's look and this one would otherwise answer `--stale` from
+    // the tree before start.
+    legacy.catch_up(watcher, ctx, batch)?;
+    if legacy.behind { hello.req.stale = true; }
     if hello.req.stale {
         // `--stale` skips the walk, not the store. A one-shot answers from whatever is on disk
         // at this instant, so a resident one reads the store back when another process has
