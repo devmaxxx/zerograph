@@ -23,7 +23,7 @@ quoted in comments. It answers questions about that structure in a few lines of 
 - **Built for agents.** Every reader takes `--json`, there is an MCP server, and a session hook keeps
   the graph fresh.
 
-[![zerograph against graphify and GitNexus](docs/assets/comparison.png)](docs/benchmarks.md)
+[![zerograph against graphify and GitNexus](docs/assets/comparison.gif)](docs/bench/2026-09-04-three-graphs-results.md)
 
 ## Get started
 
