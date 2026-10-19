@@ -1114,6 +1114,14 @@ mod tests {
     }
 
     #[test]
+    fn a_listed_model_named_in_another_case_opens_under_the_trust_lists_spelling() {
+        with_machine(None, || {
+            assert!(trust_model("acme/Mixed-Case-Embedder").unwrap().is_some());
+            assert_eq!(trusted_spelling("ACME/mixed-case-embedder").as_deref(), Some("acme/Mixed-Case-Embedder"));
+        });
+    }
+
+    #[test]
     fn an_error_names_the_variable_the_value_was_read_from() {
         with_machine(None, || {
             let dir = tempfile::tempdir().unwrap();

@@ -30,7 +30,7 @@ for l in open(sys.argv[1]):
 for r in $(seq "$REPEAT"); do
   while IFS=$'\t' read -r id prompt setup; do
     git -C "$WT" checkout -- . >/dev/null 2>&1 || true
-    git -C "$WT" clean -fdq -e .repograph -e .zerograph
+    git -C "$WT" clean -fdq -e .zerograph
     rm -rf "$WT/.claude"; cp -R "$OVERLAY" "$WT/.claude"
     cmp -s "$WT/.claude/CLAUDE.md" "$OVERLAY/CLAUDE.md" \
       || { echo "the overlay did not survive the reset: $WT/.claude is not $OVERLAY" >&2; exit 3; }
@@ -44,7 +44,7 @@ for r in $(seq "$REPEAT"); do
   done < "$OUT/tasks.tsv"
 done
 git -C "$WT" checkout -- . >/dev/null 2>&1 || true
-git -C "$WT" clean -fdq -e .repograph -e .zerograph
+git -C "$WT" clean -fdq -e .zerograph
 python3 "$HERE/score.py" "$OUT" --tasks "$HERE/tasks.jsonl" --config "$CONFIG" --model "$MODEL" > "$OUT/summary.json"
 python3 -c "import json;s=json.load(open('$OUT/summary.json'));print(s['config'],s['model'],'hits',s['hits'],'/',s['tasks'],'tokens',s['tokens'],'cost',round(s['cost'],4),'asked',s['asked'],'grepped',s['grepped'])"
 echo "$OUT"

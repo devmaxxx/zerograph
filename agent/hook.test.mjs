@@ -320,6 +320,15 @@ test('SessionStart prints the brief, and nothing where there is no store', () =>
   assert.equal(fire(bare, { hook_event_name: 'SessionStart', source: 'startup' }), null);
 });
 
+test('a .zerograph without a manifest is not built, and the binary is not asked', () => {
+  // A build that died before its manifest, or a directory another tool made, leaves the name with
+  // nothing in it the binary could answer from.
+  const w = world({ store: false, answer: 'zerograph: 3 doc nodes' });
+  mkdirSync(join(w.root, '.zerograph'), { recursive: true });
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }), null);
+  assert.deepEqual(argv(w), []);
+});
+
 test('a session started in a subdirectory finds the index above it, and a nested checkout does not borrow it', () => {
   const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
   const env = { ZEROGRAPH_HOOK_SERVE: '0' };

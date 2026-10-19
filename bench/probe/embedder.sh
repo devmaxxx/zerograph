@@ -2,10 +2,10 @@
 # a writer or a reader; sourcing defines the two calls below and runs nothing, so
 # `test_embedder.py` reads both refusals with no store under them.
 #
-# Declared in the environment rather than in a `repograph.toml` beside the store, for two reasons
-# the file could not give. `REPOGRAPH_EMBED_MODEL` outranks what a store records, so a store
+# Declared in the environment rather than in a `zerograph.toml` beside the store, for two reasons
+# the file could not give. `ZEROGRAPH_EMBED_MODEL` outranks what a store records, so a store
 # restored under a changed built-in default is still read and embedded with the weights the reading
-# names. And the corpus worktree stays clean: `repograph.toml` is untracked and unignored there and
+# names. And the corpus worktree stays clean: `zerograph.toml` is untracked and unignored there and
 # `changes` reads untracked paths, so a file of ours would have every `changes` row mapping two
 # changed paths instead of the one the row touched.
 EMBEDDER=intfloat/multilingual-e5-small
@@ -16,29 +16,28 @@ EMBEDDER=intfloat/multilingual-e5-small
 # would be read under weights this machine does not hold cached, and quietly replacing the value
 # would hide from an operator that they had asked for something else.
 #
-# The declaration keeps the old variable name, which every binary this kit runs reads. A renamed
-# binary reads `ZEROGRAPH_EMBED_MODEL` first, and the old name only while the new one is unset — an
-# empty value counts as set — so one left in the environment answers for the weights whatever the
-# declaration says, and is refused the same way.
+# A pinned binary from before the rename reads `REPOGRAPH_EMBED_MODEL` and nothing else, so the
+# declaration is exported under that name too. One already set to other weights is refused the
+# same way, rather than overwritten behind the operator's back.
 embedder_declared() {
-  if [ -n "${ZEROGRAPH_EMBED_MODEL+set}" ] && [ "$ZEROGRAPH_EMBED_MODEL" != "$EMBEDDER" ]; then
-    echo "refusing: ZEROGRAPH_EMBED_MODEL is set to '$ZEROGRAPH_EMBED_MODEL' and outranks REPOGRAPH_EMBED_MODEL in a renamed binary — every row of this kit is read under $EMBEDDER; unset it, or set it to $EMBEDDER" >&2
+  case ${ZEROGRAPH_EMBED_MODEL-} in
+    "$EMBEDDER") ;;
+    "") echo "refusing: ZEROGRAPH_EMBED_MODEL is not set — export ZEROGRAPH_EMBED_MODEL=$EMBEDDER before running this kit; unset, the binary takes whatever its built-in default is today and no reading can say which weights it was taken under" >&2
+        return 2 ;;
+    *) echo "refusing: ZEROGRAPH_EMBED_MODEL names $ZEROGRAPH_EMBED_MODEL — every row of this kit is read under $EMBEDDER, and only its weights are cached on this machine" >&2
+       return 2 ;;
+  esac
+  if [ -n "${REPOGRAPH_EMBED_MODEL+set}" ] && [ "$REPOGRAPH_EMBED_MODEL" != "$EMBEDDER" ]; then
+    echo "refusing: REPOGRAPH_EMBED_MODEL is set to '$REPOGRAPH_EMBED_MODEL', which a pinned pre-rename binary reads — every row of this kit is read under $EMBEDDER; unset it, or set it to $EMBEDDER" >&2
     return 2
   fi
-  case ${REPOGRAPH_EMBED_MODEL-} in
-    "$EMBEDDER")
-      # Exported and not only checked: a row is read under what the binary's own process sees, and
-      # a declaration that arrived as a shell variable would stop at the script.
-      export REPOGRAPH_EMBED_MODEL
-      return 0 ;;
-    "") echo "refusing: REPOGRAPH_EMBED_MODEL is not set — export REPOGRAPH_EMBED_MODEL=$EMBEDDER before running this kit; unset, the binary takes whatever its built-in default is today and no reading can say which weights it was taken under" >&2 ;;
-    *) echo "refusing: REPOGRAPH_EMBED_MODEL names $REPOGRAPH_EMBED_MODEL — every row of this kit is read under $EMBEDDER, and only its weights are cached on this machine" >&2 ;;
-  esac
-  return 2
+  # Exported and not only checked: a row is read under what the binary's own process sees, and a
+  # declaration that arrived as a shell variable would stop at the script.
+  export ZEROGRAPH_EMBED_MODEL REPOGRAPH_EMBED_MODEL="$EMBEDDER"
 }
 
 # Beside the rows in the run's own summary, the way the quiet line is: a median with no embedder
 # named next to it does not say which weights answered.
 embedder_line() {
-  echo "embedder: REPOGRAPH_EMBED_MODEL=$REPOGRAPH_EMBED_MODEL"
+  echo "embedder: ZEROGRAPH_EMBED_MODEL=$ZEROGRAPH_EMBED_MODEL"
 }

@@ -2,7 +2,9 @@
 """Render docs/assets/comparison.gif: one frame per measurement, zerograph against graphify and GitNexus.
 
 The numbers come from docs/bench/2026-09-04-three-graphs-results.md (beauty-crm at 502e8a6d) and,
-for the embedder and rerank rows, the 0.6.0 rows of bench/history/runs.jsonl. Needs Google Chrome
+for the embedder and rerank rows, the 0.6.0 rows of bench/history/runs.jsonl. graphify's 14.6 M
+build tokens are the cold build in docs/superpowers/specs/2026-09-01-zerograph-design.md; the
+2026-09-04 results show 0 because that run built off a warm cache. Needs Google Chrome
 and Pillow: `python3 scripts/comparison-gif.py`.
 """
 import os
@@ -34,7 +36,7 @@ FRAMES = [
         (ZG, 0, "0", Z2),
         ("graphify", 14.6, "14.6 M", G),
         ("GitNexus", 0, "0", N),
-    ], True, "graphify reads every file with a model; zerograph and GitNexus build locally."),
+    ], True, "graphify, a cold build, reads every file with a model; zerograph and GitNexus build locally."),
     ("Answer size", "median characters, lower is better", [
         (ZG, 593, "593", Z2),
         ("graphify", 6688, "6 688", G),

@@ -32,7 +32,7 @@ use clap::{Parser, Subcommand};
 use model::Extractor;
 use std::path::PathBuf;
 
-/// `ZEROGRAPH_<suffix>`, which once set at all wins even when it is empty.
+/// `ZEROGRAPH_<suffix>`. An empty value comes back as set; each caller decides what empty means.
 pub fn env_os(suffix: &str) -> Option<std::ffi::OsString> { std::env::var_os(env_name(suffix)) }
 
 /// [`env_os`] as text; a value that is not Unicode reads as unset, as `std::env::var` has it.

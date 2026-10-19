@@ -39,8 +39,8 @@ kill_tree() {
 # The refusal that has to be read before the store is: this script removes `vectors.f32` before it
 # starts, so an embed killed partway through leaves neither the old vectors nor a whole set of new
 # ones — and the next thing anyone does with a store is trust it.
-# The store a binary reads in a tree: `.zerograph` once a renamed binary has written there, else the
-# `.repograph` every fixture was built with.
+# The store a binary reads in a tree: `.zerograph` for a current binary, else the `.repograph` a
+# pinned pre-rename binary built.
 store_of() { if [ -e "$1/.zerograph" ]; then echo "$1/.zerograph"; else echo "$1/.repograph"; fi; }
 
 refuse_partial_store() {

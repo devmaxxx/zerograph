@@ -26,7 +26,7 @@ trap 'rm -rf "$OUT"' EXIT
 
 # A worktree's `.git` is a file pointing at the real one, never a directory.
 [ -e "$FIXTURE/.git" ] || { echo "no fixture at $FIXTURE — see bench/history/README.md" >&2; exit 1; }
-[ -f "$FIXTURE/.zerograph/graph.json" ] || [ -f "$FIXTURE/.repograph/graph.json" ] || { echo "fixture has no store — see bench/history/README.md" >&2; exit 1; }
+[ -f "$FIXTURE/.zerograph/graph.json" ] || { echo "fixture has no store — see bench/history/README.md" >&2; exit 1; }
 
 # A run recorded against a fixture that moved is a run whose history rows cannot be compared,
 # and the comparison would silently look like a regression in zerograph.

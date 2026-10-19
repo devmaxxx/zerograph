@@ -20,7 +20,7 @@
 # changed anything or its counts differ from the fixture's graph.json: the tree is not the one
 # the store was built from, and nothing measured on it would be comparable.
 #
-# usage: REPOGRAPH_EMBED_MODEL=intfloat/multilingual-e5-small reset.sh
+# usage: ZEROGRAPH_EMBED_MODEL=intfloat/multilingual-e5-small reset.sh
 #        (FIX, WT, PIN and BIN from the environment too; the defaults are this machine's)
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -38,9 +38,8 @@ refuse() { echo "reset: refusing — $1" >&2; exit 2; }
 fix=$(cd "$FIX" 2>/dev/null && pwd -P) || refuse "FIX=$FIX is not a directory"
 wt=$(cd "$WT" 2>/dev/null && pwd -P) || refuse "WT=$WT is not a directory"
 [ "$wt" != "$fix" ] || refuse "WT and FIX are the same directory ($wt)"
-# The fixture was built under the old name, and the first write by a renamed binary — a reader's
-# inline refresh included — moves it to the new one, so it holds either. The new name wins
-# whenever anything stands there, as it does for the binary.
+# Current binaries read `.zerograph` only, so that name wins whenever anything stands there. A
+# fixture built by a pinned pre-rename binary holds `.repograph`, the only name that binary reads.
 st=.zerograph
 [ -e "$fix/$st" ] || st=.repograph
 other=.repograph
@@ -55,9 +54,8 @@ printf '%s\n' "$block" | grep -q '^locked' || refuse "$wt is not locked — lock
 
 # `reset --hard` rather than `checkout -- .`: a staged edit survives the latter.
 git -C "$wt" reset -q --hard HEAD || exit 1
-# The store under the name the fixture does not hold goes: a renamed binary's first write leaves
-# the worktree's as `.zerograph`, which outranks a `.repograph` for every binary that knows both
-# names, so the restore below would not be the store that is read. `clean` cannot do it — a
+# The store under the name the fixture does not hold goes: a binary reading the other name would
+# answer from it, so the restore below would not be the store that is read. `clean` cannot do it — a
 # moved store carries its own `.gitignore` of `*`, which `clean` honours.
 rm -rf "$wt/${other:?}" || exit 1
 git -C "$wt" clean -fdq -e "$st" || exit 1
@@ -66,7 +64,7 @@ git -C "$wt" clean -fdq -e "$st" || exit 1
 # corpus it is ignored (`.gitignore`) and `status` never names it, but the pair is there for a
 # corpus that does not ignore it, where `status` prints `?? $st/` and an unfiltered check
 # would refuse every reset with "the tree did not come clean". Nothing else is spared, which is how
-# a `repograph.toml` an earlier reset left behind goes: what a reading declares is in the
+# a `zerograph.toml` (or a pre-rename `repograph.toml`) an earlier reset left behind goes: what a reading declares is in the
 # environment now, so the tree keeps no file of ours for a `changes` row to map.
 left=$(git -C "$wt" status --porcelain | grep -vxF "?? $st/")
 [ -z "$left" ] || { echo "reset: the tree did not come clean:" >&2; echo "$left" >&2; exit 1; }

@@ -18,7 +18,8 @@ M="$HERE/measure.sh"
 # `changes` rows below are the reason it matters most.
 . "$HERE/embedder.sh" || exit 2
 embedder_declared || exit 2
-export REPOGRAPH_NO_SERVE=1
+# Both names: a pinned pre-rename binary reads only the old one.
+export ZEROGRAPH_NO_SERVE=1 REPOGRAPH_NO_SERVE=1
 mkdir -p "$L"
 # Absolute before the `cd` below, the way HERE is: a relative LOGDIR would be re-created by
 # `measure.sh` *inside* the worktree, and then every transcript, `dump10.json` and the `cn.ts`

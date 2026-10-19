@@ -120,7 +120,7 @@ class Medians(unittest.TestCase):
         # a control drift together, so nothing downstream notices the row is gone.
         with tempfile.TemporaryDirectory() as d:
             p = Path(d, "medians.txt")
-            p.write_text("embedder: REPOGRAPH_EMBED_MODEL=small\n"
+            p.write_text("embedder: ZEROGRAPH_EMBED_MODEL=small\n"
                          "ask-fused wall=0.61 maxrss=1.55 peak_cpu=120.0% avg_cpu=98% n=5\n"
                          "impact wall=0.04 maxrss=0.05 peak_cpu=0.0% cpu=75% n=5\n"
                          "dump10 wall=0.70 maxrss=1.36 peak_cpu=100.0% avg_cpu=90% n=5\n")
@@ -134,7 +134,7 @@ class Medians(unittest.TestCase):
         # the rows; none of them is a reading, and the file is the one copied out of every run.
         with tempfile.TemporaryDirectory() as d:
             p = Path(d, "medians.txt")
-            p.write_text("embedder: REPOGRAPH_EMBED_MODEL=BAAI/bge-m3\n"
+            p.write_text("embedder: ZEROGRAPH_EMBED_MODEL=BAAI/bge-m3\n"
                          "quiet: idle=96% load1=1.2 avail=12.0GB\n"
                          "trace wall=0.42 maxrss=0.31 peak_cpu=0.0% avg_cpu=83% n=5 verdict=1\n"
                          + judge.verdict_note(["trace"]) + "\n")
