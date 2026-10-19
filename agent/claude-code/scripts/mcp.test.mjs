@@ -9,7 +9,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-import { binaryOf, argvOf, checkoutOf, childEnv } from './mcp.mjs';
+import { binaryOf, argvOf, checkoutOf, childEnv, machineDirs, pathKey } from './mcp.mjs';
 
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), 'mcp.mjs');
 const WIN = process.platform === 'win32';
@@ -146,4 +146,39 @@ test('no binary is a line in the server log and a failed start, never a word on 
   assert.strictEqual(r.status, 1);
   assert.strictEqual(r.stdout, '');
   assert.match(r.stderr, /relative\/zerograph\) is not an absolute path/);
+});
+
+test('a checkout that is the home directory, or above it, cuts nothing from PATH', () => {
+  const w = world();
+  const home = join(w.checkout, 'me');
+  const nvm = join(home, '.nvm', 'bin');
+  const path = [nvm, w.machine].join(sep);
+  assert.deepStrictEqual(machineDirs(path, w.checkout, WIN, home), [nvm, w.machine], 'an ancestor of home');
+  assert.deepStrictEqual(machineDirs(path, home, WIN, home), [nvm, w.machine], 'home itself');
+  assert.deepStrictEqual(machineDirs(path, WIN ? 'C:\\' : '/', WIN, home), [nvm, w.machine], 'a filesystem root');
+  assert.strictEqual(childEnv({ PATH: path }, home, WIN, home).PATH, path);
+  assert.deepStrictEqual(machineDirs([join(w.checkout, 'bin'), w.machine].join(sep), w.checkout, WIN, w.machine), [w.machine], 'a checkout beside home is still cut');
+});
+
+test('PATH is the only PATH on POSIX, and any case of it on Windows', () => {
+  const w = world();
+  assert.strictEqual(pathKey({ Path: 'x', PATH: 'y' }, false), 'PATH');
+  assert.strictEqual(pathKey({ Path: 'x' }, false), 'PATH');
+  assert.strictEqual(pathKey({ Path: 'x' }, true), 'Path');
+  const env = childEnv({ Path: join(w.checkout, 'bin'), PATH: w.machine }, w.checkout, false);
+  assert.strictEqual(env.PATH, w.machine);
+  assert.strictEqual(env.Path, join(w.checkout, 'bin'), 'another variable, left as it is');
+});
+
+test('a quoted Windows PATH entry is judged without its quotes and kept as written', () => {
+  const quoted = '"C:\\Program Files\\nodejs"';
+  assert.deepStrictEqual(machineDirs([quoted, '"C:\\src\\app\\bin"'].join(';'), 'C:\\src\\app', true, 'C:\\Users\\me'), [quoted]);
+  assert.strictEqual(childEnv({ Path: quoted }, 'C:\\src\\app', true, 'C:\\Users\\me').Path, quoted);
+});
+
+test('a session opened through a link finds the checkout by its real path, as the CLI does', { skip: WIN && 'symlinks need a privilege' }, () => {
+  const w = world();
+  const link = join(w.base, 'link');
+  symlinkSync(join(w.checkout, 'packages', 'app'), link);
+  assert.strictEqual(checkoutOf(link), w.checkout);
 });

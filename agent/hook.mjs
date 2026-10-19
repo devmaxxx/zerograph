@@ -21,7 +21,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstat
 import { spawn, spawnSync } from 'node:child_process';
 import { join, dirname, relative, delimiter, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { createHash } from 'node:crypto';
 
 const MAX_INJECTIONS = 12;   // 12 × ~107 tokens: a third of the CLAUDE.md sections this replaces
@@ -114,10 +114,19 @@ function onPath(root, platform = process.platform) {
  * on PATH nor a session opened through one lets the checkout's file through.
  */
 function machineDirs(root) {
-  const checkout = root && (checkoutRoot(root) ?? root);
+  const found = root && (checkoutRoot(root) ?? root);
+  // A `~/.zerograph` or a dotfiles `~/.git` makes the home directory the checkout, and cutting it
+  // would take nvm, cargo and `~/.local/bin` with it, where zerograph and `node` are installed.
+  const home = homedir();
+  const checkout = found && dirname(found) !== found && !(home && (inside(found, home) || inside(real(found), real(home)))) ? found : null;
   const resolved = checkout && real(checkout);
-  return (process.env.PATH || '').split(delimiter)
+  return (process.env[pathKey()] || '').split(delimiter)
     .filter((d) => d && isAbsolute(d) && !inside(checkout, d) && !inside(resolved, real(d)));
+}
+
+/** The PATH variable's name: any case on Windows, where the environment ignores it, else `PATH`. */
+function pathKey() {
+  return (process.platform === 'win32' && Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH')) || 'PATH';
 }
 
 /** `p` with every link followed, or as given when it does not resolve. */
@@ -131,8 +140,7 @@ function real(p) {
  * entry an `.envrc` put inside the checkout would start the checkout's `node` one step on.
  */
 function childEnv(root, extra = {}) {
-  const key = Object.keys(process.env).find((k) => k.toUpperCase() === 'PATH') ?? 'PATH';
-  return { ...process.env, [key]: machineDirs(root).join(delimiter), ...extra };
+  return { ...process.env, [pathKey()]: machineDirs(root).join(delimiter), ...extra };
 }
 
 /**

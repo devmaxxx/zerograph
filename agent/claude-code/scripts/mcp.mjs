@@ -6,6 +6,7 @@
 // Usage: node mcp.mjs '<binary option>'
 import { spawn } from 'node:child_process';
 import { existsSync, realpathSync, statSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -30,9 +31,13 @@ export function real(p) {
   try { return realpathSync.native(p); } catch { return p; }
 }
 
-/** The nearest directory at or above `start` holding `name`, or null. */
+/**
+ * The nearest directory at or above `start` holding `name`, or null. Walked from the real path, as
+ * the CLI canonicalizes its working directory, so a session opened through a link finds the
+ * checkout the CLI would.
+ */
 function nearest(start, name) {
-  for (let d = start; ; d = dirname(d)) {
+  for (let d = real(start); ; d = dirname(d)) {
     if (existsSync(join(d, name))) return d;
     if (dirname(d) === d) return null;
   }
@@ -53,10 +58,30 @@ export function checkoutOf(root) {
  * neither a symlinked alias of the checkout on PATH nor a session opened through one lets the
  * checkout's file through.
  */
-export function machineDirs(path, checkout, win) {
+export function machineDirs(path, checkout, win, home = homedir()) {
+  const cut = guarded(checkout, win, home);
   const resolved = real(checkout);
-  return (path ?? '').split(win ? ';' : ':')
-    .filter(dir => dir && isAbsolute(dir) && !inside(checkout, dir, win) && !inside(resolved, real(dir), win));
+  return (path ?? '').split(win ? ';' : ':').filter(entry => {
+    // Windows reads a quoted entry as the directory inside the quotes.
+    const dir = win ? entry.replace(/^"(.*)"$/, '$1') : entry;
+    return dir && isAbsolute(dir) && !(cut && (inside(checkout, dir, win) || inside(resolved, real(dir), win)));
+  });
+}
+
+/**
+ * Whether PATH entries inside `checkout` are cut. Not when it is a filesystem root or holds the home
+ * directory: a `~/.zerograph` or a dotfiles `~/.git` makes the home directory the checkout, and the
+ * cut would then take nvm, cargo and `~/.local/bin` with it, the very places zerograph and `node`
+ * are installed.
+ */
+function guarded(checkout, win, home) {
+  if (!checkout || dirname(checkout) === checkout) return false;
+  return !(home && (inside(checkout, home, win) || inside(real(checkout), real(home), win)));
+}
+
+/** The PATH variable's name: any case on Windows, where the environment ignores it, else `PATH`. */
+export function pathKey(env, win) {
+  return (win && Object.keys(env).find(k => k.toUpperCase() === 'PATH')) || 'PATH';
 }
 
 /**
@@ -65,12 +90,12 @@ export function machineDirs(path, checkout, win) {
  * otherwise have it run the moment a session opened in it. A relative option is refused rather
  * than read against a working directory nobody chose; a bare name means the PATH lookup.
  */
-export function binaryOf(configured, { path, checkout, win }) {
+export function binaryOf(configured, { path, checkout, win, home }) {
   const option = configured === UNSET ? '' : configured.trim();
   if (option && /[\\/]/.test(option)) {
     return isAbsolute(option) ? { bin: option } : { error: `the plugin's binary option (${option}) is not an absolute path; set one in /config, or clear it to use PATH` };
   }
-  const dirs = machineDirs(path, checkout, win);
+  const dirs = machineDirs(path, checkout, win, home);
   // Every `.exe` before any `.cmd`: npm's global shim is a `.cmd`, which only `cmd` can start.
   const names = win ? ['zerograph.exe', 'zerograph.cmd'] : ['zerograph'];
   for (const name of names) {
@@ -107,9 +132,9 @@ export function argvOf(bin, checkout, comspec) {
 }
 
 /** The environment the server runs in: PATH cut to the machine's entries, as the binary was. */
-export function childEnv(env, checkout, win) {
-  const key = Object.keys(env).find(k => k.toUpperCase() === 'PATH') ?? 'PATH';
-  return { ...env, [key]: machineDirs(env[key], checkout, win).join(win ? ';' : ':') };
+export function childEnv(env, checkout, win, home) {
+  const key = pathKey(env, win);
+  return { ...env, [key]: machineDirs(env[key], checkout, win, home).join(win ? ';' : ':') };
 }
 
 function main() {
@@ -118,8 +143,7 @@ function main() {
   // a plugin's server in is not documented.
   const checkout = checkoutOf(process.env.CLAUDE_PROJECT_DIR || process.cwd());
   const env = process.env;
-  const pathKey = Object.keys(env).find(k => k.toUpperCase() === 'PATH') ?? 'PATH';
-  const found = binaryOf(process.argv[2] ?? '', { path: env[pathKey], checkout, win });
+  const found = binaryOf(process.argv[2] ?? '', { path: env[pathKey(env, win)], checkout, win });
   const launch = found.error ? found : argvOf(found.bin, checkout, env.ComSpec);
   if (launch.error) {
     // stderr is the server log the harness shows; stdout belongs to the protocol.

@@ -702,3 +702,20 @@ test('malformed input is silence with exit zero', () => {
   assert.equal(r.status, 0);
   assert.equal(r.stdout, '');
 });
+
+test('a home directory that is a checkout keeps its own PATH entries', { skip: WIN && 'HOME is not the Windows profile' }, () => {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-home-')));
+  mkdirSync(join(home, '.git'));
+  mkdirSync(join(home, 'notes'));
+  const bin = join(home, '.nvm', 'bin');
+  mkdirSync(bin, { recursive: true });
+  writeFileSync(join(bin, 'zerograph'), '');
+  chmodSync(join(bin, 'zerograph'), 0o755);
+  const saved = { HOME: process.env.HOME, PATH: process.env.PATH };
+  Object.assign(process.env, { HOME: home, PATH: [bin, '/usr/bin'].join(delimiter) });
+  try {
+    assert.equal(onPath(join(home, 'notes')), join(bin, 'zerograph'));
+  } finally {
+    Object.assign(process.env, saved);
+  }
+});
