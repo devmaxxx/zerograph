@@ -36,8 +36,7 @@ zerograph install-agent --claude           # optional: MCP server + session hook
 ```
 
 `install-agent` also takes `--codex`, `--cursor`, `--copilot`, `--gemini` and `--opencode`. On
-Windows, see the [Windows notes](docs/install.md#windows-notes). If you are coming from repograph,
-see [coming from repograph](docs/install.md#coming-from-repograph).
+Windows, see the [Windows notes](docs/install.md#windows-notes).
 
 ## In action
 
