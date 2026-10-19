@@ -5,6 +5,12 @@ zerograph mcp                    # a stdio MCP server (protocol 2025-06-18) over
 claude mcp add zerograph -- zerograph --repo /path/to/checkout mcp   # what `install-agent --claude` runs, per checkout
 ```
 
+The [Claude Code plugin](install.md#claude-code-plugin) starts this server itself, once per
+session, as `mcp__plugin_zerograph_zerograph__*`, and its slash commands call these tools. With the
+plugin installed, `install-agent --claude`'s registration below is a second copy of the same
+server: remove it with `claude mcp remove zerograph -s local`
+([why](install.md#claude-code-plugin)).
+
 `install-agent --claude` registers the server through the `claude` CLI, at local scope, once for
 every checkout of the clone that `git worktree list` names, each with its own `--repo`. Local scope
 is keyed by the project's path, so a session opened in a worktree sees only what was registered for
@@ -56,7 +62,8 @@ machine-wide file, so it is not covered; `zerograph mcp` is the command to give 
 | `ask` | `question` (plus `seeds`, `bodies`, `rerank`, `rerank_local`, `depth`, `stale`) to the answer `ask` prints, with the low-confidence line when the retrievers disagree. `rerank` spends tokens on the agent's word, so one server process runs at most `mcp_reranks` of them (25 by default, set in the machine config) and answers the rest from the fused order, saying so |
 | `explain`, `impact`, `trace`, `changes` | the commands of those names, with their flags; an answer given while files are behind the tree says so |
 | `status` | nodes and edges, files behind the tree, the store's model against the configured one, vector rows owed, and whether a background refresh is running with its last progress line from `.zerograph/background.log` and what the run said besides, and whether a `serve` answers with its last log lines. The same report as `zerograph status` |
-| `reindex` | starts a detached `update` and returns at once; says so when one is already running |
+| `reindex` | starts a detached `build` where no store stands, else a detached `update`, and returns at once; says so when one is already running. The child takes the writer lock as the command line does, so readers keep answering from the store as it stands |
+| `cache_status` | the machine's vector cache: where it is, its cap, and the rows and bytes it holds per model. The same report as `zerograph cache status`; it writes nothing, and a cache not made yet reads as empty |
 | `switch_model` | `model <hub id>` in the background. Only catalogued models and ones trusted on this machine with `zerograph model <id>`; any other id is refused, because the caller is an agent and a model is code this machine downloads |
 
 `status` reports progress while the writer lock is held and nothing once the refresh is over. Each

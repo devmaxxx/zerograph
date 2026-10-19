@@ -314,6 +314,13 @@ impl VectorCache {
         Ok(VectorCache { root, max, detached: false })
     }
 
+    /// The cache at `root` for a report, which must not make the directory it reports on: one
+    /// that is not there yet is an empty cache, and `at` takes over once one stands.
+    pub fn for_status(root: PathBuf, max: u64) -> Result<VectorCache> {
+        if root.exists() { return VectorCache::at(root, max); }
+        Ok(VectorCache { root, max, detached: false })
+    }
+
     /// What a prune trims to: under the cap by enough that the next few writes do not prune again,
     /// and to nothing when the cap is 0.
     pub fn prune_target(&self) -> u64 { self.max / 100 * PRUNE_TO_PERCENT }
@@ -690,6 +697,15 @@ mod tests {
 
     fn shard_file(c: &VectorCache, model: &str, dims: usize, shard: u8) -> PathBuf {
         c.root.join(Layout::new(model, REV, dims).dir_name()).join(format!("{shard:02x}0.rows"))
+    }
+
+    #[test]
+    fn a_status_of_a_cache_not_made_yet_is_empty_and_makes_nothing() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path().join("vectors");
+        let c = VectorCache::for_status(root.clone(), 1 << 20).unwrap();
+        assert_eq!(c.status(), Status { models: vec![], other: 0 });
+        assert!(!root.exists(), "a report does not create the directory it reports on");
     }
 
     #[test]

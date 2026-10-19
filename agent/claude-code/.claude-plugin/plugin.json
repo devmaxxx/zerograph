@@ -1,7 +1,7 @@
 {
   "name": "zerograph",
   "version": "0.7.0",
-  "description": "zerograph's state at the end of the prompt's hint line: refresh progress, files behind, serve and warnings",
+  "description": "zerograph in Claude Code: its MCP server, slash commands that call it (ask, impact, trace, changes, explain, status, refresh), a skill that reaches for the graph before grep, and the index's state at the end of the prompt's hint line",
   "author": {
     "name": "devmaxxx"
   },
@@ -12,6 +12,15 @@
       "title": "zerograph binary",
       "description": "Absolute path of the zerograph to ask; a relative one is ignored. Empty asks the zerograph on PATH outside the project, so a binary inside the project runs only when named here.",
       "default": ""
+    }
+  },
+  "mcpServers": {
+    "zerograph": {
+      "command": "node",
+      "args": [
+        "${CLAUDE_PLUGIN_ROOT}/scripts/mcp.mjs",
+        "${user_config.binary}"
+      ]
     }
   }
 }

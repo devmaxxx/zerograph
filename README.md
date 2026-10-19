@@ -51,7 +51,10 @@ prints the full `zerograph status` report.
 ```
 
 It is pinned to the latest release, so `claude plugin update zerograph` moves it with zerograph.
-See [the status mod](docs/install.md#claude-code-status-mod).
+It starts zerograph's MCP server for the session and adds `/zerograph:ask`, `/zerograph:impact`,
+`/zerograph:trace`, `/zerograph:changes`, `/zerograph:explain`, `/zerograph:status` and
+`/zerograph:refresh`, each of which calls that server's tools and reads the top hits. With the
+plugin, skip `install-agent --claude`'s MCP server; see [the plugin](docs/install.md#claude-code-plugin).
 
 ## In action
 
