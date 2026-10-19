@@ -502,7 +502,7 @@ impl DenseIndex {
         let Some(cache) = self.cache.as_ref().filter(|_| self.claimed_dim > 0 && !wanted.is_empty()) else { return Default::default() };
         let asked: Vec<&str> = wanted.iter().map(String::as_str).collect();
         let found = match self.cache_shards {
-            Some(shards) => cache.get_within(&self.model, &self.revision, self.claimed_dim, &asked, shards).0,
+            Some(shards) => cache.get_within(&self.model, &self.revision, self.claimed_dim, &asked, shards),
             None => cache.get(&self.model, &self.revision, self.claimed_dim, &asked),
         };
         if !found.is_empty() {

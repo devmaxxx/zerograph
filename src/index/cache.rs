@@ -324,29 +324,26 @@ impl VectorCache {
     /// Rows for as many of the `wanted` hex text hashes as the cache holds under `model` at
     /// `revision` and `dims`.
     pub fn get(&self, model: &str, revision: &str, dims: usize, wanted: &[&str]) -> HashMap<String, Vec<f32>> {
-        self.get_at(model, revision, dims, wanted, None, now_minutes()).0
+        self.get_at(model, revision, dims, wanted, None, now_minutes())
     }
 
     /// `get` over at most `shards` of the shards the wanted rows fall in, those holding the most
-    /// of them first, and whether a shard left unread exists, so might have held some. Each shard
-    /// is read whole, so a reader that owes a pull's worth of rows would otherwise read most of the
-    /// cache before its budget is weighed.
-    pub fn get_within(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: usize) -> (HashMap<String, Vec<f32>>, bool) {
+    /// of them first. Each shard is read whole, so a reader that owes a pull's worth of rows would
+    /// otherwise read most of the cache before its budget is weighed.
+    pub fn get_within(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: usize) -> HashMap<String, Vec<f32>> {
         self.get_at(model, revision, dims, wanted, Some(shards), now_minutes())
     }
 
-    fn get_at(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: Option<usize>, now: u32) -> (HashMap<String, Vec<f32>>, bool) {
+    fn get_at(&self, model: &str, revision: &str, dims: usize, wanted: &[&str], shards: Option<usize>, now: u32) -> HashMap<String, Vec<f32>> {
         let mut found = HashMap::new();
-        if dims == 0 || model.is_empty() { return (found, false); }
+        if dims == 0 || model.is_empty() { return found; }
         let layout = Layout::new(model, revision, dims);
         let dir = self.root.join(layout.dir_name());
         let mut by_shard: HashMap<String, HashSet<[u8; KEY]>> = HashMap::new();
         for k in wanted.iter().filter_map(|h| key_of(h)) { by_shard.entry(shard_of(&k)).or_default().insert(k); }
         let mut by_shard: Vec<(String, HashSet<[u8; KEY]>)> = by_shard.into_iter().collect();
         by_shard.sort_by(|a, b| b.1.len().cmp(&a.1.len()).then_with(|| a.0.cmp(&b.0)));
-        let most = shards.unwrap_or(usize::MAX);
-        let cut = by_shard.iter().skip(most).any(|(shard, _)| dir.join(format!("{shard}.rows")).exists());
-        by_shard.truncate(most);
+        by_shard.truncate(shards.unwrap_or(usize::MAX));
         for (shard, mut keys) in by_shard {
             let path = dir.join(format!("{shard}.rows"));
             // Read-write for the touch below; a shard that will not open so still reads.
@@ -366,7 +363,7 @@ impl VectorCache {
             // and one lost to a prune's rename only leaves the row a little older.
             for at in stale { let _ = write_at(&f, (at + KEY) as u64, &now.to_le_bytes()); }
         }
-        (found, cut)
+        found
     }
 
     /// Appends `rows` — hex text hash and vector — under `model` at `revision` and `dims`, then
@@ -625,9 +622,10 @@ fn make_dir(dir: &Path) -> Result<()> {
 }
 
 /// `records` appended to one shard under its lock, less those whose key the shard already holds:
-/// another checkout may have embedded the same text since this one looked. Only keys are compared,
-/// to keep the work under the lock to a scan; a held record that fails its check is the prune's
-/// to drop, after which the row is embedded and stored again.
+/// another checkout may have embedded the same text since this one looked. A held record is checked
+/// only when its key is one being appended, which keeps the work under the lock to a scan; one
+/// that fails its check holds nothing, so the new record is appended after it and a reader, which
+/// skips a record that fails, finds that one.
 /// A shard that does not start with this layout's header — new or garbage — is started over; a
 /// torn tail a crash left is cut back to the last whole record first, or every record after it
 /// would be read out of step. A shard whose header names another format is left alone and nothing
@@ -660,7 +658,7 @@ fn append(dir: &Path, shard: &str, layout: &Layout, records: &[u8]) -> Result<(u
             let mut new: HashSet<&[u8]> = records.chunks(layout.record_len()).map(|rec| &rec[..KEY]).collect();
             for (_, rec) in layout.records(&bytes) {
                 if new.is_empty() { break; }
-                new.remove(&rec[..KEY]);
+                if new.contains(&rec[..KEY]) && layout.row_of(rec).is_some() { new.remove(&rec[..KEY]); }
             }
             records.chunks(layout.record_len()).filter(|rec| new.contains(&rec[..KEY])).flatten().copied().collect()
         }
@@ -787,7 +785,7 @@ mod tests {
         c.put_at("m", REV, 2, &[(&old, &[1.0, 0.0])], 1_000).unwrap();
         c.put_at("m", REV, 2, &[(&mid, &[0.0, 1.0])], 2_000).unwrap();
         c.put_at("m", REV, 2, &[(&new, &[1.0, 1.0])], 3_000).unwrap();
-        assert_eq!(c.get_at("m", REV, 2, &[&old], None, 4_000).0.len(), 1);
+        assert_eq!(c.get_at("m", REV, 2, &[&old], None, 4_000).len(), 1);
         let header = Layout::new("m", REV, 2).header().len() as u64;
         let rec = Layout::new("m", REV, 2).record_len() as u64;
         let pruned = c.prune(2 * rec + 3 * header).unwrap();
@@ -850,26 +848,21 @@ mod tests {
     }
 
     #[test]
-    fn a_bounded_lookup_reads_its_fullest_shards_and_says_it_left_the_rest() {
+    fn a_bounded_lookup_reads_its_fullest_shards_first() {
         let (_d, c) = cache();
         // Shard 3 holds two of the wanted rows, shards 1, 2 and 4 one each.
         let rows: Vec<String> = [(1, 0), (2, 1), (3, 2), (3, 3), (4, 4)].iter().map(|&(s, n)| hash(s, n)).collect();
         let pairs: Vec<(&str, &[f32])> = rows.iter().map(|h| (h.as_str(), &[1.0f32, 0.0][..])).collect();
         c.put("m", REV, 2, &pairs).unwrap();
         let wanted: Vec<&str> = rows.iter().map(String::as_str).collect();
-        let (found, cut) = c.get_within("m", REV, 2, &wanted, 2);
-        assert!(cut, "four shards are past a bound of two");
+        let found = c.get_within("m", REV, 2, &wanted, 2);
         let mut got: Vec<&str> = found.keys().map(String::as_str).collect();
         got.sort();
         let mut first = vec![rows[2].as_str(), rows[3].as_str(), rows[0].as_str()];
         first.sort();
         assert_eq!(got, first, "the shard holding the most wanted rows is read first, then the lowest named");
-        assert_eq!(c.get_within("m", REV, 2, &wanted, 4), (c.get("m", REV, 2, &wanted), false));
-        assert_eq!(c.get_within("m", REV, 2, &wanted, 4).0.len(), 5);
-        let (absent, unseen) = (hash(9, 9), hash(10, 10));
-        assert!(!c.get_within("m", REV, 2, &[&absent, &unseen, &rows[0]], 1).1,
-            "a shard left unread that does not exist held nothing to miss");
-        assert_eq!(c.get_within("other", REV, 2, &wanted, 1), (HashMap::new(), false), "nor does a model with no directory");
+        assert_eq!(c.get_within("m", REV, 2, &wanted, 4), c.get("m", REV, 2, &wanted));
+        assert_eq!(c.get_within("m", REV, 2, &wanted, 4).len(), 5);
     }
 
     #[test]
@@ -890,6 +883,21 @@ mod tests {
         let p = c.prune(u64::MAX).unwrap();
         assert_eq!((p.evicted, p.repeated, p.older), (0, 1, 0), "under the cap only the repeat goes");
         assert_eq!(c.get("m", REV, 2, &[&h]).len(), 1);
+    }
+
+    #[test]
+    fn a_key_whose_held_record_is_corrupt_is_stored_again_and_read() {
+        let (_d, c) = cache();
+        let h = hash(8, 1);
+        c.put("m", REV, 2, &[(&h, &[1.0, 0.0])]).unwrap();
+        let path = shard_file(&c, "m", 2, 8);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xff;
+        std::fs::write(&path, bytes).unwrap();
+        assert!(c.get("m", REV, 2, &[&h]).is_empty(), "a record that fails its check is never returned");
+        c.put("m", REV, 2, &[(&h, &[0.0, 1.0])]).unwrap();
+        assert_eq!(c.get("m", REV, 2, &[&h])[&h], vec![0.0, 1.0], "the record appended after it is");
     }
 
     /// A shard as format 1 wrote it: no revision in the header, in a directory without a suffix.
