@@ -17,7 +17,7 @@ const WIN = process.platform === 'win32';
 
 /** A checkout that ships a zerograph where a local install puts one, and one on the machine. */
 function world() {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-mcp-test-')));
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'zerograph-mcp-test-')));
   const checkout = join(base, 'checkout');
   mkdirSync(join(checkout, '.git'), { recursive: true });
   mkdirSync(join(checkout, 'packages', 'app'), { recursive: true });
@@ -96,7 +96,7 @@ test('the server is told the checkout around the project, not a package inside i
 });
 
 test('outside git the repository is the nearest directory above holding a store, else the project', () => {
-  const base = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-mcp-test-')));
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'zerograph-mcp-test-')));
   const project = join(base, 'repo', 'packages', 'app');
   mkdirSync(project, { recursive: true });
   assert.strictEqual(checkoutOf(project), project);
@@ -176,13 +176,13 @@ test('a checkout that is the home directory, or above it, cuts nothing from PATH
 });
 
 test('PATH is the only PATH on POSIX, and any case of it on Windows', () => {
-  const w = world();
   assert.strictEqual(pathKey({ Path: 'x', PATH: 'y' }, false), 'PATH');
   assert.strictEqual(pathKey({ Path: 'x' }, false), 'PATH');
   assert.strictEqual(pathKey({ Path: 'x' }, true), 'Path');
-  const env = childEnv({ Path: join(w.checkout, 'bin'), PATH: w.machine }, w.checkout, false);
-  assert.strictEqual(env.PATH, w.machine);
-  assert.strictEqual(env.Path, join(w.checkout, 'bin'), 'another variable, left as it is');
+  // POSIX spellings: the case is played on any host, and a drive letter's colon would split.
+  const env = childEnv({ Path: '/src/app/bin', PATH: '/src/app/bin:/usr/bin' }, '/src/app', false, {}, '/home/me');
+  assert.strictEqual(env.PATH, '/usr/bin');
+  assert.strictEqual(env.Path, '/src/app/bin', 'another variable, left as it is');
 });
 
 test('a quoted Windows PATH entry is judged without its quotes and kept as written', () => {
