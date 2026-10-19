@@ -1322,7 +1322,7 @@ mod tests {
         let r = retire_repo_install(dir.path(), Target::Claude, OLD);
         for rel in [".claude/settings.json", "CLAUDE.md"] {
             assert!(dir.path().join(rel).exists(), "{rel}: {r:?}");
-            assert!(r.committed.iter().any(|p| p.ends_with(rel)), "{rel}: {r:?}");
+            assert!(r.committed.iter().any(|p| Path::new(p).ends_with(rel)), "{rel}: {r:?}");
         }
         assert!(dir.path().join(".claude/hooks/zerograph-hook.mjs").exists(), "the entries kept in settings still run it: {r:?}");
         assert!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap().contains(BEGIN), "a tracked file is not rewritten either");
