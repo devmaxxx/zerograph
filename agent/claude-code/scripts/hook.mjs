@@ -461,6 +461,40 @@ function fileRisk(r, file, root, sessionKey) {
   return `zerograph changes: risk ${risk} — ${n} direct callers of ${called} in ${files} files; \`${COMMAND} changes --depth 1\` lists them.`;
 }
 
+const EXACT = /^\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+const isExact = (v) => typeof v === 'string' && EXACT.test(v);
+
+/**
+ * A newer release the CLI's daily check left in `~/.cache/zerograph/update.json` for the binary
+ * this hook runs, as a line for the brief and a message for the person, or null. Never fetched:
+ * the hook has no budget for the registry. The binary is asked its version, once and only when the
+ * file names a newer release at all, since an upgrade made by hand leaves the old entry in place.
+ */
+function updateNotice(root) {
+  if ('NO_UPDATE_NOTIFIER' in process.env || env('NO_UPDATE_CHECK') !== undefined) return null;
+  let versions;
+  try { versions = JSON.parse(readFileSync(join(homedir(), '.cache', 'zerograph', 'update.json'), 'utf8')).versions; } catch { return null; }
+  if (!versions || typeof versions !== 'object' || !Object.values(versions).some((e) => isExact(e?.latest))) return null;
+  const current = run(root, ['--version']).trim().match(/^zerograph (\S+)$/)?.[1];
+  const entry = isExact(current) && Object.hasOwn(versions, current) ? versions[current] : null;
+  const latest = entry?.checked ? entry.latest : null;
+  if (!isExact(latest) || !newer(latest, current)) return null;
+  const npm = `npm i -g zerograph@${latest}`;
+  const pnpm = `pnpm add -g zerograph@${latest}`;
+  return {
+    brief: `zerograph: ${latest} is out and this is ${current}; \`${npm}\` or \`${pnpm}\`.`,
+    message: `▲ zerograph ${latest} available (you have ${current})\n  ${npm} · ${pnpm}`,
+  };
+}
+
+/** Whether `a` is a later release than `b`: by the three numbers, then a release over its pre-release. */
+function newer(a, b) {
+  const split = (v) => { const [core, pre] = v.split('+')[0].split(/-(.*)/s); return [core.split('.').map(Number), pre]; };
+  const [[x, xp], [y, yp]] = [split(a), split(b)];
+  for (let i = 0; i < 3; i += 1) if (x[i] !== y[i]) return x[i] > y[i];
+  return yp !== undefined && xp === undefined;
+}
+
 function brief(root) {
   const text = run(root, ['prime']);
   return text ? text.trimEnd() : null;
@@ -522,10 +556,16 @@ function bootstrap(cwd) {
 
 const handlers = {
   SessionStart: (p, root) => {
-    if (!built(root)) return bootstrap(p.cwd || root);
-    // The resident serve catches the store up as it starts; without one, a detached update does.
-    if (!autostartServe(root)) startUpdate(root);
-    return brief(root);
+    let text;
+    if (!built(root)) text = bootstrap(p.cwd || root);
+    else {
+      // The resident serve catches the store up as it starts; without one, a detached update does.
+      if (!autostartServe(root)) startUpdate(root);
+      text = brief(root);
+    }
+    const update = updateNotice(root);
+    if (!update) return text;
+    return { additionalContext: [text, update.brief].filter(Boolean).join('\n'), systemMessage: update.message };
   },
   SubagentStart: (p, root) => (built(root) ? rule() : null),
   PreToolUse: (p, root, key) => {
@@ -628,11 +668,11 @@ async function main({ harness = process.argv.includes('--codex') ? 'codex' : 'cl
   let out;
   try { out = handler(payload, root, sessionKey); } catch (e) { debug('handler', e); return; }
   if (!out) return;
-  const body = typeof out === 'string'
-    ? { hookEventName: event, additionalContext: out }
-    : { hookEventName: event, ...out };
+  // `systemMessage` is a top-level field Claude Code shows the person; Codex is given only context.
+  const { systemMessage, ...rest } = typeof out === 'string' ? { additionalContext: out } : out;
+  const shown = harness === 'claude' && systemMessage ? { systemMessage } : {};
   // Written without process.exit: on Windows the pipe may still be draining when exit would cut it.
-  process.stdout.write(JSON.stringify({ hookSpecificOutput: body }));
+  process.stdout.write(JSON.stringify({ ...shown, hookSpecificOutput: { hookEventName: event, ...rest } }));
 }
 
 // Importable for the tests, which exercise the pure parts directly; only the real run reads stdin.

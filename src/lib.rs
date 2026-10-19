@@ -25,6 +25,7 @@ mod status;
 mod store;
 mod text;
 mod walk;
+mod update;
 
 // What a code resolver is built from, so `tests/` can build one over files of its own.
 pub use config::Config;
@@ -1111,7 +1112,9 @@ impl std::error::Error for Verdict {}
 pub fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
     let json = cli.cmd.json();
-    let Err(e) = run(cli) else { return std::process::ExitCode::SUCCESS };
+    let result = run(cli);
+    // Last of all, as update-notifier prints at exit.
+    let Err(e) = result else { update::print(); return std::process::ExitCode::SUCCESS };
     let verdict = e.downcast_ref::<Verdict>();
     let code: u8 = if verdict.is_some() { 3 } else { 1 };
     // A caller that asked for JSON parses stdout, and an empty stdout told it nothing.
@@ -1124,6 +1127,7 @@ pub fn main() -> std::process::ExitCode {
         // anyhow report with its context chain, which several transcripts are read for.
         eprintln!("{}", terminal_safe(&format!("Error: {e:?}")));
     }
+    update::print();
     std::process::ExitCode::from(code)
 }
 
@@ -1140,6 +1144,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
         Some(repo) => plain(repo.canonicalize()?),
         None => repo_root(&std::env::current_dir()?.canonicalize()?),
     };
+    update::start(matches!(cli.cmd, Cmd::Mcp | Cmd::Serve { .. } | Cmd::Status { .. }), cli.cmd.json());
     // Loaded per command: `bench` reads its own from `ZEROGRAPH_BENCH_REPO`, and `explain`/`verify`
     // must not fail on a broken `zerograph.toml` they never read. `embed` does read it — the model
     // the vectors are written with lives there — so it fails on a broken one like the other writers.
