@@ -210,9 +210,13 @@ fn serve(dir: &std::path::Path, extra: &[&str]) -> Server {
 /// The answer once a server is the one giving it. A socket file that exists says a `serve` has
 /// bound; only a reply says it is listening, so this asks until one comes rather than sleeping.
 fn ask_until_resident(dir: &std::path::Path, words: &[&str]) -> (String, String) {
+    ask_until_resident_with(dir, &[], words)
+}
+
+fn ask_until_resident_with(dir: &std::path::Path, extra: &[&str], words: &[&str]) -> (String, String) {
     let start = Instant::now();
     loop {
-        let (out, err) = ask(dir, &[], words);
+        let (out, err) = ask(dir, extra, words);
         if err.contains("serve: answered by the resident process") { return (out, err); }
         assert!(start.elapsed() < Duration::from_secs(20), "serve never answered over the socket: {err}");
         std::thread::sleep(Duration::from_millis(50));
@@ -261,13 +265,7 @@ fn a_server_catches_up_with_the_tree_at_start_rather_than_at_its_first_poll() {
     wait_for_socket(dir.path());
     // `--stale` skips the refresh before the answer, so only the start-up catch-up can have
     // brought the new document in.
-    let start = Instant::now();
-    let (after, err) = loop {
-        let (out, err) = ask(dir.path(), &["--stale"], &["возврат", "аванса"]);
-        if err.contains("serve: answered by the resident process") { break (out, err); }
-        assert!(start.elapsed() < Duration::from_secs(20), "serve never answered over the socket: {err}");
-        std::thread::sleep(Duration::from_millis(50));
-    };
+    let (after, err) = ask_until_resident_with(dir.path(), &["--stale"], &["возврат", "аванса"]);
     assert!(after.contains("FR-PAY-2"), "the server refreshed on start: {after}\n{err}");
     server.kill().unwrap();
     let _ = server.wait();
@@ -709,6 +707,15 @@ fn a_detached_server_answers_after_the_command_returns_and_stop_ends_it() {
 /// confirmation, then the socket file gone with its exit. The first line it is sent comes back
 /// on the channel.
 fn serve_0_6_4(dir: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
+    let (release, sent) = serve_0_6_4_held(dir);
+    release.send(()).unwrap();
+    sent
+}
+
+/// The same server, confirming the stop only once the test says so — a 0.6.4 server finishing a
+/// rerank before it reads the line, made to last as long as the test needs on every platform.
+fn serve_0_6_4_held(dir: &std::path::Path) -> (std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<String>) {
+    let (release, held) = std::sync::mpsc::channel::<()>();
     let sock = dir.join(".zerograph/serve.sock");
     assert!(sock.as_os_str().len() <= 100, "0.6.4 would have bound {} under the temp directory", sock.display());
     let listener = transport::bind(&sock);
@@ -719,6 +726,7 @@ fn serve_0_6_4(dir: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
         let _ = writeln!(w, "{{\"ack\":\"0.6.4\"}}");
         let mut line = String::new();
         let _ = BufReader::new(&s).read_line(&mut line);
+        let _ = held.recv();
         let _ = writeln!(w, "{{\"stopped\":\"0.6.4\"}}");
         // The exit takes a moment after the confirmation, as a real one does, so `stop` has to
         // wait for the file rather than find it already gone.
@@ -726,7 +734,7 @@ fn serve_0_6_4(dir: &std::path::Path) -> std::sync::mpsc::Receiver<String> {
         let _ = std::fs::remove_file(&sock);
         let _ = tx.send(line);
     });
-    rx
+    (release, rx)
 }
 
 #[test]
@@ -750,4 +758,26 @@ fn serve_stops_a_0_6_4_server_of_its_checkout_before_it_binds() {
     let _server = serve(dir.path(), &["--every", "3600", "--idle", "60"]);
     assert_eq!(sent.recv_timeout(Duration::from_secs(20)).expect("serve never sent the old server the stop line").trim(), r#"{"stop":true}"#);
     ask_until_resident(dir.path(), &["штраф"]);
+}
+
+/// The catch-up at start waits for the old server rather than being skipped for it: with an hour
+/// between polls nothing else would bring a document written before start into a `--stale` answer.
+#[test]
+fn a_server_catches_up_with_the_tree_once_a_slow_0_6_4_server_has_stopped() {
+    let dir = repo_with_docs();
+    std::fs::write(dir.path().join("docs/new.md"), "**FR-PAY-2 · MUST · Возврат аванса**\n\nАванс возвращается при отмене салоном.\n").unwrap();
+    let (release, sent) = serve_0_6_4_held(dir.path());
+    let _server = serve(dir.path(), &["--every", "3600", "--idle", "60"]);
+    // A resident answer means the start-up is behind it, with the old server still holding.
+    let (before, err) = ask_until_resident_with(dir.path(), &["--stale"], &["возврат", "аванса"]);
+    assert!(!before.contains("FR-PAY-2"), "the server wrote while the old one was still up: {before}\n{err}");
+    release.send(()).unwrap();
+    assert_eq!(sent.recv_timeout(Duration::from_secs(20)).expect("the old server was never sent the stop line").trim(), r#"{"stop":true}"#);
+    let start = Instant::now();
+    loop {
+        let (after, err) = ask_until_resident_with(dir.path(), &["--stale"], &["возврат", "аванса"]);
+        if after.contains("FR-PAY-2") { break; }
+        assert!(start.elapsed() < Duration::from_secs(20), "the server never caught up once the old one stopped: {after}\n{err}");
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }

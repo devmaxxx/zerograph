@@ -573,12 +573,20 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
     // within seconds: waiting `--every` for the first poll handed that question everything a pull
     // changed — 1469 vectors, 17 s on beauty-crm. Catching up now spends the same time before
     // anyone has asked.
-    if legacy.gone() { adopt_if_moved(&mut watcher, &mut ctx, batch)?; }
+    // A 0.6.4 server still being stopped holds the catch-up back rather than cancelling it: with
+    // a long `--every` no poll would come to make up for it, and a `--stale` question would be
+    // answered from the tree as it stood before this process started.
+    let mut behind = true;
+    catch_up_once_gone(&mut behind, &mut legacy, &mut watcher, &mut ctx, batch)?;
     log(&mut ctx);
     eprintln!("serve: {} every {every}s, batch {batch}, idle {idle}s, model idle {idle_model}s; Ctrl-C stops", path.display());
     let (mut last_poll, mut last_request) = (Instant::now(), Instant::now());
     loop {
-        match rx.recv_timeout(WAKE) {
+        let received = rx.recv_timeout(WAKE);
+        // Ahead of the answer, so the first question after the old server leaves is not one
+        // asked of the tree before the catch-up.
+        catch_up_once_gone(&mut behind, &mut legacy, &mut watcher, &mut ctx, batch)?;
+        match received {
             // Only a question that arrived counts against `--idle`. A bare connect and close is
             // a liveness probe — another `serve` deciding whether to bind, a client that gave
             // up — and treating one as a request keeps this process resident, holding 1.3 GB,
@@ -655,6 +663,14 @@ fn catch_termination() {}
 /// Notices no client asked for, on the server's stderr.
 fn log(ctx: &mut ask::Context) {
     for n in ctx.notices() { eprintln!("{}", crate::terminal_safe(&format!("serve: {n}"))); }
+}
+
+fn catch_up_once_gone(behind: &mut bool, legacy: &mut Legacy, watcher: &mut crate::Watcher, ctx: &mut ask::Context, batch: usize) -> Result<()> {
+    if *behind && legacy.gone() {
+        adopt_if_moved(watcher, ctx, batch)?;
+        *behind = false;
+    }
+    Ok(())
 }
 
 /// The poll `ask` does before it answers, and the one case the poll's own answer does not
