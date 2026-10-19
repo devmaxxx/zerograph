@@ -1,0 +1,7 @@
+{
+  "hooks": {
+    "SessionStart": [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"", "commandWindows": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'scripts','hook.mjs')).href).then(m=>m.main())\"", "timeout": 10 }] }],
+    "SubagentStart": [{ "hooks": [{ "type": "command", "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"", "commandWindows": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'scripts','hook.mjs')).href).then(m=>m.main())\"", "timeout": 5 }] }],
+    "PostToolUse": [{ "matcher": "apply_patch|Edit|Write", "hooks": [{ "type": "command", "command": "node \"${PLUGIN_ROOT}/scripts/hook.mjs\"", "commandWindows": "node -e \"import(require('url').pathToFileURL(require('path').join(process.env.PLUGIN_ROOT,'scripts','hook.mjs')).href).then(m=>m.main())\"", "timeout": 10 }] }]
+  }
+}

@@ -86,7 +86,7 @@ jobs:
         uses: actions/setup-node@v4
         with: { node-version: '20' }
       - if: ${{ !cancelled() }}
-        run: node --test agent/hook.test.mjs agent/claude-code/scripts/mcp.test.mjs npm/zerograph/test/launcher.test.js
+        run: node --test agent/claude-code/scripts/hook.test.mjs agent/claude-code/scripts/mcp.test.mjs agent/codex/plugin.test.mjs npm/zerograph/test/launcher.test.js
 
       # A default Git for Windows install puts `git` on PATH and not `sh` — the Unix tools are an
       # opt-in — so `ask --rerank` looks for one. Route 1: Git's shell directories

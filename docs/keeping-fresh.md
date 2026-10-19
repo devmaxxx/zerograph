@@ -128,17 +128,21 @@ worktree) and of a block a hook manager rewrote away. A re-run of `install-agent
 `# zerograph:begin` … `# zerograph:end` block an earlier release wrote into `post-merge` and
 `post-checkout`, leaves the rest of each hook as it is, and deletes a hook that held nothing else.
 
-The agent's session hook does that job per checkout instead. At SessionStart:
+The agent's session hook does that job per checkout instead. It ships in the
+[Claude Code plugin](install.md#claude-code-plugin) and the [Codex plugin](install.md#codex-plugin)
+as `scripts/hook.mjs`. At SessionStart:
 
 - **No index in this checkout** — a new worktree, typically — and the checkout asked for one (it
-  holds the hook `install-agent` writes, or a `zerograph.toml`, or its main worktree does): it starts `update --detach` at the
-  checkout's root and says in one line that a build is running. A checkout that asked for nothing
-  stays silent, which matters for Codex, whose one hook runs in every repository.
+  holds a `zerograph.toml` or the hook an earlier `install-agent` wrote, or its main worktree does
+  or has an index): it starts `update --detach` at the checkout's root and says in one line that a
+  build is running. A checkout that asked for nothing stays silent, which matters because a
+  plugin's hook runs in every repository a session opens.
 - **An index** — it starts the resident `serve`, which catches the store up as it starts; with
   `ZEROGRAPH_HOOK_SERVE=0` it starts `update --detach` instead, which writes nothing when nothing
   moved.
 
-The hook runs the binary `ZEROGRAPH_BIN` names, else the `zerograph` on `PATH`, and never one
+The hook runs the binary `ZEROGRAPH_BIN` names, else the Claude Code plugin's `binary` option,
+else the `zerograph` on `PATH`, and never one
 inside the checkout: a cloned repository that commits a `zerograph.toml` and an executable
 `node_modules/.bin/zerograph` would otherwise have that file started as soon as a session opened
 in it. A project-local install (`pnpm add -D zerograph`) puts no `zerograph` on `PATH`, so set

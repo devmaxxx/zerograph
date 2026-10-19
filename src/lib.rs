@@ -153,13 +153,13 @@ enum Cmd {
     Verify {
         #[arg(long)] json: bool,
     },
-    /// Writes the agent-facing surface into this repository: one hook dispatched on four events, a
-    /// skill, a subagent definition and a ten-line stanza in the instructions file. Idempotent —
-    /// a second run rewrites the same bytes and says it changed nothing.
+    /// Wires a coding agent to this repository's index. Claude Code and Codex get the zerograph
+    /// plugin through their own `plugin` commands, and an older install's files are taken out once
+    /// it is in; the editors get an MCP entry and the stanza. Idempotent.
     InstallAgent {
-        /// Claude Code's `.claude/`.
+        /// Claude Code: the zerograph plugin, through `claude plugin install`.
         #[arg(long)] claude: bool,
-        /// Codex's `.codex/`.
+        /// Codex: the zerograph plugin, through `codex plugin add`.
         #[arg(long)] codex: bool,
         /// Cursor: `.cursor/mcp.json` and an always-on rule.
         #[arg(long)] cursor: bool,
@@ -169,8 +169,11 @@ enum Cmd {
         #[arg(long)] gemini: bool,
         /// opencode: `opencode.json` and `AGENTS.md`.
         #[arg(long)] opencode: bool,
-        /// How this repository invokes the binary, in every file the install writes.
+        /// How this repository invokes the binary, in the editors' MCP entries and stanzas.
         #[arg(long, default_value = "zerograph")] command: String,
+        /// With --claude or --codex: also take out the older install's files that git tracks. Left
+        /// by default, since they serve every teammate who has no plugin yet.
+        #[arg(long)] retire_repo: bool,
     },
     /// What a coding agent should be told about this repository at the start of a session: node
     /// counts, which embedder the vectors belong to, how many families the documents define, and the five commands. Reads the store; never refreshes.
@@ -1290,7 +1293,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             if graph.nodes.is_empty() { anyhow::bail!("graph is empty — run `zerograph build`"); }
             Ok(())
         }
-        Cmd::InstallAgent { claude, codex, cursor, copilot, gemini, opencode, command } => {
+        Cmd::InstallAgent { claude, codex, cursor, copilot, gemini, opencode, command, retire_repo } => {
             use install_agent::Editor;
             let editors: Vec<Editor> = [(cursor, Editor::Cursor), (copilot, Editor::Copilot), (gemini, Editor::Gemini), (opencode, Editor::Opencode)]
                 .into_iter().filter(|(on, _)| *on).map(|(_, e)| e).collect();
@@ -1299,13 +1302,13 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             }
             let targets: Vec<install_agent::Target> = match (claude, codex) {
                 (false, false) => Vec::new(),
-                // Codex first: its stanza goes into the root `AGENTS.md`, which a `CLAUDE.md` link
-                // usually points at, so the Claude pass finds nothing left to write through the link.
+                // Codex first: it takes the stanza out of the root `AGENTS.md`, which a `CLAUDE.md`
+                // link usually points at, so the Claude pass finds nothing left behind the link.
                 (c, x) => [(x, install_agent::Target::Codex), (c, install_agent::Target::Claude)]
                     .into_iter().filter(|(on, _)| *on).map(|(_, t)| t).collect(),
             };
-            // Editors first: opencode writes the root `AGENTS.md`, which a `CLAUDE.md` link usually
-            // points at, so the Claude pass below finds it written rather than a link to refuse.
+            // Editors first: opencode reads the stanza in the root `AGENTS.md`, and the Codex pass
+            // leaves it there once opencode's entry is written.
             for editor in editors {
                 let r = install_agent::install_editor(&repo, editor, &command)?;
                 match r.written {
@@ -1315,39 +1318,51 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 for note in &r.notes { println!("{editor:?}: {note}"); }
             }
             for target in targets {
-                let r = install_agent::install(&repo, target, &command)?;
-                match r.written {
-                    0 => println!("{target:?}: already installed, nothing written"),
-                    n => println!("{target:?}: wrote {n} files\n  {}", r.paths.join("\n  ")),
-                }
-                for note in &r.notes { println!("{target:?}: {note}"); }
-                // Per checkout: a local-scope server is keyed by the project's path, so a session in
-                // a worktree sees only what was registered for that worktree.
-                if target == install_agent::Target::Claude {
-                    let registered = install_agent::register_mcp_everywhere(&repo, &command, &install_agent::run_claude);
-                    for (checkout, m) in &registered {
-                        let at = match registered.len() { 1 => String::new(), _ => format!(" for {}", checkout.display()) };
-                        for path in &m.paths { println!("Claude: registered the MCP server{at}\n  {path}"); }
-                        for note in &m.notes { println!("Claude: {note}{at}"); }
-                    }
-                    if let Some(config) = install_agent::claude_config() {
-                        for note in &install_agent::prune_stale_mcp(&config).notes { println!("Claude: {note}"); }
-                    }
-                }
-                // Codex reads its hooks from `~/.codex/hooks.json`, which is the machine's and not
-                // this repository's. Printed for a person to paste; see `agent/codex.md`.
+                let name = format!("{target:?}");
+                let (installed, r) = install_agent::install_plugin(&repo, target, &install_agent::run_cli);
+                for note in &r.notes { println!("{name}: {note}"); }
+                // An older install is the only thing serving sessions until the plugin is in.
+                if !installed { continue; }
+                let mut retire = install_agent::Retire { committed: retire_repo, machine_hooks_gone: true };
+                let mut retired = Vec::new();
+                // Hook entries before the script they run: an entry left pointing at a removed
+                // script fails on every event it matches.
                 if target == install_agent::Target::Codex {
-                    let (hook, r) = install_agent::codex_hook(&repo, &command)?;
-                    for note in &r.notes { println!("Codex: {note}"); }
-                    println!("\nTo run the hook on this machine, add to ~/.codex/hooks.json \
-                              (merging with what is already there):\n{}\n\
-                              Codex trusts a hook by hash: the first session after this is added \
-                              asks once, and editing the script later asks again. The path is the \
-                              main worktree's copy, which stays when a linked worktree is removed. \
-                              The hook reads each session's own working directory and stays silent \
-                              where no index was asked for, so one copy serves every repository.",
-                             install_agent::codex_hooks_block(&hook.display().to_string()));
+                    if let Some(home) = install_agent::codex_home() {
+                        let (gone, r) = install_agent::retire_codex_hooks(&home);
+                        retire.machine_hooks_gone = gone;
+                        retired.push(r);
+                    }
                 }
+                retired.push(install_agent::retire_repo_install(&repo, target, retire));
+                match target {
+                    install_agent::Target::Claude => if let Some(config) = install_agent::claude_config() {
+                        retired.push(install_agent::prune_mcp(&config, &install_agent::worktrees(&repo)));
+                    },
+                    // An earlier release wrote the Codex hook into the main worktree, for the
+                    // machine's hooks file to point at.
+                    install_agent::Target::Codex => if let Some(main) = install_agent::main_worktree(&repo) {
+                        let mut r = install_agent::Report::default();
+                        install_agent::retire_hook_script(&main.join(".codex").join("hooks"), retire.machine_hooks_gone, retire, &mut r);
+                        retired.push(r);
+                    },
+                }
+                for r in &retired { for note in &r.notes { println!("{name}: {note}"); } }
+                let committed: Vec<&String> = retired.iter().flat_map(|r| &r.committed).collect();
+                if !committed.is_empty() {
+                    let flag = match target { install_agent::Target::Claude => "--claude", install_agent::Target::Codex => "--codex" };
+                    println!("{name}: left what an earlier release wrote that git tracks, for teammates without the plugin: {}; \
+                              once every teammate has it, `zerograph install-agent {flag} --retire-repo` takes them out",
+                             committed.iter().map(|p| p.as_str()).collect::<Vec<_>>().join(", "));
+                }
+                if command != "zerograph" {
+                    println!("{name}: the plugin's hints name `zerograph`, and it starts the one on PATH outside the checkout; \
+                              `--command` reaches only the editors' files. A binary elsewhere is named by its absolute path \
+                              in ZEROGRAPH_BIN{}.", match target { install_agent::Target::Claude => " or `/plugin configure zerograph@zerograph`", install_agent::Target::Codex => "" });
+                }
+            }
+            if !repo.join(".zerograph").join("manifest.json").exists() {
+                println!("This repository has no index yet: `zerograph build` writes one, and from then on the session hook builds every new worktree of it in the background.");
             }
             // Once whatever the harnesses: an earlier release wrote these, and nothing writes them now.
             for note in &install_agent::retire_git_hooks(&repo).notes { println!("git: {note}"); }

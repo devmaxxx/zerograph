@@ -64,23 +64,54 @@ editing the hook script later invalidates the hash, which is a feature and not a
 
 **Nothing here writes that file.** It is machine-level: an entry added from inside one repository
 would fire in every other repository on the machine, which is not a side effect a `--repo` command
-gets to have. `install-agent --codex` therefore installs the repository-scoped half — the stanza and
-the skill — copies the hook script into `.codex/hooks/` so there is something to point at, and
-prints the JSON to add to `~/.codex/hooks.json`, for the reader to paste once if they want it. The
-path it prints is the main worktree's copy (the first entry of `git worktree list --porcelain`),
-written there when the install runs in a linked worktree and the main one has none, so removing a
-worktree does not leave every Codex session pointing at a missing file.
+gets to have. Releases before 0.7.0 copied the hook script into `.codex/hooks/` and printed the
+JSON to paste; since 0.7.0 the hooks ship in the plugin (below), and `install-agent --codex` takes
+a pasted zerograph entry back out of `$CODEX_HOME/hooks.json`, since the plugin's would fire
+beside it.
 
 Max, 2026-09-07: Codex gets the brief, the skill and the risk line, and **not** the Bash
-interceptor — its verdict is being read on Claude Code and is not carried over blind. The printed
-JSON reflects that: three events, no `PreToolUse`.
+interceptor — its verdict is being read on Claude Code and is not carried over blind. The plugin's
+hooks reflect that: three events, no `PreToolUse`.
+
+## The plugin: `agent/codex/`
+
+Established on 0.154.0 with a scratch `CODEX_HOME` and a local marketplace, no model call:
+
+- A plugin is a directory with `.codex-plugin/plugin.json`, which names `skills`, `mcpServers` and
+  `hooks` by relative path. A repository's `.agents/plugins/marketplace.json` lists it, and Codex
+  prefers that file to `.claude-plugin/marketplace.json` in the same repository.
+  `codex plugin marketplace add <source> [--ref <tag>]` and `codex plugin add zerograph@zerograph`
+  are both idempotent, exit 0 on a repeat, and copy the plugin to
+  `$CODEX_HOME/plugins/cache/zerograph/zerograph/<version>/`.
+- Hook commands run through a shell with `PLUGIN_ROOT` (and `CLAUDE_PLUGIN_ROOT`) set, in the
+  session's project directory, with the payload's `cwd` naming it too. A `PostToolUse` matcher of
+  `apply_patch|Edit|Write` is honoured; `apply_patch` is Codex's edit tool.
+- An MCP server's `args` are passed as written — no `${PLUGIN_ROOT}` is substituted — and its
+  environment is scrubbed down to Codex's defaults (`HOME`, `LANG`, `LC_ALL`, `LOGNAME`, `PATH`,
+  `SHELL`, `TERM`, `TMPDIR`, `USER` on macOS) and what `env_vars` names. With no `cwd` it starts in
+  the project. `command` takes only a bare name or a `./` path, and `cwd` only a `./` path — which
+  resolves to the plugin root, losing the project — so `${PLUGIN_ROOT}` reaches the server nowhere.
+  `.mcp.json` therefore runs `node -e` with a bootstrap that imports `scripts/mcp.mjs` from the
+  newest version directory under `$CODEX_HOME/plugins/cache/zerograph/zerograph/`.
+- `codex plugin marketplace add` with a different `--ref` than the configured one fails ("already
+  added from a different source"); `marketplace remove` then `add` repins it and keeps the plugin
+  enabled, and `codex plugin add` replaces the old version directory with the new one.
+- Hook handlers take a `commandWindows` override, used on Windows instead of `command`.
+- A skill's `agents/openai.yaml` with `policy.allow_implicit_invocation: false` keeps it out of the
+  model's own choices, so the commands run only when named, as `$zerograph:<name>`.
+
+The scripts are copies of `agent/claude-code/scripts/` — a plugin is installed as one directory and
+cannot import from a sibling, and a symlink out of it would be a text file in a Windows checkout
+without `core.symlinks` — and `plugin.test.mjs` fails when they differ;
+`scripts/sync-plugin-scripts.sh` copies them over.
 
 ## Skills: `.codex/skills/<name>/SKILL.md`
 
 Confirmed by running it: a scratch repository carrying `.codex/skills/probe-codex/SKILL.md` and
 `.agents/skills/probe-agents/SKILL.md` had **both** listed under *Available skills* in
 `codex debug prompt-input`'s output, with the roots table naming each directory. So
-`.codex/skills/zerograph/SKILL.md` is read, which is where the installer puts it; `.agents/skills`
+`.codex/skills/zerograph/SKILL.md` is read, which is where releases before 0.7.0 put the skill and
+where `install-agent --codex` now removes it from, the plugin's skills replacing it; `.agents/skills`
 is the other repository-scoped root, and is left alone because a repository that uses it has its own
 conventions there.
 

@@ -1,25 +1,32 @@
-//! `zerograph install-agent`: writes the agent-facing surface into a consuming repository, for
-//! Claude Code or for Codex, and an MCP entry and the stanza for Cursor, VS Code with Copilot,
-//! Gemini CLI and opencode. The texts are embedded with `include_str!` rather than copied from a
-//! checkout, so a binary and the surface it installs cannot disagree about what the tool can do.
+//! `zerograph install-agent`: wires a coding agent to this repository's index. Claude Code and
+//! Codex get the zerograph plugin, installed through their own `plugin` commands — the MCP server,
+//! the session hook, the commands and the skill all ship in it — and an older install's files in
+//! the repository are taken out once the plugin is in. Cursor, VS Code with Copilot, Gemini CLI and
+//! opencode, which have no plugin to carry them, get an MCP entry and the stanza.
 //!
 //! Idempotent by construction: a second run rewrites the same bytes and reports nothing written.
-//! The settings file is merged rather than replaced — a repository's own hooks survive, and this
-//! tool's entries are replaced by command match, which is what makes an upgrade a re-run.
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-const HOOK: &str = include_str!("../agent/hook.mjs");
-const RULE: &str = include_str!("../agent/rule.txt");
 const STANZA: &str = include_str!("../agent/stanza.md");
-const SKILL: &str = include_str!("../agent/skill/SKILL.md");
-/// The skill as 0.6.0–0.6.3 wrote it, under the name `repo-query`: what an upgrade may remove.
-const LEGACY_SKILL: &str = include_str!("../agent/skill/repo-query.md");
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const SCOUT: &str = include_str!("../agent/subagent.md");
 
-/// Where the surface is being installed. The two harnesses read different files for the same four
-/// jobs, and the only thing that differs between them is which path each job goes to.
+/// What an earlier release wrote into a repository for Claude Code and Codex, kept so a re-run can
+/// tell its own files from a team's before it takes them out.
+const LEGACY_RULE: &str = include_str!("../agent/legacy/rule.txt");
+const LEGACY_SKILL: &str = include_str!("../agent/legacy/skill.md");
+/// The skill as 0.6.0–0.6.3 wrote it, under the name `repo-query`.
+const LEGACY_REPO_QUERY: &str = include_str!("../agent/legacy/repo-query.md");
+const LEGACY_SCOUT: &str = include_str!("../agent/legacy/repo-scout.md");
+const LEGACY_HOOK: &str = "zerograph-hook.mjs";
+/// The hook script 0.6.0–0.6.4 wrote, one text across all five.
+const LEGACY_HOOK_TEXT: &str = include_str!("../agent/legacy/zerograph-hook.mjs");
+
+/// The repository both harnesses read the marketplace from, and the plugin's id in it.
+const MARKETPLACE: &str = "devmaxxx/zerograph";
+const PLUGIN: &str = "zerograph@zerograph";
+const MARKETPLACE_NAME: &str = "zerograph";
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Target { Claude, Codex }
 
@@ -28,47 +35,143 @@ impl Target {
         match self { Target::Claude => ".claude", Target::Codex => ".codex" }
     }
 
-    /// The file each harness reads for its always-on instructions. Codex reads the repository's
-    /// **root** `AGENTS.md` and has no `.codex/AGENTS.md` in its spec, so its stanza is written at
-    /// the root whether or not one is already there; Claude Code reads either, and a repository
-    /// that already keeps a root `CLAUDE.md` should not grow a second file beside it.
-    fn instructions(self) -> &'static str {
-        match self { Target::Claude => "CLAUDE.md", Target::Codex => "AGENTS.md" }
+    pub fn cli(self) -> &'static str {
+        match self { Target::Claude => "claude", Target::Codex => "codex" }
     }
 
-    /// Whether the harness reads a settings file inside the repository. Claude Code does
-    /// (`.claude/settings.json`); Codex's hooks are `CODEX_HOME`-relative — `"hooks":
-    /// "./hooks.json"` — so an entry added from inside one repository would fire in every other
-    /// repository on the machine. `agent/codex.md` records how both were read off the CLI.
-    fn hooks_are_repository_scoped(self) -> bool { self == Target::Claude }
+    /// The commands that install the plugin, or bring an installed one to this release, each safe
+    /// to repeat. Claude Code's marketplace pins the plugin to a release tag itself, so the catalog
+    /// is refreshed and the plugin updated to what it names now; an install alone leaves an older
+    /// release in place. Codex reads the plugin out of the marketplace's own checkout, so the
+    /// release is pinned on the marketplace, to the one this binary is.
+    fn plugin_steps(self) -> Vec<Vec<String>> {
+        let s = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+        match self {
+            Target::Claude => vec![
+                s(&["plugin", "marketplace", "add", MARKETPLACE]),
+                s(&["plugin", "marketplace", "update", MARKETPLACE_NAME]),
+                s(&["plugin", "install", PLUGIN]),
+                s(&["plugin", "update", PLUGIN]),
+            ],
+            Target::Codex => vec![
+                s(&["plugin", "marketplace", "add", MARKETPLACE, "--ref", &format!("v{VERSION}")]),
+                s(&["plugin", "add", PLUGIN]),
+            ],
+        }
+    }
+
+    /// What to run instead when `step` failed saying `said`. Codex refuses to re-add a marketplace
+    /// under another ref — which is every upgrade of the binary — until the old source is removed;
+    /// removing it keeps the plugin enabled, and the `plugin add` after it installs the new release.
+    fn recovery(self, step: &[String], said: &str) -> Option<Vec<Vec<String>>> {
+        let repinning = self == Target::Codex && step.get(1).is_some_and(|a| a == "marketplace")
+            && said.contains("already added from a different source");
+        repinning.then(|| vec![
+            ["plugin", "marketplace", "remove", MARKETPLACE_NAME].iter().map(|a| a.to_string()).collect(),
+            step.to_vec(),
+        ])
+    }
 }
 
 #[derive(Debug, Default)]
-pub struct Report { pub written: usize, pub paths: Vec<String>, pub notes: Vec<String> }
-
-/// A text with `{{command}}` resolved to how this repository invokes the binary — `zerograph`
-/// unless a caller says otherwise, `pnpm exec zerograph` in a workspace that installs it as a
-/// dependency. Every text that names a command carries it: a line naming the bare binary where
-/// PATH has none tells an agent to run something that is not there.
-fn with_command(template: &str, command: &str) -> String { template.replace("{{command}}", command) }
-
-/// The hook's one declaration of the command its hints name. Replaced whole rather than through
-/// `{{command}}`, because this text lands in JavaScript: a JSON string is a JavaScript string
-/// literal, so no quote, backslash or `${` in a command can end the literal or open an expression.
-/// The template declares the default, which is what lets the hook's own tests run it as it ships.
-const HOOK_COMMAND: &str = "const COMMAND = \"zerograph\";";
-
-fn hook(command: &str) -> String {
-    let script = HOOK.replacen(HOOK_COMMAND, &format!("const COMMAND = {};", serde_json::Value::from(command)), 1);
-    let (shebang, rest) = script.split_once('\n').unwrap();
-    format!("{shebang}\n{}{rest}", stamp())
+pub struct Report {
+    pub written: usize,
+    pub paths: Vec<String>,
+    pub notes: Vec<String>,
+    /// Files an earlier install wrote that git tracks, left for the team to retire.
+    pub committed: Vec<String>,
 }
 
-/// The line under the shebang records the matchers this release wrote, so a re-run can tell one it
-/// wrote (moved to the new default) from one a person changed (kept).
-fn stamp() -> String {
-    let wrote: Vec<String> = hook_entries("").iter().map(|(e, m, _)| format!("{e}={m}")).collect();
-    format!("// zerograph {} wrote: {}\n", env!("CARGO_PKG_VERSION"), wrote.join(" "))
+/// How far a retirement reaches.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct Retire {
+    /// Take out files git tracks too. Off by default: a committed hook or stanza serves every
+    /// teammate who has no plugin yet, and removing it here puts that removal in someone's commit.
+    pub committed: bool,
+    /// Whether the machine's hook entries that run a script in the repository are gone. Codex's
+    /// live in `$CODEX_HOME/hooks.json`, outside the repository, and a script they still run
+    /// stays.
+    pub machine_hooks_gone: bool,
+}
+
+/// Whether git tracks `path` in the checkout that holds it.
+fn tracked(path: &Path) -> bool {
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else { return false };
+    std::process::Command::new("git").arg("-C").arg(dir).args(["ls-files", "--error-unmatch", "--"]).arg(name)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null())
+        .status().is_ok_and(|s| s.success())
+}
+
+/// Whether `path` stays because git tracks it, recording it when so.
+fn keep_committed(path: &Path, retire: Retire, report: &mut Report) -> bool {
+    if retire.committed || !tracked(path) { return false; }
+    report.committed.push(path.display().to_string());
+    true
+}
+
+/// How a CLI is run: `program`, in `cwd`, with `args`; `None` when it is not installed. A test
+/// passes its own.
+pub type Run<'a> = &'a dyn Fn(&str, &Path, &[String]) -> Option<std::process::Output>;
+
+pub fn run_cli(program: &str, cwd: &Path, args: &[String]) -> Option<std::process::Output> {
+    command_for(program)?.args(args).current_dir(cwd).stdin(std::process::Stdio::null()).output().ok()
+}
+
+/// `program` as a command to start. On Windows `Command` finds only a `.exe` by a bare name, and
+/// npm installs `claude` and `codex` as `.cmd` shims, which only `cmd` starts; the arguments
+/// passed here are fixed words with nothing `cmd` would act on.
+fn command_for(program: &str) -> Option<std::process::Command> {
+    if !cfg!(windows) { return Some(std::process::Command::new(program)); }
+    let path = std::env::var_os("PATH")?;
+    for ext in ["exe", "cmd"] {
+        for dir in std::env::split_paths(&path).filter(|d| d.is_absolute()) {
+            let file = dir.join(format!("{program}.{ext}"));
+            if !file.is_file() { continue; }
+            if ext == "exe" { return Some(std::process::Command::new(file)); }
+            let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+            let mut cmd = std::process::Command::new(comspec);
+            cmd.args(["/d", "/c", "call"]).arg(file);
+            return Some(cmd);
+        }
+    }
+    None
+}
+
+/// Installs the plugin through the harness's own CLI, and says whether it is in. A missing CLI or
+/// a failed step is a note naming the commands to run by hand, not an error: the other targets
+/// and the git clean-up still run.
+pub fn install_plugin(root: &Path, target: Target, run: Run) -> (bool, Report) {
+    let mut report = Report::default();
+    let cli = target.cli();
+    let steps = target.plugin_steps();
+    let mut by_hand = steps.iter().map(|s| format!("  {cli} {}", s.iter().map(|a| shell_word(a)).collect::<Vec<_>>().join(" "))).collect::<Vec<_>>().join("\n");
+    if target == Target::Codex {
+        by_hand.push_str(&format!("\n(when Codex says the marketplace is already added from a different source, run `codex plugin marketplace remove {MARKETPLACE_NAME}` first)"));
+    }
+    let said = |out: &std::process::Output| [&out.stderr[..], &out.stdout[..]].iter()
+        .map(|b| String::from_utf8_lossy(b).trim().to_string()).find(|s| !s.is_empty()).unwrap_or_default();
+    for step in &steps {
+        let mut out = run(cli, root, step);
+        if let Some(fallback) = out.as_ref().filter(|o| !o.status.success()).and_then(|o| target.recovery(step, &said(o))) {
+            for again in &fallback {
+                out = run(cli, root, again);
+                if !out.as_ref().is_some_and(|o| o.status.success()) { break; }
+            }
+        }
+        match out {
+            None => {
+                report.notes.push(format!("`{cli}` is not on PATH, so the plugin was not installed; run these where it is, then run this again to take out the older install:\n{by_hand}"));
+                return (false, report);
+            }
+            Some(out) if !out.status.success() => {
+                report.notes.push(format!("`{cli} {}` failed ({}), so the plugin was not installed; the commands are:\n{by_hand}", step.join(" "), said(&out)));
+                return (false, report);
+            }
+            Some(_) => {}
+        }
+    }
+    report.notes.push(format!("the {PLUGIN} plugin is installed for this user; it starts with the next session"));
+    (true, report)
 }
 
 const BEGIN: &str = "<!-- zerograph:begin -->";
@@ -84,6 +187,12 @@ fn marked(text: &str, begin: &str, end: &str) -> Option<(usize, usize)> {
 fn skip_break(text: &str) -> &str {
     text.strip_prefix("\r\n").or_else(|| text.strip_prefix('\n')).unwrap_or(text)
 }
+
+/// A text with `{{command}}` resolved to how this repository invokes the binary — `zerograph`
+/// unless a caller says otherwise, `pnpm exec zerograph` in a workspace that installs it as a
+/// dependency. A line naming the bare binary where PATH has none tells an agent to run something
+/// that is not there.
+fn with_command(template: &str, command: &str) -> String { template.replace("{{command}}", command) }
 
 /// The instructions file with our stanza in it: replacing what is between the markers when they are
 /// there, appending when they are not. Everything outside the markers is the repository's own and
@@ -109,55 +218,24 @@ pub fn merged_instructions(existing: &str, command: &str) -> String {
     }
 }
 
-/// The four hook entries this tool owns, as the harness's settings file spells them.
-fn hook_entries(hook_path: &str) -> Vec<(&'static str, &'static str, serde_json::Value)> {
-    let entry = |timeout: u64| serde_json::json!({
-        "hooks": [{ "type": "command", "command": format!("node \"{hook_path}\""), "timeout": timeout }]
-    });
-    vec![
-        ("SessionStart", "startup|resume|clear|compact", entry(10)),
-        ("SubagentStart", ".*", entry(5)),
-        ("PreToolUse", "Bash|Grep|Glob|Agent", entry(10)),
-        ("PostToolUse", "Edit|Write|MultiEdit", entry(10)),
-    ]
-}
-
-/// The settings file with this tool's entries in it and everything else left alone. An entry whose
-/// command names our hook script is replaced rather than added, so a re-run after the hook changed
-/// is an upgrade and not a second copy firing twice per event.
-///
-/// `prior_hook` is the hook script on disk before this run; its stamp says which matchers we wrote.
-pub fn merged_settings(existing: &str, hook_path: &str, prior_hook: &str) -> Result<String> {
-    let mut root: serde_json::Value = match existing.trim().is_empty() {
-        true => serde_json::json!({}),
-        false => serde_json::from_str(existing).context("the settings file is not JSON")?,
-    };
-    if !root.is_object() { anyhow::bail!("the settings file is not a JSON object"); }
-    let hooks = root.as_object_mut().unwrap().entry("hooks").or_insert_with(|| serde_json::json!({}));
-    if !hooks.is_object() { anyhow::bail!("`hooks` in the settings file is not an object"); }
-    // A hook from before the stamp has none, and its release wrote today's defaults.
-    let stamp = prior_hook.lines().nth(1).unwrap_or_default();
-    for (event, matcher, mut ours) in hook_entries(hook_path) {
-        let list = hooks.as_object_mut().unwrap().entry(event).or_insert_with(|| serde_json::json!([]));
-        let Some(arr) = list.as_array_mut() else { anyhow::bail!("`hooks.{event}` is not an array") };
-        let theirs = arr.iter()
-            .filter(|e| e.to_string().contains("zerograph-hook"))
-            .find_map(|e| e["matcher"].as_str())
-            .filter(|m| *m != matcher && !stamp.split(' ').any(|t| t == format!("{event}={m}")));
-        ours["matcher"] = serde_json::json!(theirs.unwrap_or(matcher));
-        // Ours by the script it runs, never by position: a repository's own entries keep theirs.
-        arr.retain(|e| !e.to_string().contains("zerograph-hook"));
-        arr.push(ours);
-    }
-    Ok(serde_json::to_string_pretty(&root)? + "\n")
+/// `existing` without our stanza and the blank line that set it off, or `None` when it holds none.
+pub fn without_stanza(existing: &str) -> Option<String> {
+    let (a, b) = marked(existing, BEGIN, END)?;
+    let head = existing[..a].trim_end_matches(['\n', '\r']);
+    let tail = skip_break(&existing[b..]);
+    Some(match (head.is_empty(), tail.trim().is_empty()) {
+        (true, _) => tail.trim_start_matches(['\n', '\r']).to_string(),
+        (false, true) => format!("{head}\n"),
+        (false, false) => format!("{head}\n\n{}", tail.trim_start_matches(['\n', '\r'])),
+    })
 }
 
 fn is_symlink(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
 }
 
-/// A repository can ship `.claude/settings.json` or `zerograph.toml` as a link to a file elsewhere
-/// on the machine, and a write through it would overwrite that file with ours.
+/// A repository can ship a file as a link to one elsewhere on the machine, and a write through it
+/// would overwrite that file with ours.
 fn refuse_symlink(path: &Path) -> Result<()> {
     if is_symlink(path) {
         anyhow::bail!("{} is a symlink; refusing to write through it — replace it with a regular file and run again", path.display());
@@ -178,72 +256,31 @@ fn write_if_changed(path: &Path, text: &str, report: &mut Report) -> Result<()> 
     Ok(())
 }
 
-/// The block a reader pastes into `~/.codex/hooks.json` to wire the hook on a machine, printed
-/// rather than written: that file is machine-level, and a `--repo` command does not get to change
-/// how every other repository on the machine behaves. Three events, not four — the Bash
-/// interceptor's verdict is being read on Claude Code and is not carried over blind.
-pub fn codex_hooks_block(hook_abs: &str) -> String {
-    let entry = |matcher: &str, timeout: u64| serde_json::json!({
-        "matcher": matcher,
-        "hooks": [{ "type": "command", "command": node_command(hook_abs, cfg!(windows)), "timeout": timeout }]
-    });
-    serde_json::to_string_pretty(&serde_json::json!({
-        "hooks": {
-            "SessionStart": [entry("startup|resume|clear|compact", 10)],
-            "SubagentStart": [entry(".*", 5)],
-            "PostToolUse": [entry("apply_patch|Edit|Write", 10)],
-        }
-    })).unwrap_or_default()
-}
-
-/// `node <hook>` as the shell Codex hands it to reads it. A POSIX shell takes the path as one
-/// word through `shell_word`; `cmd` knows only double quotes, which a Windows path cannot contain.
-fn node_command(hook_abs: &str, windows: bool) -> String {
-    if windows { format!("node \"{hook_abs}\"") } else { format!("node {}", shell_word(hook_abs)) }
-}
-
-/// The hook `~/.codex/hooks.json` should run, for an install in `root`. Codex's hooks are per user,
-/// so the path has to outlive the checkout it was printed from: it is the main worktree's copy,
-/// which stays while linked worktrees come and go. When the install runs in a linked worktree and
-/// the main one has no hook yet, the hook and its rule are written there; one already there is
-/// left as it is. A bare clone, or no git, is `root`'s own copy.
-pub fn codex_hook(root: &Path, command: &str) -> Result<(PathBuf, Report)> {
-    let mut report = Report::default();
-    let here = canonical(root).unwrap_or_else(|| root.to_path_buf());
-    let home = main_worktree(root).unwrap_or_else(|| here.clone());
-    let hooks = home.join(Target::Codex.dir()).join("hooks");
-    let path = hooks.join("zerograph-hook.mjs");
-    if home != here {
-        match std::fs::read_to_string(&path) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound && std::fs::symlink_metadata(&path).is_err() => {
-                write_if_changed(&path, &hook(command), &mut report)?;
-                write_if_changed(&hooks.join("rule.txt"), &with_command(RULE, command), &mut report)?;
-                report.notes.push(format!("wrote the hook into the main worktree, {}, which outlives this one", home.display()));
-            }
-            Ok(text) if text == hook(command) => {}
-            _ => report.notes.push(format!("{} is left as it is; `install-agent --codex` run there updates it", path.display())),
-        }
+/// Removes `path`, counted and named, or says why it stayed.
+fn remove(path: &Path, why: &str, retire: Retire, report: &mut Report) {
+    if std::fs::symlink_metadata(path).is_err() { return; }
+    // Unlinking would leave the file it points at, which another checkout or a dotfile manager
+    // shares, still holding what is being retired, and nothing would say so.
+    if is_symlink(path) {
+        report.notes.push(format!("{} is a symlink, so it was left; {why}, so remove it and what it points at by hand", path.display()));
+        return;
     }
-    Ok((path, report))
-}
-
-/// The skill under `skills/zerograph/`, stamped with the release that wrote it — the
-/// `metadata.version` the Agent Skills format keeps for that — so a re-run by the same release
-/// writes nothing and one by another says what it replaced. The `repo-query` skill an earlier
-/// release wrote goes with it, when it is still the text that release wrote.
-fn write_skill(skills: &Path, command: &str, report: &mut Report) -> Result<()> {
-    let path = skills.join("zerograph").join("SKILL.md");
-    let before = std::fs::read_to_string(&path).ok().and_then(|t| skill_version(&t).map(String::from));
-    let written = report.written;
-    write_if_changed(&path, &skill(command), report)?;
-    if let Some(old) = before.filter(|v| v != VERSION && report.written > written) {
-        report.notes.push(format!("{}: rewritten from zerograph {old} to {VERSION}", path.display()));
+    if keep_committed(path, retire, report) { return; }
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            report.written += 1;
+            report.paths.push(path.display().to_string());
+            report.notes.push(format!("removed {}: {why}", path.display()));
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => report.notes.push(format!("{} could not be removed ({e}); {why}, so remove it by hand", path.display())),
     }
-    retire_legacy_skill(&skills.join("repo-query"), report);
-    Ok(())
 }
 
-fn skill(command: &str) -> String { with_command(SKILL, command).replace("{{version}}", VERSION) }
+/// Removes `dir` when nothing is left in it.
+fn remove_if_empty(dir: &Path) {
+    if std::fs::read_dir(dir).is_ok_and(|mut d| d.next().is_none()) { let _ = std::fs::remove_dir(dir); }
+}
 
 /// The release a generated skill names in its front matter.
 fn skill_version(text: &str) -> Option<&str> {
@@ -261,81 +298,232 @@ fn generated_from(template: &str, text: &str) -> bool {
     with_command(template, &rest[..end]) == text
 }
 
-/// Removes the `repo-query` skill an earlier release wrote, now that `zerograph` replaces it. Only
-/// a directory holding nothing but the `SKILL.md` that release generated is ours: an edited one, or
-/// one with files of its own, is a team's skill under that name, and is left and named.
-fn retire_legacy_skill(dir: &Path, report: &mut Report) {
+/// Removes a skill directory an earlier release wrote: only one holding nothing but the `SKILL.md`
+/// `ours` recognises. An edited one, or one with files of its own, is a team's skill under that
+/// name, and is left and named.
+fn retire_skill(dir: &Path, ours: &dyn Fn(&str) -> bool, retire: Retire, report: &mut Report) {
     let Ok(meta) = std::fs::symlink_metadata(dir) else { return };
     let file = dir.join("SKILL.md");
     let only_skill = meta.is_dir() && std::fs::read_dir(dir).is_ok_and(|entries| {
         entries.filter_map(|e| e.ok()).all(|e| e.file_name() == "SKILL.md" && e.file_type().is_ok_and(|t| t.is_file()))
     });
-    let ours = only_skill && std::fs::read_to_string(&file).is_ok_and(|t| generated_from(LEGACY_SKILL, &t));
-    if !ours {
-        report.notes.push(format!("{} is not the skill an earlier zerograph wrote, so it was left; the `zerograph` skill beside it replaces it", dir.display()));
+    if !(only_skill && std::fs::read_to_string(&file).is_ok_and(|t| ours(&t))) {
+        report.notes.push(format!("{} is not the skill an earlier zerograph wrote, so it was left; the plugin's skill replaces it", dir.display()));
         return;
     }
-    if let Err(e) = std::fs::remove_file(&file).and_then(|_| std::fs::remove_dir(dir)) {
-        report.notes.push(format!("{} could not be removed ({e}); the `zerograph` skill replaces it, so remove it by hand", dir.display()));
-        return;
-    }
-    report.written += 1;
-    report.notes.push(format!("removed {}, the skill's name before 0.6.4; `zerograph` replaces it", dir.display()));
+    remove(&file, "the plugin carries the skill now", retire, report);
+    let _ = std::fs::remove_dir(dir);
 }
 
-/// Installs the surface for one harness under `root`. Returns what it actually wrote: a second run
-/// writes nothing, which is how a caller can tell an upgrade from a no-op.
-pub fn install(root: &Path, target: Target, command: &str) -> Result<Report> {
+/// The settings file without the hook entries an earlier release merged in, found by the script
+/// they run, or `None` when it holds none. An event left with no entry goes, and `hooks` with it.
+pub fn without_hook_entries(existing: &str) -> Result<Option<String>> {
+    if existing.trim().is_empty() { return Ok(None); }
+    let mut root: serde_json::Value = serde_json::from_str(existing).context("not JSON")?;
+    let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else { return Ok(None) };
+    let mut found = false;
+    let ours = |v: &serde_json::Value| v.to_string().contains(LEGACY_HOOK);
+    for list in hooks.values_mut() {
+        let Some(groups) = list.as_array_mut() else { continue };
+        // By command, not by group: `/hooks` and a pasted block both add a command to an existing
+        // matcher's group, and the commands beside ours there are someone else's.
+        for group in groups.iter_mut() {
+            let Some(commands) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else { continue };
+            let before = commands.len();
+            commands.retain(|c| !ours(c));
+            found |= commands.len() < before;
+        }
+        let before = groups.len();
+        groups.retain(|g| match g.get("hooks").and_then(|h| h.as_array()) {
+            Some(commands) => !commands.is_empty(),
+            None => !ours(g),
+        });
+        found |= groups.len() < before;
+    }
+    if !found { return Ok(None); }
+    hooks.retain(|_, list| list.as_array().is_none_or(|a| !a.is_empty()));
+    if hooks.is_empty() { root.as_object_mut().unwrap().remove("hooks"); }
+    Ok(Some(serde_json::to_string_pretty(&root)? + "\n"))
+}
+
+/// Takes our hook entries out of a settings file, removing the file when they were all it held, and
+/// says whether none are left in it.
+fn retire_hook_entries(path: &Path, retire: Retire, report: &mut Report) -> bool {
+    let Ok(existing) = std::fs::read_to_string(path) else { return true };
+    match without_hook_entries(&existing) {
+        Ok(None) => true,
+        Ok(Some(_)) if is_symlink(path) => {
+            report.notes.push(format!("{} is a symlink, so the hook entries an earlier release wrote were left in it; take out the ones that run {LEGACY_HOOK}", path.display()));
+            false
+        }
+        Ok(Some(_)) if keep_committed(path, retire, report) => false,
+        Ok(Some(rest)) if rest.trim() == "{}" => {
+            remove(path, "it held only the hook entries an earlier release wrote, and the plugin runs the hook now", retire, report);
+            !path.exists()
+        }
+        Ok(Some(rest)) => match std::fs::write(path, rest) {
+            Ok(()) => {
+                report.written += 1;
+                report.paths.push(path.display().to_string());
+                report.notes.push(format!("{}: took out the hook entries an earlier release wrote; the plugin runs the hook now", path.display()));
+                true
+            }
+            Err(e) => {
+                report.notes.push(format!("{} could not be rewritten ({e}); take out the entries that run {LEGACY_HOOK}", path.display()));
+                false
+            }
+        },
+        Err(e) => {
+            report.notes.push(format!("{} is left as it is ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display()));
+            false
+        }
+    }
+}
+
+/// Takes our stanza out of an instructions file, removing the file when it was all it held.
+fn retire_stanza(path: &Path, retire: Retire, report: &mut Report) {
+    let Ok(existing) = std::fs::read_to_string(path) else { return };
+    let Some(rest) = without_stanza(&existing) else { return };
+    if is_symlink(path) {
+        report.notes.push(format!("{} is a symlink, so the stanza an earlier release wrote was left in what it points to; the plugin's skill replaces it", path.display()));
+        return;
+    }
+    if keep_committed(path, retire, report) { return; }
+    if rest.trim().is_empty() {
+        remove(path, "it held only the stanza an earlier release wrote, and the plugin's skill replaces it", retire, report);
+        return;
+    }
+    match std::fs::write(path, rest) {
+        Ok(()) => {
+            report.written += 1;
+            report.paths.push(path.display().to_string());
+            report.notes.push(format!("{}: took out the stanza an earlier release wrote; the plugin's skill replaces it", path.display()));
+        }
+        Err(e) => report.notes.push(format!("{} could not be rewritten ({e}); remove the lines between `{BEGIN}` and `{END}` by hand", path.display())),
+    }
+}
+
+/// Whether opencode in `root` still runs our server, which reads the stanza from `AGENTS.md`.
+fn opencode_wants_stanza(root: &Path) -> bool {
+    std::fs::read_to_string(root.join(Editor::Opencode.mcp_file())).ok()
+        .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
+        .is_some_and(|v| v[Editor::Opencode.servers_key()].get(MCP_NAME).is_some())
+}
+
+/// Whether `text` is the hook 0.6.0–0.6.4 wrote: the template with its command line resolved to
+/// whatever command the install was given, and, from 0.6.4, a stamp under the shebang.
+fn generated_hook(text: &str) -> bool {
+    const TEMPLATE_COMMAND: &str = "const COMMAND = \"zerograph\";";
+    let Some((shebang, rest)) = text.split_once('\n') else { return false };
+    let rest = match rest.split_once('\n') {
+        Some((stamp, after)) if stamp.starts_with("// zerograph ") && stamp.contains(" wrote: ") => after,
+        _ => rest,
+    };
+    let Some(a) = rest.find("const COMMAND = ") else { return false };
+    let end = rest[a..].find('\n').map_or(rest.len(), |n| a + n);
+    format!("{shebang}\n{}{TEMPLATE_COMMAND}{}", &rest[..a], &rest[end..]) == LEGACY_HOOK_TEXT
+}
+
+/// Removes the hook script an earlier release wrote into `hooks`, and its rule while it is still the
+/// text that release generated — but only once `entries_gone`: a hook entry left pointing at a
+/// removed script fails on every event it matches.
+pub fn retire_hook_script(hooks: &Path, entries_gone: bool, retire: Retire, report: &mut Report) {
+    let script = hooks.join(LEGACY_HOOK);
+    let Ok(text) = std::fs::read_to_string(&script) else { return };
+    if !entries_gone {
+        report.notes.push(format!("{} was left: hook entries that run it are still in place", script.display()));
+        return;
+    }
+    if !generated_hook(&text) {
+        report.notes.push(format!("{} is not the hook an earlier zerograph wrote, so it was left; the plugin runs its own", script.display()));
+        return;
+    }
+    remove(&script, "the plugin runs the session hook now", retire, report);
+    let rule = hooks.join("rule.txt");
+    match std::fs::read_to_string(&rule) {
+        Ok(t) if generated_from(LEGACY_RULE, &t) => remove(&rule, "the plugin's hook carries the rule", retire, report),
+        Ok(_) => report.notes.push(format!("{} was edited, so it was left; the plugin's hook carries its own rule and never reads it", rule.display())),
+        Err(_) => {}
+    }
+    remove_if_empty(hooks);
+}
+
+/// Takes out of `root` what an earlier `install-agent` wrote for `target`, now that the plugin
+/// carries it: the hook script and its rule, the hook entries in `.claude/settings.json`, the skill
+/// and the subagent where they are still the text that release generated, and the stanza. Run only
+/// once the plugin is in, so a session is never left with neither.
+pub fn retire_repo_install(root: &Path, target: Target, retire: Retire) -> Report {
     let mut report = Report::default();
-    let base: PathBuf = root.join(target.dir());
-    let hook_file = base.join("hooks").join("zerograph-hook.mjs");
-    let prior_hook = std::fs::read_to_string(&hook_file).unwrap_or_default();
-    write_if_changed(&hook_file, &hook(command), &mut report)?;
-    write_if_changed(&base.join("hooks").join("rule.txt"), &with_command(RULE, command), &mut report)?;
-    write_skill(&base.join("skills"), command, &mut report)?;
-    if target == Target::Claude {
-        write_if_changed(&base.join("agents").join("repo-scout.md"), &with_command(SCOUT, command), &mut report)?;
-    }
-
-    // A path the harness can resolve from wherever it runs the hook. Claude Code exports the
-    // project directory; Codex runs with the repository as its working directory and exports
-    // nothing, so the path is relative there.
-    let hook_path = match target {
-        Target::Claude => "$CLAUDE_PROJECT_DIR/.claude/hooks/zerograph-hook.mjs".to_string(),
-        Target::Codex => ".codex/hooks/zerograph-hook.mjs".to_string(),
+    let base = root.join(target.dir());
+    let entries_gone = match target {
+        Target::Claude => retire_hook_entries(&base.join("settings.json"), retire, &mut report),
+        Target::Codex => retire.machine_hooks_gone,
     };
-    if target.hooks_are_repository_scoped() {
-        let settings = base.join("settings.json");
-        let existing = std::fs::read_to_string(&settings).unwrap_or_default();
-        let merged = merged_settings(&existing, &hook_path, &prior_hook)?;
-        write_if_changed(&settings, &merged, &mut report)?;
-    }
+    retire_hook_script(&base.join("hooks"), entries_gone, retire, &mut report);
 
-    // Codex's is the repository root or nowhere; Claude Code reads either, and a repository that
-    // already keeps a root `CLAUDE.md` should not grow a second file beside it. A stanza already in
-    // `.claude/CLAUDE.md` stays the one to update, though, or a root file made since would hold a
-    // second stanza beside the first.
-    let root_instructions = root.join(target.instructions());
-    let inner_instructions = base.join(target.instructions());
-    let instructions = match target == Target::Codex || holds_stanza(&root_instructions)
-        || (root_instructions.exists() && !holds_stanza(&inner_instructions))
-    {
-        true => root_instructions,
-        false => inner_instructions,
-    };
-    let existing = std::fs::read_to_string(&instructions).unwrap_or_default();
-    let merged = merged_instructions(&existing, command);
-    // Never written through a link, and not an error either: `CLAUDE.md` linked to `AGENTS.md` is
-    // common, and failing here would abort an install that has already rewritten the settings and
-    // removed the old hook, before the MCP server is reached.
-    match merged != existing && is_symlink(&instructions) {
-        true => report.notes.push(format!(
-            "{} is a symlink, so the stanza was not written through it; `install-agent --codex` writes it \
-             when it points at AGENTS.md, and otherwise the file it points to needs the update by hand",
-            instructions.display())),
-        false => write_if_changed(&instructions, &merged, &mut report)?,
+    let skills = base.join("skills");
+    let generated = |t: &str| skill_version(t).is_some_and(|v| generated_from(&LEGACY_SKILL.replace("{{version}}", v), t));
+    if skills.join("zerograph").exists() { retire_skill(&skills.join("zerograph"), &generated, retire, &mut report); }
+    if skills.join("repo-query").exists() { retire_skill(&skills.join("repo-query"), &|t| generated_from(LEGACY_REPO_QUERY, t), retire, &mut report); }
+    remove_if_empty(&skills);
+    let scout = base.join("agents").join("repo-scout.md");
+    match std::fs::read_to_string(&scout) {
+        Ok(t) if generated_from(LEGACY_SCOUT, &t) => remove(&scout, "the plugin carries the subagent now", retire, &mut report),
+        Ok(_) => report.notes.push(format!("{} is not the subagent an earlier zerograph wrote, so it was left; the plugin's repo-scout replaces it", scout.display())),
+        Err(_) => {}
     }
-    Ok(report)
+    remove_if_empty(&base.join("agents"));
+
+    match target {
+        Target::Claude => for file in [root.join("CLAUDE.md"), base.join("CLAUDE.md")] { retire_stanza(&file, retire, &mut report) },
+        Target::Codex if opencode_wants_stanza(root) => {}
+        Target::Codex => retire_stanza(&root.join("AGENTS.md"), retire, &mut report),
+    }
+    remove_if_empty(&base);
+    report
+}
+
+/// Codex's home: `CODEX_HOME` when set, `~/.codex` otherwise.
+pub fn codex_home() -> Option<PathBuf> {
+    match std::env::var_os("CODEX_HOME").filter(|v| !v.is_empty()) {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(std::env::home_dir()?.join(".codex")),
+    }
+}
+
+/// Takes out of Codex's machine hooks file the entries an earlier release printed for a person to
+/// paste in: with the plugin's hook beside them, the hook would answer every event twice. Says
+/// whether none are left, which is when the script they ran can go.
+pub fn retire_codex_hooks(home: &Path) -> (bool, Report) {
+    let mut report = Report::default();
+    // Written through a link to where it points, so a dotfile manager's link stays one.
+    let path = home.join("hooks.json");
+    let path = path.canonicalize().unwrap_or(path);
+    let Ok(seen) = std::fs::metadata(&path) else { return (true, report) };
+    let Ok(existing) = std::fs::read_to_string(&path) else {
+        report.notes.push(format!("{} could not be read; take out the entries that run {LEGACY_HOOK}", path.display()));
+        return (false, report);
+    };
+    let gone = match without_hook_entries(&existing) {
+        Ok(None) => true,
+        Ok(Some(rest)) => match replace_config(&path, &seen, &rest) {
+            Ok(()) => {
+                report.written += 1;
+                report.paths.push(path.display().to_string());
+                report.notes.push(format!("{}: took out the entries that ran {LEGACY_HOOK}; the plugin runs the hook now", path.display()));
+                true
+            }
+            Err(e) => {
+                report.notes.push(format!("{} could not be rewritten ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display()));
+                false
+            }
+        },
+        Err(e) => {
+            report.notes.push(format!("{} is left as it is ({e:#}); take out the entries that run {LEGACY_HOOK}", path.display()));
+            false
+        }
+    };
+    (gone, report)
 }
 
 /// An editor or CLI that reads a project MCP file and an instructions file, and none of the
@@ -454,10 +642,6 @@ pub fn install_editor(root: &Path, editor: Editor, command: &str) -> Result<Repo
     Ok(report)
 }
 
-fn holds_stanza(path: &Path) -> bool {
-    std::fs::read_to_string(path).is_ok_and(|t| t.contains(BEGIN))
-}
-
 const MCP_NAME: &str = "zerograph";
 
 /// The words of a command line the way a shell would split it, for the quotes and backslashes a
@@ -477,57 +661,6 @@ fn split_words(command: &str) -> Vec<String> {
     }
     if started { words.push(word); }
     words
-}
-
-/// Registers `zerograph --repo <root> mcp` with Claude Code for the project at `root`, through
-/// `claude mcp add` so the harness keeps its own registry's format. `--repo` is explicit because
-/// the server's working directory is the harness's choice. `run` is how `claude` is invoked: a
-/// test passes its own, and `None` from it means the binary is not on PATH. A registration that
-/// already says this is left alone, which is what makes a re-run write nothing; one that says
-/// something else (another command, another repository) is removed from the local scope and made
-/// again; one in another scope is left and the local one added beside it. A missing
-/// `claude` is a note and not a failure, since the files this install wrote are useful without it.
-pub fn register_mcp(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> Option<std::process::Output>) -> Report {
-    let mut report = Report::default();
-    let words = split_words(command);
-    let Some((program, rest)) = words.split_first() else {
-        report.notes.push("--command is empty, so the MCP server was not registered".to_string());
-        return report;
-    };
-    let root_arg = root.display().to_string();
-    let tail: Vec<&str> = rest.iter().map(String::as_str).chain(["--repo", &root_arg, "mcp"]).collect();
-    let by_hand = format!("claude mcp add {MCP_NAME} -- {}", words.iter().map(String::as_str).chain(["--repo", &root_arg, "mcp"]).map(shell_word).collect::<Vec<_>>().join(" "));
-    let Some(existing) = run(root, &["mcp", "get", MCP_NAME]) else {
-        report.notes.push(format!("`claude` is not on PATH, so the MCP server was not registered; run `{by_hand}` where it is"));
-        return report;
-    };
-    let mut beside = false;
-    if existing.status.success() {
-        let shown = String::from_utf8_lossy(&existing.stdout);
-        if said_in_order(&shown, program.as_str(), &tail) {
-            report.notes.push("MCP server already registered, left alone".to_string());
-            return report;
-        }
-        // Only the local scope is this install's: without `-s` the CLI removes whichever scope
-        // holds the name, so a user-level entry would go machine-wide and a tracked `.mcp.json`
-        // entry would go in every worktree, leaving each one dirty. A local entry added beside
-        // one in another scope wins in this project, and the other stays as its owner left it.
-        beside = !run(root, &["mcp", "remove", MCP_NAME, "-s", "local"]).is_some_and(|o| o.status.success());
-    }
-    let mut args = vec!["mcp", "add", MCP_NAME, "--", program.as_str()];
-    args.extend(&tail);
-    match run(root, &args) {
-        Some(added) if added.status.success() => {
-            report.written = 1;
-            report.paths.push(by_hand);
-            if beside {
-                report.notes.push(format!("a `{MCP_NAME}` MCP server registered in another scope differs from this one and was left alone; the local one added beside it answers in this project, and `claude mcp remove {MCP_NAME} -s user` (or `-s project`) takes the other out if it is stale"));
-            }
-        }
-        Some(failed) => report.notes.push(format!("`claude mcp add` failed, the MCP server was not registered: {}", String::from_utf8_lossy(&failed.stderr).trim())),
-        None => report.notes.push("`claude` went away between two calls; the MCP server was not registered".to_string()),
-    }
-    report
 }
 
 /// The worktrees `git worktree list --porcelain` names, as (path, bare), main worktree first.
@@ -566,11 +699,6 @@ fn canonical(path: &Path) -> Option<PathBuf> {
     path.canonicalize().ok().map(crate::plain)
 }
 
-/// [`register_mcp`] once in every checkout [`worktrees`] names, each answer beside its checkout.
-pub fn register_mcp_everywhere(root: &Path, command: &str, run: &dyn Fn(&Path, &[&str]) -> Option<std::process::Output>) -> Vec<(PathBuf, Report)> {
-    worktrees(root).into_iter().map(|checkout| { let r = register_mcp(&checkout, command, run); (checkout, r) }).collect()
-}
-
 /// The main worktree of the clone `root` belongs to: the one that stays while linked worktrees
 /// come and go. `None` for a bare clone, or where git cannot say.
 pub fn main_worktree(root: &Path) -> Option<PathBuf> {
@@ -588,19 +716,20 @@ pub fn claude_config() -> Option<PathBuf> {
     }
 }
 
-/// Whether a registered server is one `register_mcp` made: it runs `… --repo <path> mcp`.
+/// Whether a registered server is one an earlier `install-agent` made: it runs `… --repo <path> mcp`.
 fn registered_by_us(server: &serde_json::Value) -> bool {
     let Some(args) = server["args"].as_array() else { return false };
     args.last().and_then(|a| a.as_str()) == Some("mcp") && args.iter().any(|a| a.as_str() == Some("--repo"))
 }
 
-/// Drops the server this tool registered for a checkout that is no longer on disk — a removed
-/// worktree, mostly — from Claude Code's `config` file. `claude mcp remove` cannot do it: it finds
-/// the project by its working directory, which is gone. Only our entry goes, and only
-/// where the project's path is missing; everything else in the file is kept, though its keys
-/// come back in sorted order. The file is written beside itself and renamed over, with its
-/// permissions, and not at all when there is nothing to prune.
-pub fn prune_stale_mcp(config: &Path) -> Report {
+/// Drops the local-scope server an earlier `install-agent` registered from Claude Code's `config`
+/// file, for every checkout in `replaced` — the plugin's server answers there now, and two would
+/// both be offered — and for any checkout no longer on disk. `claude mcp remove` cannot do either
+/// in one go: it finds the project by its working directory, once per checkout, and a removed one
+/// has none. Only our entry goes; everything else in the file is kept, though its keys come back in
+/// sorted order. The file is written beside itself and renamed over, with its permissions, and not
+/// at all when there is nothing to prune.
+pub fn prune_mcp(config: &Path, replaced: &[PathBuf]) -> Report {
     let mut report = Report::default();
     // Written through a link to where it points, so a dotfile manager's link stays one.
     let config = &config.canonicalize().unwrap_or_else(|_| config.to_path_buf());
@@ -615,11 +744,12 @@ pub fn prune_stale_mcp(config: &Path) -> Report {
     for (path, project) in projects.iter_mut() {
         // Only a path known to be gone: one that cannot be looked at now (a mount that is down, a
         // directory without permission) may still be there.
-        if !matches!(Path::new(path).try_exists(), Ok(false)) { continue; }
+        let gone = matches!(Path::new(path).try_exists(), Ok(false));
+        if !gone && !replaced.iter().any(|r| r == Path::new(path)) { continue; }
         let Some(servers) = project.get_mut("mcpServers").and_then(|s| s.as_object_mut()) else { continue };
         let before = servers.len();
         servers.retain(|name, server| !(name == MCP_NAME && registered_by_us(server)));
-        if servers.len() < before { pruned.push(path.clone()); }
+        if servers.len() < before { pruned.push((path.clone(), gone)); }
     }
     if pruned.is_empty() { return report; }
     let written = serde_json::to_string_pretty(&root).map_err(anyhow::Error::from).and_then(|out| replace_config(config, &seen, &(out + "\n")));
@@ -627,9 +757,15 @@ pub fn prune_stale_mcp(config: &Path) -> Report {
         Ok(()) => {
             report.written = 1;
             report.paths.push(config.display().to_string());
-            for path in pruned { report.notes.push(format!("removed the MCP server registered for {path}, which is no longer on disk")); }
+            for (path, gone) in pruned {
+                report.notes.push(match gone {
+                    true => format!("removed the MCP server registered for {path}, which is no longer on disk"),
+                    false => format!("removed the MCP server an earlier release registered for {path}; the plugin's server replaces it"),
+                });
+            }
         }
-        Err(e) => report.notes.push(format!("{} could not be rewritten ({e:#}); the MCP servers registered for {} stay", config.display(), pruned.join(", "))),
+        Err(e) => report.notes.push(format!("{} could not be rewritten ({e:#}); the MCP servers registered for {} stay", config.display(),
+            pruned.iter().map(|(p, _)| p.as_str()).collect::<Vec<_>>().join(", "))),
     }
     report
 }
@@ -669,28 +805,6 @@ fn replace_config(config: &Path, seen: &std::fs::Metadata, text: &str) -> Result
 fn shell_word(word: &str) -> String {
     let plain = !word.is_empty() && word.chars().all(|c| c.is_alphanumeric() || "-_./:=@%+,".contains(c));
     if plain { word.to_string() } else { format!("'{}'", word.replace('\'', "'\\''")) }
-}
-
-/// Whether `shown`, what `claude mcp get` printed, names `program` and then every argument of
-/// `tail` in order. Each is looked for on its own because the harness decides how it joins them,
-/// and a path with a space in it does not survive being compared as one space-joined string.
-fn said_in_order(shown: &str, program: &str, tail: &[&str]) -> bool {
-    // A word counts only where whitespace or an end bounds it, or `/proj/app` is read inside `/proj/app2`.
-    let mut rest = shown;
-    std::iter::once(program).chain(tail.iter().copied()).all(|word| {
-        let whole = |at: usize| rest[..at].chars().next_back().is_none_or(char::is_whitespace)
-            && rest[at + word.len()..].chars().next().is_none_or(char::is_whitespace);
-        match rest.match_indices(word).map(|(at, _)| at).find(|&at| whole(at)) {
-            Some(at) => { rest = &rest[at + word.len()..]; true }
-            None => false,
-        }
-    })
-}
-
-/// `claude` run in `root`, where its local-scope registration belongs; `None` when it is not
-/// installed.
-pub fn run_claude(root: &Path, args: &[&str]) -> Option<std::process::Output> {
-    std::process::Command::new("claude").args(args).current_dir(root).stdin(std::process::Stdio::null()).output().ok()
 }
 
 /// The git events an earlier release wrote a refresh block into.
@@ -751,19 +865,6 @@ mod tests {
     use super::*;
 
     fn root() -> tempfile::TempDir { tempfile::tempdir().unwrap() }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_symlinked_target_is_refused_and_what_it_points_at_is_left_alone() {
-        let dir = root();
-        let victim = dir.path().join("elsewhere.json");
-        std::fs::write(&victim, "{}").unwrap();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::os::unix::fs::symlink(&victim, dir.path().join(".claude/settings.json")).unwrap();
-        let err = install(dir.path(), Target::Claude, "zerograph").unwrap_err().to_string();
-        assert!(err.contains("symlink"), "{err}");
-        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "{}");
-    }
 
     fn read_json(path: &Path) -> serde_json::Value {
         serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
@@ -837,12 +938,6 @@ mod tests {
         assert!(dir.path().join(".cursor/rules/zerograph.mdc").exists());
     }
 
-    #[cfg(unix)]
-    fn exited(code: i32, stdout: &str) -> std::process::Output {
-        use std::os::unix::process::ExitStatusExt;
-        std::process::Output { status: std::process::ExitStatus::from_raw(code << 8), stdout: stdout.as_bytes().to_vec(), stderr: Vec::new() }
-    }
-
     #[test]
     fn a_command_is_split_the_way_a_shell_would() {
         assert_eq!(split_words("zerograph"), ["zerograph"]);
@@ -850,122 +945,6 @@ mod tests {
         assert_eq!(split_words(r#"pnpm exec "my repo graph" 'a b' c\ d"#), ["pnpm", "exec", "my repo graph", "a b", "c d"]);
         assert_eq!(split_words(r#"x "" y"#), ["x", "", "y"]);
         assert!(split_words("   ").is_empty());
-    }
-
-    /// A `claude` whose registry holds one entry per name, shown the way `mcp get` prints it.
-    #[cfg(unix)]
-    fn fake_claude(calls: &std::cell::RefCell<Vec<Vec<String>>>, registry: &std::cell::RefCell<std::collections::BTreeMap<String, String>>, args: &[&str]) -> Option<std::process::Output> {
-        calls.borrow_mut().push(args.iter().map(|a| a.to_string()).collect());
-        Some(match args {
-            ["mcp", "get", name] => match registry.borrow().get(*name) { Some(shown) => exited(0, shown), None => exited(1, "") },
-            ["mcp", "remove", name, ..] => { registry.borrow_mut().remove(*name); exited(0, "") }
-            ["mcp", "add", name, "--", program, rest @ ..] => {
-                registry.borrow_mut().insert(name.to_string(), format!("{name}:\n  Command: {program}\n  Args: {}\n", rest.join(" ")));
-                exited(0, "")
-            }
-            _ => exited(1, ""),
-        })
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn the_mcp_server_is_registered_once_a_second_run_leaves_it_and_a_different_one_is_replaced() {
-        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
-        let registry = std::cell::RefCell::new(std::collections::BTreeMap::new());
-        let claude = |_: &Path, args: &[&str]| fake_claude(&calls, &registry, args);
-        let root = Path::new("/work/proj");
-        let first = register_mcp(root, "pnpm exec zerograph", &claude);
-        assert_eq!(first.written, 1);
-        assert!(calls.borrow().iter().any(|c| c == &["mcp", "add", "zerograph", "--", "pnpm", "exec", "zerograph", "--repo", "/work/proj", "mcp"]), "{:?}", calls.borrow());
-        let asked = calls.borrow().len();
-        let second = register_mcp(root, "pnpm exec zerograph", &claude);
-        assert_eq!(second.written, 0);
-        assert!(calls.borrow()[asked..].iter().all(|c| c[1] == "get"), "the second run only asked: {:?}", calls.borrow());
-        assert!(second.notes[0].contains("already registered"));
-        let moved = register_mcp(Path::new("/work/other"), "pnpm exec zerograph", &claude);
-        assert_eq!(moved.written, 1, "another repository replaces the entry");
-        let removals: Vec<_> = calls.borrow().iter().filter(|c| c[1] == "remove").cloned().collect();
-        assert_eq!(removals, [["mcp", "remove", "zerograph", "-s", "local"]], "only the local scope");
-        assert!(registry.borrow()["zerograph"].contains("/work/other"));
-    }
-
-    /// A `claude` that keeps each scope's entries apart, as the CLI does: `get` shows the entry
-    /// that wins (local over project over user), `remove` without `-s` takes whichever scope
-    /// holds the name, and `add` writes the local scope.
-    #[cfg(unix)]
-    fn scoped_claude(calls: &std::cell::RefCell<Vec<Vec<String>>>, registry: &std::cell::RefCell<std::collections::BTreeMap<(u8, String), String>>, args: &[&str]) -> Option<std::process::Output> {
-        const LOCAL: u8 = 0;
-        calls.borrow_mut().push(args.iter().map(|a| a.to_string()).collect());
-        let winner = |name: &str| registry.borrow().iter().find(|((_, n), _)| n == name).map(|(k, v)| (k.clone(), v.clone()));
-        Some(match args {
-            ["mcp", "get", name] => match winner(name) { Some((_, shown)) => exited(0, &shown), None => exited(1, "") },
-            ["mcp", "remove", name, "-s", "local"] => match registry.borrow_mut().remove(&(LOCAL, name.to_string())) { Some(_) => exited(0, ""), None => exited(1, "") },
-            ["mcp", "remove", name] => match winner(name) { Some((k, _)) => { registry.borrow_mut().remove(&k); exited(0, "") } None => exited(1, "") },
-            ["mcp", "add", name, "--", program, rest @ ..] => {
-                registry.borrow_mut().insert((LOCAL, name.to_string()), format!("{name}:\n  Command: {program}\n  Args: {}\n", rest.join(" ")));
-                exited(0, "")
-            }
-            _ => exited(1, ""),
-        })
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_differing_server_in_another_scope_is_left_and_the_local_one_added_beside_it() {
-        const USER: u8 = 2;
-        let calls = std::cell::RefCell::new(Vec::<Vec<String>>::new());
-        let registry = std::cell::RefCell::new(std::collections::BTreeMap::new());
-        let theirs = "zerograph:\n  Command: zerograph\n  Args: --repo /elsewhere mcp\n".to_string();
-        registry.borrow_mut().insert((USER, "zerograph".to_string()), theirs.clone());
-        let claude = |_: &Path, args: &[&str]| scoped_claude(&calls, &registry, args);
-        let r = register_mcp(Path::new("/work/proj"), "zerograph", &claude);
-        assert_eq!(r.written, 1, "{:?}", r.notes);
-        assert_eq!(registry.borrow().get(&(USER, "zerograph".to_string())), Some(&theirs), "the user-scope entry is untouched");
-        assert!(registry.borrow()[&(0, "zerograph".to_string())].contains("/work/proj"));
-        assert!(calls.borrow().iter().filter(|c| c[1] == "remove").all(|c| c.ends_with(&["-s".to_string(), "local".to_string()])), "{:?}", calls.borrow());
-        assert_eq!(r.notes.iter().filter(|n| n.contains("another scope")).count(), 1, "{:?}", r.notes);
-        let again = register_mcp(Path::new("/work/proj"), "zerograph", &claude);
-        assert_eq!(again.written, 0, "the local entry now wins, and says this: {:?}", again.notes);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_claude_md_linked_to_agents_md_is_not_written_through_and_does_not_end_the_install() {
-        let dir = root();
-        let before = "# Rules\n\n<!-- zerograph:begin -->\nan older stanza\n<!-- zerograph:end -->\n";
-        std::fs::write(dir.path().join("AGENTS.md"), before).unwrap();
-        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
-        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert!(r.notes.iter().any(|n| n.contains("symlink")), "{:?}", r.notes);
-        assert_eq!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap(), before, "what the link points at is left alone");
-        assert!(dir.path().join(".claude/settings.json").exists(), "the rest of the install ran");
-
-        // `install-agent --claude --codex` runs Codex first, which writes the file the link points at.
-        install(dir.path(), Target::Codex, "zerograph").unwrap();
-        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert!(!r.notes.iter().any(|n| n.contains("symlink")), "nothing left to write: {:?}", r.notes);
-        let text = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-        assert_eq!(text.matches(BEGIN).count(), 1, "{text}");
-        assert!(!text.contains("an older stanza"), "{text}");
-    }
-
-    #[test]
-    fn a_stanza_in_the_inner_claude_md_stays_the_one_updated_when_a_root_file_appears_later() {
-        let dir = root();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/CLAUDE.md"), "<!-- zerograph:begin -->\nan older stanza\n<!-- zerograph:end -->\n").unwrap();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# House rules\n").unwrap();
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        let inner = std::fs::read_to_string(dir.path().join(".claude/CLAUDE.md")).unwrap();
-        assert!(inner.contains(BEGIN) && !inner.contains("an older stanza"), "{inner}");
-        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), "# House rules\n", "no second stanza beside the first");
-    }
-
-    #[test]
-    fn a_machine_without_claude_gets_a_note_and_the_command_to_run() {
-        let r = register_mcp(Path::new("."), "zerograph", &|_, _| None);
-        assert_eq!(r.written, 0);
-        assert!(r.notes[0].contains("claude mcp add zerograph -- zerograph --repo . mcp"), "{:?}", r.notes);
     }
 
     fn git_repo() -> tempfile::TempDir {
@@ -1024,7 +1003,7 @@ mod tests {
             }
         });
         std::fs::write(&config, serde_json::to_string(&before).unwrap()).unwrap();
-        let r = prune_stale_mcp(&config);
+        let r = prune_mcp(&config, &[]);
         assert_eq!(r.written, 1, "{r:?}");
         assert!(r.notes.iter().any(|n| n.contains(&gone)), "{r:?}");
         let after = read_json(&config);
@@ -1034,9 +1013,9 @@ mod tests {
         assert_eq!(after["projects"][&gone]["allowedTools"], serde_json::json!(["x"]));
         assert_eq!(after["projects"]["/gone/hand-made"], before["projects"]["/gone/hand-made"], "not one `register_mcp` made");
         let text = std::fs::read_to_string(&config).unwrap();
-        assert_eq!(prune_stale_mcp(&config).written, 0, "nothing left to prune");
+        assert_eq!(prune_mcp(&config, &[]).written, 0, "nothing left to prune");
         assert_eq!(std::fs::read_to_string(&config).unwrap(), text, "and nothing rewritten");
-        assert_eq!(prune_stale_mcp(&dir.path().join("missing.json")).written, 0);
+        assert_eq!(prune_mcp(&dir.path().join("missing.json"), &[]).written, 0);
     }
 
     #[cfg(unix)]
@@ -1047,38 +1026,8 @@ mod tests {
         let config = dir.path().join(".claude.json");
         std::fs::write(&config, r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#).unwrap();
         std::fs::set_permissions(&config, std::fs::Permissions::from_mode(0o600)).unwrap();
-        assert_eq!(prune_stale_mcp(&config).written, 1);
+        assert_eq!(prune_mcp(&config, &[]).written, 1);
         assert_eq!(std::fs::metadata(&config).unwrap().permissions().mode() & 0o777, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn install_agent_registers_the_server_in_every_checkout_each_with_its_own_repo() {
-        let dir = git_repo();
-        let main = dir.path().join("main");
-        std::fs::create_dir(&main).unwrap();
-        git(&main, &["init", "-q"]);
-        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
-        let wt = dir.path().join("wt");
-        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
-        let (main, wt) = (canonical(&main).unwrap(), canonical(&wt).unwrap());
-        let registries = std::cell::RefCell::new(std::collections::BTreeMap::<PathBuf, std::cell::RefCell<std::collections::BTreeMap<String, String>>>::new());
-        let adds = std::cell::RefCell::new(Vec::<(PathBuf, Vec<String>)>::new());
-        let calls = std::cell::RefCell::new(Vec::new());
-        let claude = |cwd: &Path, args: &[&str]| {
-            if args.get(1) == Some(&"add") { adds.borrow_mut().push((cwd.to_path_buf(), args.iter().map(|a| a.to_string()).collect())); }
-            let mut all = registries.borrow_mut();
-            let registry = all.entry(cwd.to_path_buf()).or_default();
-            fake_claude(&calls, registry, args)
-        };
-        let done = register_mcp_everywhere(&wt, "zerograph", &claude);
-        assert_eq!(done.iter().map(|(c, _)| c.clone()).collect::<Vec<_>>(), [main.clone(), wt.clone()]);
-        let adds = adds.into_inner();
-        assert_eq!(adds.len(), 2, "{adds:?}");
-        for (cwd, args) in &adds {
-            let repo = args.iter().position(|a| a == "--repo").map(|i| PathBuf::from(&args[i + 1]));
-            assert_eq!(repo.as_ref(), Some(cwd), "each checkout's server reads that checkout: {args:?}");
-        }
     }
 
     #[cfg(unix)]
@@ -1103,39 +1052,9 @@ mod tests {
         std::fs::write(&real, r#"{"projects":{"/gone/wt":{"mcpServers":{"zerograph":{"command":"zerograph","args":["--repo","/gone/wt","mcp"]}}}}}"#).unwrap();
         let link = dir.path().join(".claude.json");
         std::os::unix::fs::symlink(&real, &link).unwrap();
-        assert_eq!(prune_stale_mcp(&link).written, 1);
+        assert_eq!(prune_mcp(&link, &[]).written, 1);
         assert!(std::fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
         assert_eq!(read_json(&real)["projects"]["/gone/wt"]["mcpServers"], serde_json::json!({}));
-    }
-
-    #[test]
-    fn the_codex_hook_from_a_linked_worktree_is_the_main_worktrees_and_one_already_there_is_kept() {
-        let dir = git_repo();
-        let main = dir.path().join("main");
-        std::fs::create_dir(&main).unwrap();
-        git(&main, &["init", "-q"]);
-        git(&main, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "x"]);
-        let wt = dir.path().join("wt");
-        git(&main, &["worktree", "add", "-q", "--detach", wt.to_str().unwrap()]);
-        let main = canonical(&main).unwrap();
-        let (path, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
-        assert_eq!(path, main.join(".codex/hooks/zerograph-hook.mjs"));
-        assert_eq!(r.written, 2, "{r:?}");
-        assert!(std::fs::read_to_string(&path).unwrap().contains("const COMMAND = \"pnpm exec zerograph\";"));
-        assert!(main.join(".codex/hooks/rule.txt").exists());
-        assert_eq!(codex_hook(&wt, "pnpm exec zerograph").unwrap().1.written, 0, "a second run writes nothing");
-
-        std::fs::write(&path, "// the main checkout's own\n").unwrap();
-        let (_, r) = codex_hook(&wt, "pnpm exec zerograph").unwrap();
-        assert_eq!(r.written, 0);
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), "// the main checkout's own\n");
-        assert!(r.notes.iter().any(|n| n.contains("left as it is")), "{r:?}");
-
-        let (from_main, r) = codex_hook(&main, "zerograph").unwrap();
-        assert_eq!(from_main, path, "the main worktree names its own copy");
-        assert_eq!(r.written, 0);
-        let lone = root();
-        assert_eq!(codex_hook(lone.path(), "zerograph").unwrap().0, canonical(lone.path()).unwrap().join(".codex/hooks/zerograph-hook.mjs"));
     }
 
     /// The block as the last release that wrote one spelled it.
@@ -1187,250 +1106,6 @@ mod tests {
         assert!(r.notes.is_empty(), "{r:?}");
     }
 
-    #[test]
-    fn a_path_with_a_space_is_quoted_for_hand_use_and_matches_what_claude_printed() {
-        assert_eq!(shell_word("/a b/it's"), "'/a b/it'\\''s'");
-        assert_eq!(shell_word("--repo"), "--repo");
-        assert!(said_in_order("Command: zerograph\nArgs: --repo /a b mcp", "zerograph", &["--repo", "/a b", "mcp"]));
-        assert!(!said_in_order("Args: mcp --repo /a b", "zerograph", &["--repo", "/a b", "mcp"]));
-        assert!(!said_in_order("Command: zerograph\nArgs: --repo /a b2 mcp", "zerograph", &["--repo", "/a b", "mcp"]), "another root");
-    }
-
-    #[test]
-    fn installing_twice_writes_the_same_tree_and_says_it_changed_nothing() {
-        let dir = root();
-        let first = install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert!(first.written > 0, "{first:?}");
-        for rel in [".claude/hooks/zerograph-hook.mjs", ".claude/skills/zerograph/SKILL.md",
-                    ".claude/agents/repo-scout.md", ".claude/settings.json", ".claude/CLAUDE.md"] {
-            assert!(dir.path().join(rel).exists(), "{rel} was not written");
-        }
-        let second = install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert_eq!(second.written, 0, "a second install is a no-op: {second:?}");
-    }
-
-    #[test]
-    fn the_skill_names_the_release_that_wrote_it_and_another_release_says_it_replaced_it() {
-        let dir = root();
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        let path = dir.path().join(".claude/skills/zerograph/SKILL.md");
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(text.starts_with("---\nname: zerograph\n"), "the name is the directory's: {text}");
-        assert_eq!(skill_version(&text), Some(VERSION));
-        std::fs::write(&path, text.replace(&format!("version: \"{VERSION}\""), "version: \"0.0.1\"")).unwrap();
-        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert_eq!(r.written, 1, "{r:?}");
-        assert!(r.notes.iter().any(|n| n.contains(&format!("rewritten from zerograph 0.0.1 to {VERSION}"))), "{r:?}");
-        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
-    }
-
-    /// The skill was `repo-query` until 0.6.4. What a release wrote under that name goes, under
-    /// either harness and whatever command it was installed with; a skill a team keeps under the
-    /// name stays.
-    #[test]
-    fn the_repo_query_skill_an_earlier_release_wrote_is_removed_and_one_a_team_edited_is_kept() {
-        for target in [Target::Claude, Target::Codex] {
-            let dir = root();
-            let old = dir.path().join(target.dir()).join("skills/repo-query");
-            std::fs::create_dir_all(&old).unwrap();
-            std::fs::write(old.join("SKILL.md"), with_command(LEGACY_SKILL, "pnpm exec zerograph")).unwrap();
-            let r = install(dir.path(), target, "zerograph").unwrap();
-            assert!(!old.exists(), "{target:?}: {r:?}");
-            assert!(r.notes.iter().any(|n| n.contains("removed") && n.contains("repo-query")), "{r:?}");
-            assert!(dir.path().join(target.dir()).join("skills/zerograph/SKILL.md").exists());
-        }
-        let dir = root();
-        let old = dir.path().join(".claude/skills/repo-query");
-        std::fs::create_dir_all(&old).unwrap();
-        let edited = with_command(LEGACY_SKILL, "zerograph") + "\nOur own rule.\n";
-        std::fs::write(old.join("SKILL.md"), &edited).unwrap();
-        let r = install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert_eq!(std::fs::read_to_string(old.join("SKILL.md")).unwrap(), edited);
-        assert!(r.notes.iter().any(|n| n.contains("repo-query") && n.contains("left")), "{r:?}");
-        std::fs::write(old.join("SKILL.md"), with_command(LEGACY_SKILL, "zerograph")).unwrap();
-        std::fs::write(old.join("notes.md"), "ours\n").unwrap();
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        assert!(old.join("notes.md").exists() && old.join("SKILL.md").exists(), "a directory with files of its own is a team's");
-    }
-
-    /// An installer that rewrote a repository's settings file would be a worse citizen than no
-    /// installer: the hooks a team wrote are the reason the file exists.
-    #[test]
-    fn an_existing_settings_file_keeps_its_own_hooks() {
-        let dir = root();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/settings.json"),
-            r#"{"model":"opus","hooks":{"Stop":[{"hooks":[{"type":"command","command":"echo mine"}]}]}}"#).unwrap();
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        let v: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap()).unwrap();
-        assert_eq!(v["model"], "opus", "a key that is not ours is untouched");
-        assert!(v["hooks"]["Stop"].is_array(), "the repository's own hook survived");
-        assert_eq!(v["hooks"]["SessionStart"].as_array().unwrap().len(), 1);
-        assert_eq!(v["hooks"]["PreToolUse"][0]["matcher"], "Bash|Grep|Glob|Agent");
-    }
-
-    /// The upgrade case: an older entry of ours is replaced, not joined by a second copy that
-    /// would fire the hook twice on every event.
-    #[test]
-    fn an_older_entry_of_ours_is_replaced_rather_than_doubled() {
-        let dir = root();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/settings.json"), r#"{"hooks":{"SessionStart":[
-            {"matcher":"startup","hooks":[{"type":"command","command":"node /old/path/zerograph-hook.mjs"}]}
-        ]}}"#).unwrap();
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        let v: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap()).unwrap();
-        let arr = v["hooks"]["SessionStart"].as_array().unwrap();
-        assert_eq!(arr.len(), 1, "{arr:?}");
-        assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("CLAUDE_PROJECT_DIR"));
-    }
-
-    /// A narrowed matcher is a choice someone made, such as keeping the hook off Bash calls; a
-    /// re-run that put the default back would undo it on every upgrade.
-    #[test]
-    fn a_matcher_set_on_our_entry_survives_a_re_run() {
-        let dir = root();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/settings.json"), r#"{"hooks":{"PreToolUse":[
-            {"matcher":"Grep|Glob|Agent","hooks":[{"type":"command","command":"node /old/path/zerograph-hook.mjs"}]}
-        ]}}"#).unwrap();
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        let v: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap()).unwrap();
-        let arr = v["hooks"]["PreToolUse"].as_array().unwrap();
-        assert_eq!(arr.len(), 1, "{arr:?}");
-        assert_eq!(arr[0]["matcher"], "Grep|Glob|Agent");
-        assert!(arr[0]["hooks"][0]["command"].as_str().unwrap().contains("CLAUDE_PROJECT_DIR"), "the rest of the entry is still ours to update");
-        assert_eq!(v["hooks"]["SessionStart"][0]["matcher"], "startup|resume|clear|compact", "a fresh entry gets the default");
-    }
-
-    /// A matcher the stamp says we wrote is ours to move when the default changes; any other stays.
-    #[test]
-    fn a_matcher_the_stamp_records_moves_to_the_new_default() {
-        let settings = r#"{"hooks":{"PreToolUse":[{"matcher":"Bash|Grep","hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#;
-        let ours = merged_settings(settings, "h", "#!/usr/bin/env node\n// zerograph 0.6.4 wrote: PreToolUse=Bash|Grep\n").unwrap();
-        assert!(ours.contains("\"Bash|Grep|Glob|Agent\""), "{ours}");
-        let theirs = merged_settings(settings, "h", "#!/usr/bin/env node\n// zerograph 0.6.4 wrote: PreToolUse=Bash\n").unwrap();
-        assert!(theirs.contains("\"Bash|Grep\""), "{theirs}");
-    }
-
-    #[test]
-    fn the_stanza_lands_in_a_root_instructions_file_when_there_is_one_and_replaces_only_itself() {
-        let dir = root();
-        std::fs::write(dir.path().join("CLAUDE.md"), "# House rules\n\nRun the tests.\n").unwrap();
-        install(dir.path(), Target::Claude, "pnpm exec zerograph").unwrap();
-        let text = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(text.starts_with("# House rules\n\nRun the tests.\n"), "{text}");
-        assert!(text.contains("pnpm exec zerograph ask <words>"), "{text}");
-        assert!(!dir.path().join(".claude/CLAUDE.md").exists(), "the root file was the one to use");
-
-        // A re-install under a different invocation name replaces the block and nothing else.
-        install(dir.path(), Target::Claude, "zerograph").unwrap();
-        let text = std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap();
-        assert!(text.starts_with("# House rules\n\nRun the tests.\n"), "{text}");
-        assert!(!text.contains("pnpm exec"), "the old block went: {text}");
-        assert_eq!(text.matches(BEGIN).count(), 1, "one block, not two: {text}");
-    }
-
-    /// Read off the CLI rather than assumed — `agent/codex.md` records how. Codex reads the
-    /// repository's root `AGENTS.md`, so a `.codex/AGENTS.md` is a file nothing would ever open;
-    /// and its hooks live at `CODEX_HOME`, so no repository-scoped hooks file is written at all.
-    #[test]
-    fn codex_gets_its_stanza_at_the_root_and_no_repository_hooks_file() {
-        let dir = root();
-        install(dir.path(), Target::Codex, "zerograph").unwrap();
-        assert!(dir.path().join(".codex/hooks/zerograph-hook.mjs").exists(), "something to point at");
-        assert!(dir.path().join(".codex/skills/zerograph/SKILL.md").exists());
-        let stanza = std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap();
-        assert!(stanza.contains("zerograph ask <words>"), "{stanza}");
-        assert!(!dir.path().join(".codex/AGENTS.md").exists(), "nothing reads that path");
-        assert!(!dir.path().join(".codex/hooks.json").exists(), "hooks are CODEX_HOME-relative");
-        assert!(!dir.path().join(".codex/agents").exists(), "the scout is a Claude Code definition");
-    }
-
-    #[test]
-    fn the_codex_block_names_three_events_and_not_the_interceptor() {
-        let v: serde_json::Value = serde_json::from_str(&codex_hooks_block("/abs/hook.mjs")).unwrap();
-        let events: Vec<&String> = v["hooks"].as_object().unwrap().keys().collect();
-        assert_eq!(events.len(), 3, "{events:?}");
-        assert!(v["hooks"]["PreToolUse"].is_null(), "the interceptor is not carried over blind");
-        assert!(v["hooks"]["SessionStart"][0]["hooks"][0]["command"].as_str().unwrap().contains("/abs/hook.mjs"));
-    }
-
-    /// A checkout directory named with a `'` must not close the quoting once the block is pasted;
-    /// on Windows `cmd` reads no single quote as quoting at all.
-    #[test]
-    fn the_codex_hook_command_quotes_the_path_for_the_shell_that_runs_it() {
-        let posix = "/home/o'brien/my repo/.codex/hooks/zerograph-hook.mjs";
-        let cmd = node_command(posix, false);
-        #[cfg(unix)]
-        {
-            let word = cmd.strip_prefix("node ").unwrap();
-            let out = std::process::Command::new("sh").arg("-c").arg(format!("printf %s {word}")).output().unwrap();
-            assert_eq!(String::from_utf8_lossy(&out.stdout), posix, "{cmd}");
-        }
-        assert!(cmd.starts_with("node "), "{cmd}");
-        assert_eq!(node_command(r"C:\Users\o'brien\repo\hook.mjs", true), r#"node "C:\Users\o'brien\repo\hook.mjs""#);
-    }
-
-    #[test]
-    fn a_settings_file_that_is_not_json_is_refused_by_name_rather_than_overwritten() {
-        let dir = root();
-        std::fs::create_dir_all(dir.path().join(".claude")).unwrap();
-        std::fs::write(dir.path().join(".claude/settings.json"), "not json").unwrap();
-        let err = install(dir.path(), Target::Claude, "zerograph").unwrap_err().to_string();
-        assert!(err.contains("not JSON"), "{err}");
-        assert_eq!(std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap(), "not json");
-    }
-
-    /// `--command` is how this repository runs the binary, and a pnpm workspace has no bare
-    /// `zerograph` on PATH: a file that still says the bare name tells an agent to run nothing.
-    /// So every text either harness installs carries it, and not only the stanza.
-    #[test]
-    fn the_command_reaches_every_file_either_harness_installs() {
-        for (target, texts) in [
-            (Target::Claude, &[".claude/hooks/rule.txt", ".claude/skills/zerograph/SKILL.md",
-                               ".claude/agents/repo-scout.md", ".claude/CLAUDE.md"][..]),
-            (Target::Codex, &[".codex/hooks/rule.txt", ".codex/skills/zerograph/SKILL.md", "AGENTS.md"][..]),
-        ] {
-            let dir = root();
-            install(dir.path(), target, "pnpm exec zerograph").unwrap();
-            for rel in texts {
-                let text = std::fs::read_to_string(dir.path().join(rel)).unwrap();
-                assert!(text.contains("`pnpm exec zerograph "), "{rel} names the command: {text}");
-                assert!(!text.contains("`zerograph ") && !text.contains("{{command}}") && !text.contains("{{version}}"), "{rel} still names the bare binary: {text}");
-            }
-            let script = std::fs::read_to_string(dir.path().join(target.dir()).join("hooks/zerograph-hook.mjs")).unwrap();
-            assert!(script.contains("\nconst COMMAND = \"pnpm exec zerograph\";\n"), "{target:?}: the hook's hints read one declaration");
-        }
-    }
-
-    /// A command is whatever a person typed, and the hook is JavaScript: it goes in as one JSON
-    /// string, which JavaScript reads as a string literal, so nothing in it can run.
-    #[test]
-    fn the_hook_takes_the_command_as_one_json_string_and_the_default_as_it_ships() {
-        assert_eq!(HOOK.matches(HOOK_COMMAND).count(), 1, "the declaration the installer replaces is in the hook once");
-        assert_eq!(hook("zerograph").replacen(&stamp(), "", 1), HOOK, "the default installs the template byte for byte, under the stamp");
-        let script = hook(r#"pnpm exec "re'po\graph" `x` ${y}"#);
-        assert!(script.contains(r#"const COMMAND = "pnpm exec \"re'po\\graph\" `x` ${y}";"#), "the command is one string literal");
-        assert_eq!(script.matches("const COMMAND = ").count(), 1);
-    }
-
-    /// An upgrade is a re-run, and a re-run under the same command writes nothing — for a command
-    /// other than the default, and for both harnesses.
-    #[test]
-    fn a_second_install_under_a_named_command_writes_nothing_for_either_harness() {
-        for target in [Target::Claude, Target::Codex] {
-            let dir = root();
-            std::fs::write(dir.path().join(target.instructions()), "# House rules\n").unwrap();
-            assert!(install(dir.path(), target, "pnpm exec zerograph").unwrap().written > 0);
-            let again = install(dir.path(), target, "pnpm exec zerograph").unwrap();
-            assert_eq!(again.written, 0, "{target:?}: {again:?}");
-        }
-    }
-
     /// Measured with prettier 3.9.6, under no config and under a consumer's: the one change it made
     /// to the 0.5.0 stanza was a blank line after the begin marker, because a comment is a block of
     /// its own. A stanza carrying that line is left alone by the formatter and by a re-run of this.
@@ -1448,5 +1123,307 @@ mod tests {
         let upgraded = merged_instructions(old, "zerograph");
         assert_eq!(upgraded, format!("# House rules\n\n{}\n\n## After\n", block.trim_end()));
         assert_eq!(merged_instructions(&upgraded, "zerograph"), upgraded);
+    }
+
+    fn exited(code: i32, stdout: &str) -> std::process::Output {
+        #[cfg(unix)]
+        use std::os::unix::process::ExitStatusExt;
+        #[cfg(windows)]
+        use std::os::windows::process::ExitStatusExt;
+        #[cfg(unix)]
+        let status = std::process::ExitStatus::from_raw(code << 8);
+        #[cfg(windows)]
+        let status = std::process::ExitStatus::from_raw(code as u32);
+        std::process::Output { status, stdout: stdout.as_bytes().to_vec(), stderr: Vec::new() }
+    }
+
+    #[test]
+    fn each_harness_installs_the_plugin_through_its_own_cli_marketplace_first() {
+        for (target, wanted) in [
+            (Target::Claude, vec!["claude plugin marketplace add devmaxxx/zerograph".to_string(), "claude plugin marketplace update zerograph".to_string(),
+                "claude plugin install zerograph@zerograph".to_string(), "claude plugin update zerograph@zerograph".to_string()]),
+            (Target::Codex, vec![format!("codex plugin marketplace add devmaxxx/zerograph --ref v{VERSION}"), "codex plugin add zerograph@zerograph".to_string()]),
+        ] {
+            let calls = std::cell::RefCell::new(Vec::<String>::new());
+            let run = |program: &str, _: &Path, args: &[String]| { calls.borrow_mut().push(format!("{program} {}", args.join(" "))); Some(exited(0, "")) };
+            let (ok, r) = install_plugin(Path::new("."), target, &run);
+            assert!(ok, "{r:?}");
+            assert_eq!(calls.into_inner(), wanted);
+        }
+    }
+
+    #[test]
+    fn a_machine_without_the_cli_gets_the_commands_to_run_and_no_install() {
+        let (ok, r) = install_plugin(Path::new("."), Target::Claude, &|_, _, _| None);
+        assert!(!ok);
+        assert!(r.notes[0].contains("`claude` is not on PATH"), "{:?}", r.notes);
+        assert!(r.notes[0].contains("  claude plugin marketplace add devmaxxx/zerograph\n  claude plugin marketplace update zerograph\n  claude plugin install zerograph@zerograph\n  claude plugin update zerograph@zerograph"), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn a_failed_step_stops_the_install_and_says_what_the_cli_said() {
+        let calls = std::cell::RefCell::new(0);
+        let run = |_: &str, _: &Path, _: &[String]| {
+            *calls.borrow_mut() += 1;
+            Some(std::process::Output { stderr: b"network down".to_vec(), ..exited(1, "") })
+        };
+        let (ok, r) = install_plugin(Path::new("."), Target::Codex, &run);
+        assert!(!ok);
+        assert_eq!(calls.into_inner(), 1, "the plugin is not added from a marketplace that failed");
+        assert!(r.notes[0].contains("network down") && r.notes[0].contains("codex plugin add zerograph@zerograph"), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn a_codex_marketplace_pinned_to_an_older_release_is_repinned_to_this_one() {
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let run = |_: &str, _: &Path, args: &[String]| {
+            let call = args.join(" ");
+            let first = !calls.borrow().iter().any(|c| c == &call);
+            calls.borrow_mut().push(call.clone());
+            if call.starts_with("plugin marketplace add") && first {
+                return Some(std::process::Output { stderr: b"Error: marketplace 'zerograph' is already added from a different source; remove it before adding this source".to_vec(), ..exited(1, "") });
+            }
+            Some(exited(0, ""))
+        };
+        let (ok, r) = install_plugin(Path::new("."), Target::Codex, &run);
+        assert!(ok, "{r:?}");
+        let add = format!("plugin marketplace add devmaxxx/zerograph --ref v{VERSION}");
+        assert_eq!(calls.into_inner(), vec![add.clone(), "plugin marketplace remove zerograph".to_string(), add, "plugin add zerograph@zerograph".to_string()]);
+    }
+
+    #[test]
+    fn any_other_failure_removes_nothing() {
+        let calls = std::cell::RefCell::new(Vec::<String>::new());
+        let run = |_: &str, _: &Path, args: &[String]| {
+            calls.borrow_mut().push(args.join(" "));
+            Some(std::process::Output { stderr: b"network down".to_vec(), ..exited(1, "") })
+        };
+        let (ok, _) = install_plugin(Path::new("."), Target::Codex, &run);
+        assert!(!ok);
+        assert!(!calls.into_inner().iter().any(|c| c.contains("remove")));
+    }
+
+    /// What a retirement of an older install reaches in a test: no git, so nothing is committed.
+    const OLD: Retire = Retire { committed: false, machine_hooks_gone: true };
+
+    /// The hook as 0.6.4 wrote it for `command`: the command resolved, the stamp under the shebang.
+    fn old_hook(command: &str) -> String {
+        let script = LEGACY_HOOK_TEXT.replacen("const COMMAND = \"zerograph\";", &format!("const COMMAND = {};", serde_json::Value::from(command)), 1);
+        let (shebang, rest) = script.split_once('\n').unwrap();
+        format!("{shebang}\n// zerograph 0.6.4 wrote: SessionStart=startup|resume|clear|compact\n{rest}")
+    }
+
+    /// A repository as `install-agent --claude` and `--codex` of 0.7.0's predecessors left it.
+    fn older_install(root: &Path, command: &str) {
+        let w = |rel: &str, text: &str| {
+            let p = root.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        };
+        for dir in [".claude", ".codex"] {
+            w(&format!("{dir}/hooks/zerograph-hook.mjs"), &old_hook(command));
+            w(&format!("{dir}/hooks/rule.txt"), &with_command(LEGACY_RULE, command));
+            w(&format!("{dir}/skills/zerograph/SKILL.md"), &with_command(LEGACY_SKILL, command).replace("{{version}}", "0.6.4"));
+        }
+        w(".claude/agents/repo-scout.md", &with_command(LEGACY_SCOUT, command));
+        let entry = |m: &str| serde_json::json!({ "matcher": m, "hooks": [{ "type": "command", "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/zerograph-hook.mjs\"", "timeout": 10 }] });
+        let theirs = serde_json::json!({ "matcher": "Bash", "hooks": [{ "type": "command", "command": "./lint.sh" }] });
+        w(".claude/settings.json", &serde_json::to_string_pretty(&serde_json::json!({
+            "permissions": { "allow": ["Bash(ls)"] },
+            "hooks": { "SessionStart": [entry("startup|resume|clear|compact")], "PreToolUse": [entry("Bash|Grep|Glob|Agent"), theirs] },
+        })).unwrap());
+        w("CLAUDE.md", &format!("# House rules\n\nBe kind.\n\n{}\n## After\n", with_command(STANZA, command)));
+        w("AGENTS.md", &with_command(STANZA, command));
+    }
+
+    #[test]
+    fn a_re_run_over_an_older_install_takes_out_what_it_wrote_and_keeps_the_rest() {
+        let dir = root();
+        older_install(dir.path(), "pnpm exec zerograph");
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(!dir.path().join(".claude/hooks").exists(), "{r:?}");
+        assert!(!dir.path().join(".claude/skills").exists(), "{r:?}");
+        assert!(!dir.path().join(".claude/agents").exists(), "{r:?}");
+        let settings = read_json(&dir.path().join(".claude/settings.json"));
+        assert_eq!(settings["permissions"]["allow"], serde_json::json!(["Bash(ls)"]));
+        assert_eq!(settings["hooks"], serde_json::json!({ "PreToolUse": [{ "matcher": "Bash", "hooks": [{ "type": "command", "command": "./lint.sh" }] }] }));
+        assert_eq!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap(), "# House rules\n\nBe kind.\n\n## After\n");
+        assert!(dir.path().join("AGENTS.md").exists(), "Codex's stanza is the Codex pass's");
+
+        let r = retire_repo_install(dir.path(), Target::Codex, OLD);
+        assert!(!dir.path().join(".codex").exists(), "{r:?}");
+        assert!(!dir.path().join("AGENTS.md").exists(), "a file that held only the stanza goes");
+
+        let again = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert_eq!((again.written, again.notes.len()), (0, 0), "{again:?}");
+    }
+
+    #[test]
+    fn settings_that_held_only_our_hooks_go_and_a_team_edited_skill_or_scout_stays() {
+        let dir = root();
+        older_install(dir.path(), "zerograph");
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::write(&settings, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#).unwrap();
+        std::fs::write(dir.path().join(".claude/skills/zerograph/SKILL.md"), "---\nname: zerograph\n---\nOur own words.\n").unwrap();
+        std::fs::write(dir.path().join(".claude/agents/repo-scout.md"), "a scout of our own\n").unwrap();
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(!settings.exists(), "{r:?}");
+        assert!(dir.path().join(".claude/skills/zerograph/SKILL.md").exists());
+        assert!(dir.path().join(".claude/agents/repo-scout.md").exists());
+        assert_eq!(r.notes.iter().filter(|n| n.contains("was left")).count(), 2, "{r:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_hook_script_stays_while_an_entry_still_runs_it() {
+        let dir = root();
+        older_install(dir.path(), "zerograph");
+        let settings = dir.path().join(".claude/settings.json");
+        std::fs::rename(&settings, dir.path().join("shared.json")).unwrap();
+        std::os::unix::fs::symlink(dir.path().join("shared.json"), &settings).unwrap();
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(dir.path().join(".claude/hooks/zerograph-hook.mjs").exists(), "{r:?}");
+        assert!(dir.path().join(".claude/hooks/rule.txt").exists(), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("hook entries that run it are still in place")), "{r:?}");
+
+        let r = retire_repo_install(dir.path(), Target::Codex, Retire { machine_hooks_gone: false, ..OLD });
+        assert!(dir.path().join(".codex/hooks/zerograph-hook.mjs").exists(), "Codex's entries live in its home: {r:?}");
+    }
+
+    #[test]
+    fn codex_entries_left_in_place_keep_the_script_they_run() {
+        let dir = root();
+        assert!(retire_codex_hooks(dir.path()).0, "no hooks file runs nothing");
+        std::fs::write(dir.path().join("hooks.json"), "{ not json").unwrap();
+        let (gone, r) = retire_codex_hooks(dir.path());
+        assert!(!gone, "{r:?}");
+    }
+
+    #[test]
+    fn an_edited_hook_script_stays() {
+        let dir = root();
+        older_install(dir.path(), "pnpm exec zerograph");
+        let script = dir.path().join(".claude/hooks/zerograph-hook.mjs");
+        assert!(generated_hook(&std::fs::read_to_string(&script).unwrap()), "every command the install was given");
+        assert!(generated_hook(LEGACY_HOOK_TEXT), "0.6.0-0.6.3 wrote no stamp");
+        std::fs::write(&script, old_hook("zerograph") + "// ours\n").unwrap();
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(script.exists(), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("is not the hook an earlier zerograph wrote")), "{r:?}");
+    }
+
+    #[test]
+    fn files_git_tracks_stay_for_the_team_until_asked_for() {
+        let dir = root();
+        let git = |args: &[&str]| assert!(std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).output().unwrap().status.success());
+        git(&["init", "-q"]);
+        older_install(dir.path(), "zerograph");
+        git(&["add", ".claude/hooks/zerograph-hook.mjs", ".claude/settings.json", "CLAUDE.md"]);
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        for rel in [".claude/settings.json", "CLAUDE.md"] {
+            assert!(dir.path().join(rel).exists(), "{rel}: {r:?}");
+            assert!(r.committed.iter().any(|p| Path::new(p).ends_with(rel)), "{rel}: {r:?}");
+        }
+        assert!(dir.path().join(".claude/hooks/zerograph-hook.mjs").exists(), "the entries kept in settings still run it: {r:?}");
+        assert!(std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap().contains(BEGIN), "a tracked file is not rewritten either");
+        assert!(!dir.path().join(".claude/skills/zerograph").exists(), "an untracked file still goes: {r:?}");
+
+        let r = retire_repo_install(dir.path(), Target::Claude, Retire { committed: true, ..OLD });
+        assert!(!dir.path().join(".claude/hooks").exists(), "{r:?}");
+        assert!(!std::fs::read_to_string(dir.path().join(".claude/settings.json")).unwrap().contains(LEGACY_HOOK), "{r:?}");
+        assert!(!std::fs::read_to_string(dir.path().join("CLAUDE.md")).unwrap().contains(BEGIN), "{r:?}");
+        assert!(r.committed.is_empty());
+    }
+
+    #[test]
+    fn opencode_keeps_the_agents_md_stanza_it_still_reads() {
+        let dir = root();
+        older_install(dir.path(), "zerograph");
+        install_editor(dir.path(), Editor::Opencode, "zerograph").unwrap();
+        retire_repo_install(dir.path(), Target::Codex, OLD);
+        assert!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap().contains(BEGIN));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_claude_md_is_not_written_through() {
+        let dir = root();
+        older_install(dir.path(), "zerograph");
+        std::fs::remove_file(dir.path().join("CLAUDE.md")).unwrap();
+        std::os::unix::fs::symlink("AGENTS.md", dir.path().join("CLAUDE.md")).unwrap();
+        let r = retire_repo_install(dir.path(), Target::Claude, OLD);
+        assert!(r.notes.iter().any(|n| n.contains("is a symlink")), "{r:?}");
+        assert!(std::fs::read_to_string(dir.path().join("AGENTS.md")).unwrap().contains(BEGIN));
+    }
+
+    #[test]
+    fn the_stanza_comes_out_whole_wherever_it_sits() {
+        let block = with_command(STANZA, "zerograph");
+        assert_eq!(without_stanza(&block).unwrap(), "");
+        assert_eq!(without_stanza(&format!("# A\n\n{block}")).unwrap(), "# A\n");
+        assert_eq!(without_stanza(&format!("{block}\n# B\n")).unwrap(), "# B\n");
+        assert_eq!(without_stanza(&format!("# A\n\n{}\n\n# B\n", block.trim_end())).unwrap(), "# A\n\n# B\n");
+        assert_eq!(without_stanza("# nothing of ours\n"), None);
+    }
+
+    #[test]
+    fn the_codex_hooks_file_loses_only_the_entries_that_ran_our_script() {
+        let dir = root();
+        let path = dir.path().join("hooks.json");
+        std::fs::write(&path, r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"node '/r/.codex/hooks/zerograph-hook.mjs'"}]},{"hooks":[{"type":"command","command":"gitnexus"}]}],"PostToolUse":[{"hooks":[{"type":"command","command":"node /r/.codex/hooks/zerograph-hook.mjs"}]}]}}"#).unwrap();
+        let r = retire_codex_hooks(dir.path()).1;
+        assert_eq!(r.written, 1, "{r:?}");
+        assert_eq!(read_json(&path), serde_json::json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "gitnexus" }] }] } }));
+        assert_eq!(retire_codex_hooks(dir.path()).1.written, 0);
+        assert_eq!(retire_codex_hooks(&dir.path().join("none")).1.written, 0);
+    }
+
+    #[test]
+    fn a_command_beside_ours_in_one_matcher_group_stays() {
+        let shared = r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"gitnexus"},{"type":"command","command":"node /r/.codex/hooks/zerograph-hook.mjs"}]}]}}"#;
+        let rest: serde_json::Value = serde_json::from_str(&without_hook_entries(shared).unwrap().unwrap()).unwrap();
+        assert_eq!(rest, serde_json::json!({ "hooks": { "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command", "command": "gitnexus" }] }] } }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_hooks_file_is_rewritten_where_it_points_and_a_linked_settings_file_is_left() {
+        let dir = root();
+        let dotfiles = dir.path().join("dotfiles.json");
+        std::fs::write(&dotfiles, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node /r/.codex/hooks/zerograph-hook.mjs"}]}]},"x":1}"#).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, home.join("hooks.json")).unwrap();
+        assert_eq!(retire_codex_hooks(&home).1.written, 1);
+        assert!(is_symlink(&home.join("hooks.json")), "the link stays a link");
+        assert_eq!(read_json(&dotfiles), serde_json::json!({ "x": 1 }));
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        let shared = dir.path().join("shared.json");
+        std::fs::write(&shared, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#).unwrap();
+        std::os::unix::fs::symlink(&shared, repo.join(".claude").join("settings.json")).unwrap();
+        let r = retire_repo_install(&repo, Target::Claude, OLD);
+        assert!(is_symlink(&repo.join(".claude").join("settings.json")), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("is a symlink")), "{r:?}");
+    }
+
+    #[test]
+    fn the_server_an_earlier_release_registered_for_a_live_checkout_goes_when_the_plugin_replaces_it() {
+        let dir = root();
+        let live = dir.path().to_str().unwrap().to_string();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let other = other.to_str().unwrap().to_string();
+        let ours = |p: &str| serde_json::json!({ "command": "zerograph", "args": ["--repo", p, "mcp"] });
+        let config = dir.path().join(".claude.json");
+        std::fs::write(&config, serde_json::to_string(&serde_json::json!({
+            "projects": { live.clone(): { "mcpServers": { "zerograph": ours(&live) } }, other.clone(): { "mcpServers": { "zerograph": ours(&other) } } }
+        })).unwrap()).unwrap();
+        let r = prune_mcp(&config, &[PathBuf::from(&live)]);
+        assert!(r.notes.iter().any(|n| n.contains("the plugin's server replaces it")), "{r:?}");
+        let after = read_json(&config);
+        assert_eq!(after["projects"][&live]["mcpServers"], serde_json::json!({}));
+        assert_eq!(after["projects"][&other]["mcpServers"]["zerograph"], ours(&other), "another repository's is not this install's");
     }
 }

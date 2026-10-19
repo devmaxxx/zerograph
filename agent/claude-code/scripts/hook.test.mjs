@@ -1,6 +1,6 @@
 // The hook, exercised the way a harness runs it: a payload on stdin, a fake `zerograph` the hook
 // resolves the way it resolves the real one, and a temporary root that has or lacks a store.
-// Run: `node --test agent/hook.test.mjs`, on every platform the hook is installed on.
+// Run: `node --test agent/claude-code/scripts/hook.test.mjs`, on every platform the hook is installed on.
 import { test } from 'node:test';
 import assert from 'node:assert';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, symlinkSync, statSync, realpathSync } from 'node:fs';
@@ -9,7 +9,7 @@ import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-import { queryWords, searchPattern, binary, onPath, bounded, rule, RULE_FALLBACK, COMMAND } from './hook.mjs';
+import { queryWords, searchPattern, binary, onPath, bounded, rule, RULE } from './hook.mjs';
 
 const HOOK = join(dirname(fileURLToPath(import.meta.url)), 'hook.mjs');
 
@@ -90,22 +90,6 @@ async function waitFor(w, re, ms = 3000) {
     await new Promise((r) => setTimeout(r, 50));
   }
   return null;
-}
-
-/**
- * The hook as `install-agent --command` writes it, alone in a directory with no `rule.txt`: its one
- * declaration replaced by the command JSON-encoded, which is what `src/install_agent.rs` does. A
- * function replacement, because a replacement string would read a `$'` in the command as a pattern.
- */
-function installed(w, command) {
-  const declaration = 'const COMMAND = "zerograph";';
-  const source = readFileSync(HOOK, 'utf8');
-  assert.equal(source.split(declaration).length, 2, 'the declaration the installer replaces is in the hook once');
-  const dir = join(w.root, 'installed');
-  mkdirSync(dir, { recursive: true });
-  const file = join(dir, 'zerograph-hook.mjs');
-  writeFileSync(file, source.replace(declaration, () => `const COMMAND = ${JSON.stringify(command)};`));
-  return file;
 }
 
 /**
@@ -302,13 +286,6 @@ test('the hook keeps its session state in a directory private to the user', { sk
   assert.ok(!existsSync(join(w.root, 'tmp', 'zerograph-hook')), 'the predictable shared name is gone');
 });
 
-test('the rule the hook hands a subagent is the file the installer ships', () => {
-  const shipped = readFileSync(join(dirname(HOOK), 'rule.txt'), 'utf8');
-  assert.equal(rule(), shipped);
-  assert.equal(RULE_FALLBACK.trim(), shipped.split('{{command}}').join(COMMAND).trim(),
-    'the built-in copy and the file cannot drift');
-});
-
 test('SessionStart prints the brief, and nothing where there is no store', () => {
   const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes\nmodel=onnx-community/embeddinggemma-300m-ONNX' });
   const c = context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }));
@@ -404,7 +381,7 @@ test('on Windows a zerograph.exe anywhere on PATH wins over an earlier npm .cmd 
   writeFileSync(join(npm, 'zerograph.cmd'), '');
   writeFileSync(join(cargo, 'zerograph.exe'), '');
   const path = process.env.PATH;
-  process.env.PATH = [npm, cargo].join(delimiter);
+  process.env.PATH = [npm, cargo].join(';');
   try {
     assert.equal(onPath(null, 'win32'), join(cargo, 'zerograph.exe'));
   } finally {
@@ -428,6 +405,7 @@ test('a hook run through a symlinked path still answers', () => {
   const real = join(w.root, 'real');
   mkdirSync(real);
   copyFileSync(HOOK, join(real, 'hook.mjs'));
+  copyFileSync(join(dirname(HOOK), 'launcher.mjs'), join(real, 'launcher.mjs'));
   const link = join(w.root, 'link');
   // A junction on Windows, which needs no symlink privilege; the type is ignored everywhere else.
   symlinkSync(real, link, 'junction');
@@ -492,6 +470,27 @@ test('a linked worktree whose main worktree holds the hook asked for an index to
   assert.equal(await waitFor(w, /update --detach/), `--repo ${wt} update --detach`);
 });
 
+test('a linked worktree of a main worktree with a built index asked for one too', async () => {
+  const w = world({ store: false });
+  const main = join(w.root, 'main');
+  mkdirSync(join(main, '.git', 'worktrees', 'wt'), { recursive: true });
+  writeFileSync(join(main, '.git', 'worktrees', 'wt', 'commondir'), '../..\n');
+  mkdirSync(join(main, '.zerograph'), { recursive: true });
+  writeFileSync(join(main, '.zerograph', 'manifest.json'), '{}');
+  const wt = join(w.root, 'wt');
+  mkdirSync(wt);
+  writeFileSync(join(wt, '.git'), `gitdir: ${join(main, '.git', 'worktrees', 'wt')}\n`);
+  assert.match(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup', cwd: wt })), /being built/);
+  assert.equal(await waitFor(w, /update --detach/), `--repo ${wt} update --detach`);
+});
+
+test('the plugin\'s binary option names the binary when ZEROGRAPH_BIN does not', { skip: WIN }, () => {
+  const w = world({ answer: 'zerograph: 3 doc nodes' });
+  const c = context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' },
+    { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '', CLAUDE_PLUGIN_OPTION_BINARY: w.launcher, ZEROGRAPH_HOOK_SERVE: '0' }));
+  assert.equal(c, 'zerograph: 3 doc nodes');
+});
+
 test('an opted-in checkout with no binary to start claims no build', { skip: WIN }, async () => {
   const w = world({ store: false });
   mkdirSync(join(w.root, '.git'));
@@ -539,7 +538,8 @@ test('every call the hook waits on refreshes in process for less than its timeou
 test('SubagentStart carries the rule', () => {
   const w = world();
   const c = context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }));
-  assert.equal(c.trim(), readFileSync(join(dirname(HOOK), 'rule.txt'), 'utf8').trim());
+  assert.equal(c, RULE);
+  assert.match(c, /`zerograph ask <words>`/);
   assert.deepEqual(argv(w), [], 'the rule costs no call');
 });
 
@@ -611,6 +611,23 @@ test('an edit to a hub injects one risk line, once, and only above LOW', () => {
   assert.deepEqual(argv(doc), [], 'a document edit does not even ask');
 });
 
+test('a Codex apply_patch is scored on every file its patch writes', () => {
+  const w = world({ answer: diff([
+    { file: 'src/db.ts', symbol: 'DatabaseService.withTenant', callers: 18 },
+    { file: 'src/slots.ts', symbol: 'freeSlots', callers: 6, files: 2 },
+  ], 'HIGH') });
+  const patch = ['*** Begin Patch', '*** Update File: src/db.ts', '@@', '-a', '+b', '*** Add File: notes.md', '+x',
+    '*** Update File: src/old.ts', '*** Move to: src/slots.ts', '@@', '-c', '+d', '*** End Patch'].join('\n');
+  const c = context(fire(w, { hook_event_name: 'PostToolUse', tool_name: 'apply_patch', tool_input: { command: patch } }));
+  assert.match(c, /risk HIGH — 18 direct callers of DatabaseService\.withTenant/);
+  assert.match(c, /risk MEDIUM — 6 direct callers of freeSlots in 2 files/, 'a moved file is scored at its new path');
+
+  const doc = world({ answer: diff([{ file: 'src/db.ts', symbol: 'x', callers: 18 }], 'HIGH') });
+  const md = { hook_event_name: 'PostToolUse', tool_name: 'apply_patch', tool_input: { command: '*** Begin Patch\n*** Add File: x.md\n+y\n*** End Patch' } };
+  assert.equal(fire(doc, md), null);
+  assert.deepEqual(argv(doc), [], 'a patch that writes no TypeScript does not even ask');
+});
+
 test('an edit is scored on its own file\'s callers, not on the rest of the diff', () => {
   const w = world({ answer: diff([
     { file: 'src/db.ts', symbol: 'DatabaseService.withTenant', callers: 40 },
@@ -654,46 +671,24 @@ test('the Agent prompt is extended only when the fallback is asked for', () => {
   assert.equal(out.hookSpecificOutput.permissionDecision, undefined, 'no decision: the call proceeds as it would have');
 });
 
-test('a repository with no store gets one build notice and then silence', () => {
+test('a repository that asked for an index and cannot build one gets one build notice and then silence', () => {
   const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  writeFileSync(join(w.root, 'zerograph.toml'), '');
   const payload = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } };
-  const notice = context(fire(w, payload));
+  const nothing = { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' };
+  const notice = context(fire(w, payload, nothing));
   assert.match(notice, /zerograph build/);
   assert.match(notice, /already embedded.*vector cache/, 'a large repository is not told it costs a whole embed');
   assert.doesNotMatch(notice, /couple of minutes/, 'a large repository takes far longer than that');
-  assert.equal(fire(w, { ...payload, tool_input: { command: 'rg "another question here"' } }), null, 'once a session');
+  assert.equal(fire(w, { ...payload, tool_input: { command: 'rg "another question here"' } }, nothing), null, 'once a session');
 });
 
-test('every hint names the command install-agent was given, and no command can break the script', () => {
-  const env = { ZEROGRAPH_HOOK_SERVE: '0' };
-  const command = 'pnpm exec zerograph';
-  const search = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } };
-
-  const bare = world({ store: false });
-  assert.match(context(fire(bare, search, env, installed(bare, command))), /`pnpm exec zerograph build`/);
-
-  const w = world({ answer: 'FR-PAY-22  docs/a.md:1  отмена' });
-  const hook = installed(w, command);
-  const given = context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }, env, hook));
-  assert.match(given, /`pnpm exec zerograph ask <words>`/, 'no rule.txt beside it: the built-in copy answers');
-  assert.ok(!given.includes('`zerograph '), given);
-  const injected = context(fire(w, search, env, hook));
-  assert.match(injected, /^pnpm exec zerograph ask cancellation policy →/, 'the header is a command an agent re-runs');
-  assert.match(injected, /`pnpm exec zerograph ask` for more\)$/);
-  let reminder = null;
-  for (let i = 0; i < 40; i += 1) {
-    const payload = { hook_event_name: 'PreToolUse', agent_id: 'r', tool_name: 'Bash', tool_input: { command: `rg "thing${i}"` } };
-    reminder = context(fire(w, payload, { ...env, ZEROGRAPH_HOOK_INTERCEPT: '0' }, hook)) ?? reminder;
-  }
-  assert.match(reminder, /`pnpm exec zerograph ask <words>`/);
-
-  const hub = world({ answer: diff([{ file: 'src/db.ts', symbol: 'withTenant', callers: 18 }], 'HIGH') });
-  assert.match(context(fire(hub, edit(hub, 'src', 'db.ts'), env, installed(hub, command))), /`pnpm exec zerograph changes --depth 1`/);
-
-  const hostile = 'pnpm exec "re\'po\\graph" `x` ${y} $\'';
-  const odd = world();
-  const said = context(fire(odd, { hook_event_name: 'SubagentStart', agent_id: 'a1' }, env, installed(odd, hostile)));
-  assert.ok(said.includes(`\`${hostile} ask <words>\``), `a JSON string is a JavaScript string literal: ${said}`);
+test('a repository that never asked for an index hears nothing from a search', () => {
+  const w = world({ store: false });
+  mkdirSync(join(w.root, '.git'));
+  const payload = { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg "cancellation policy"' } };
+  assert.equal(fire(w, payload), null);
 });
 
 test('malformed input is silence with exit zero', () => {

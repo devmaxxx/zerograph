@@ -3,13 +3,14 @@
 // answers one MCP request. Run: `node --test agent/claude-code/scripts/mcp.test.mjs`.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-import { binaryOf, argvOf, checkoutOf, childEnv, machineDirs, pathKey } from './mcp.mjs';
+import { binaryOf, argvOf, checkoutOf, childEnv } from './mcp.mjs';
+import { machineDirs, pathKey } from './launcher.mjs';
 
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), 'mcp.mjs');
 const WIN = process.platform === 'win32';
@@ -148,6 +149,20 @@ test('no binary is a line in the server log and a failed start, never a word on 
   assert.match(r.stderr, /relative\/zerograph\) is not an absolute path/);
 });
 
+test('ZEROGRAPH_BIN outranks the option, set or left unsubstituted, as it does in the hook', { skip: WIN && 'a POSIX launcher for the fake' }, () => {
+  const w = world();
+  const named = join(w.base, 'named');
+  mkdirSync(named);
+  const seen = join(w.base, 'seen.txt');
+  writeFileSync(join(named, 'zerograph'), `#!/bin/sh\necho named > '${seen}'\n`);
+  chmodSync(join(named, 'zerograph'), 0o755);
+  for (const option of ['${user_config.binary}', join(w.machine, 'zerograph')]) {
+    const r = spawnSync(process.execPath, [LAUNCHER, option], { cwd: w.base, input: '', env: { PATH: '/usr/bin:/bin', CLAUDE_PROJECT_DIR: w.checkout, ZEROGRAPH_BIN: join(named, 'zerograph') }, encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(readFileSync(seen, 'utf8').trim(), 'named', option);
+  }
+});
+
 test('a checkout that is the home directory, or above it, cuts nothing from PATH', () => {
   const w = world();
   const home = join(w.checkout, 'me');
@@ -156,7 +171,7 @@ test('a checkout that is the home directory, or above it, cuts nothing from PATH
   assert.deepStrictEqual(machineDirs(path, w.checkout, WIN, home), [nvm, w.machine], 'an ancestor of home');
   assert.deepStrictEqual(machineDirs(path, home, WIN, home), [nvm, w.machine], 'home itself');
   assert.deepStrictEqual(machineDirs(path, WIN ? 'C:\\' : '/', WIN, home), [nvm, w.machine], 'a filesystem root');
-  assert.strictEqual(childEnv({ PATH: path }, home, WIN, home).PATH, path);
+  assert.strictEqual(childEnv({ PATH: path }, home, WIN, {}, home).PATH, path);
   assert.deepStrictEqual(machineDirs([join(w.checkout, 'bin'), w.machine].join(sep), w.checkout, WIN, w.machine), [w.machine], 'a checkout beside home is still cut');
 });
 
@@ -165,7 +180,7 @@ test('PATH is the only PATH on POSIX, and any case of it on Windows', () => {
   assert.strictEqual(pathKey({ Path: 'x' }, false), 'PATH');
   assert.strictEqual(pathKey({ Path: 'x' }, true), 'Path');
   // POSIX spellings: the case is played on any host, and a drive letter's colon would split.
-  const env = childEnv({ Path: '/src/app/bin', PATH: '/src/app/bin:/usr/bin' }, '/src/app', false, '/home/me');
+  const env = childEnv({ Path: '/src/app/bin', PATH: '/src/app/bin:/usr/bin' }, '/src/app', false, {}, '/home/me');
   assert.strictEqual(env.PATH, '/usr/bin');
   assert.strictEqual(env.Path, '/src/app/bin', 'another variable, left as it is');
 });
@@ -173,7 +188,7 @@ test('PATH is the only PATH on POSIX, and any case of it on Windows', () => {
 test('a quoted Windows PATH entry is judged without its quotes and kept as written', () => {
   const quoted = '"C:\\Program Files\\nodejs"';
   assert.deepStrictEqual(machineDirs([quoted, '"C:\\src\\app\\bin"'].join(';'), 'C:\\src\\app', true, 'C:\\Users\\me'), [quoted]);
-  assert.strictEqual(childEnv({ Path: quoted }, 'C:\\src\\app', true, 'C:\\Users\\me').Path, quoted);
+  assert.strictEqual(childEnv({ Path: quoted }, 'C:\\src\\app', true, {}, 'C:\\Users\\me').Path, quoted);
 });
 
 test('a session opened through a link finds the checkout by its real path, as the CLI does', { skip: WIN && 'symlinks need a privilege' }, () => {
