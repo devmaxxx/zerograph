@@ -2,7 +2,7 @@
 
 `run.sh` swaps one of these into the disposable worktree as its `.claude/` and runs the twelve
 tasks against it. The worktree is a `git worktree` of beauty-crm at `502e8a6d` with the pinned
-fixture's `.repograph/` copied beside it; the fixture itself is read once and never written.
+fixture's `.zerograph/` copied beside it; the fixture itself is read once and never written.
 
 | overlay | what it is | instructions the agent carries |
 | --- | --- | --- |

@@ -114,3 +114,28 @@ test('a session opened in a package of a checkout still refuses a PATH entry els
   await $.command.run({ command: 'zerograph', args: '' })
   expect(ran).toEqual([])
 })
+
+test('on Windows a checkout whose path cmd would act on is never handed to an npm .cmd shim', async ($, on) => {
+  const ran = windows(on, 'C:\\src\\a&calc', 'C:\\npm', ['C:\\npm\\zerograph.cmd'])
+  await $.command.run({ command: 'zerograph', args: '' })
+  expect(ran).toEqual([])
+})
+
+test('a PATH entry that is a symlinked alias of the checkout is the checkout\'s', async ($, on) => {
+  const ALIAS = '/alias/cloned'
+  const ran: string[][] = []
+  on('session.root', async () => ({ value: ROOT }))
+  on('env.get', async ($, e) => ({ value: e.name === 'PATH' ? [`${ALIAS}/node_modules/.bin`, MACHINE].join(':') : undefined }))
+  on('fs.exists', async () => ({ value: true }))
+  on('fs.stat', async ($, e) => {
+    const realPath = e.resolve ? e.path.replace(ALIAS, ROOT) : undefined
+    return { value: { kind: 'file', size: 1, mtimeMs: 0, isLink: e.path.startsWith(ALIAS), realPath } }
+  })
+  on('process.run', async ($, e) => {
+    ran.push([...e.argv])
+    return { value: { exitCode: 1, stdout: '', stderr: '', isStdoutTruncated: false } }
+  })
+  await $.command.run({ command: 'zerograph', args: '' })
+  expect(ran.length).toBeGreaterThan(0)
+  expect(ran.filter(argv => argv[0] !== `${MACHINE}/zerograph`)).toEqual([])
+})

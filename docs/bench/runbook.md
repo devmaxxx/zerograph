@@ -22,7 +22,7 @@ all three:
 | corpus at `502e8a6d` | the worktree itself | — | 856 MB |
 | gitnexus index | `.gitnexus/` | gitnexus 1.6.9 | 218 s, 598 MB |
 | graphify graph | `graphify-out/graph.json` | graphify 0.9.48 | 24 s, 123 MB |
-| zerograph store | `.repograph/` | see below | 78 MB |
+| zerograph store | `.zerograph/` | see below | 78 MB |
 
 The zerograph store carries the graph, the dense vectors and the enrichment questions, so the
 fixture answers in the enriched arm without anyone paying for `enrich` again. The vectors and

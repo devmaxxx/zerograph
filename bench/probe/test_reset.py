@@ -59,11 +59,11 @@ class Reset(unittest.TestCase):
         # second copy of it among the `**env` overrides would be shadowed by this one and a case
         # that meant to run under another model would silently run under the small one.
         e = {**os.environ, "FIX": str(self.fix), "WT": str(self.wt), "PIN": self.sha[:8], "BIN": str(self.bin), **env}
-        e.pop("ZEROGRAPH_EMBED_MODEL", None)
+        e.pop("REPOGRAPH_EMBED_MODEL", None)
         if model is None:
-            e.pop("REPOGRAPH_EMBED_MODEL", None)
+            e.pop("ZEROGRAPH_EMBED_MODEL", None)
         else:
-            e["REPOGRAPH_EMBED_MODEL"] = model
+            e["ZEROGRAPH_EMBED_MODEL"] = model
         return subprocess.run(["bash", str(RESET)], env=e, capture_output=True, text=True)
 
     def dirty(self):
@@ -72,7 +72,7 @@ class Reset(unittest.TestCase):
         (self.wt / ".repograph").mkdir(exist_ok=True)
         (self.wt / ".repograph/graph.json").write_text("{}")
         (self.wt / ".repograph/left-by-an-arm").write_text("x")
-        (self.wt / "repograph.toml").write_text('embed_model = "wrong"\n')
+        (self.wt / "zerograph.toml").write_text('embed_model = "wrong"\n')
 
     def test_a_dirty_tree_and_a_foreign_store_are_put_back(self):
         self.dirty()
@@ -97,9 +97,8 @@ class Reset(unittest.TestCase):
         self.assertFalse((self.wt / ".zerograph").exists())
         self.assertEqual((self.wt / ".repograph/graph.json").read_text(), FIXTURE_GRAPH)
 
-    def test_a_fixture_a_renamed_binary_moved_is_restored_under_the_name_it_holds(self):
-        # A reader's inline refresh is a write, so reading the fixture with a renamed binary moves
-        # its store; the next reset has to restore from where it went and not refuse.
+    def test_a_fixture_under_the_current_name_is_restored_under_that_name(self):
+        # A fixture rebuilt by a current binary holds `.zerograph`, the only name that binary reads.
         shutil.move(self.fix / ".repograph", self.fix / ".zerograph")
         (self.fix / ".zerograph/.gitignore").write_text("*\n")
         self.dirty()
@@ -107,7 +106,7 @@ class Reset(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertEqual((self.wt / ".zerograph/graph.json").read_text(), FIXTURE_GRAPH)
         self.assertEqual((self.wt / ".zerograph/vectors.f32").read_bytes(), b"v")
-        self.assertFalse((self.wt / ".repograph").exists(), "the old name would be outranked: it goes")
+        self.assertFalse((self.wt / ".repograph").exists(), "a pre-rename binary would read the old name instead: it goes")
         self.assertEqual(git("status", "--porcelain", cwd=self.wt), "")
 
     def test_a_fixture_holding_both_names_is_restored_from_the_one_the_binary_reads(self):
@@ -120,19 +119,19 @@ class Reset(unittest.TestCase):
         self.assertFalse((self.wt / ".repograph").exists())
 
     def test_the_config_an_earlier_reset_wrote_is_gone_and_the_tree_is_clean(self):
-        # The whole of the reason `changes` rows are read here: an untracked `repograph.toml` is a
+        # The whole of the reason `changes` rows are read here: an untracked `zerograph.toml` is a
         # changed path like any other, so a row that touched one file would map two.
         self.dirty()
         r = self.run_reset()
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertFalse((self.wt / "repograph.toml").exists())
+        self.assertFalse((self.wt / "zerograph.toml").exists())
         self.assertEqual(git("status", "--porcelain", cwd=self.wt), "")
 
     def test_a_reset_without_the_declaration_is_refused_and_nothing_is_touched(self):
         self.dirty()
         r = self.run_reset(model=None)
         self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
-        self.assertIn("REPOGRAPH_EMBED_MODEL", r.stderr)
+        self.assertIn("ZEROGRAPH_EMBED_MODEL", r.stderr)
         self.assertEqual((self.wt / "docs/a.md").read_text(), "# edited\n")
         self.assertFalse(self.calls.exists())
 

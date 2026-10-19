@@ -18,9 +18,8 @@ pub const PICK: usize = 5;
 
 pub struct CrossEncoder { session: Session, tokenizer: Tokenizer, wants_type_ids: bool }
 
-/// Where `optimum-cli export onnx` was told to write: `~/.cache/zerograph/reranker` (the
-/// pre-rename `~/.cache/repograph/reranker` while only that exists), beside the embedder's own
-/// cache, unless the config names another directory.
+/// Where `optimum-cli export onnx` was told to write: `~/.cache/zerograph/reranker`, beside the
+/// embedder's own cache, unless the config names another directory.
 pub fn default_dir() -> Result<PathBuf> {
     crate::index::cache_dir("reranker")
 }

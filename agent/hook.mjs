@@ -77,10 +77,8 @@ function rule() {
   try { return existsSync(beside) ? readFileSync(beside, 'utf8') : RULE_FALLBACK; } catch { return RULE_FALLBACK; }
 }
 
-// The name a setting had before the rename is read while the new one is unset, so a shell profile
-// written then keeps working.
 function env(suffix) {
-  return process.env[`ZEROGRAPH_${suffix}`] ?? process.env[`REPOGRAPH_${suffix}`];
+  return process.env[`ZEROGRAPH_${suffix}`];
 }
 
 function debug(...args) {
@@ -110,10 +108,21 @@ function onPath(root, platform = process.platform) {
   return null;
 }
 
-/** PATH's absolute entries outside the checkout `root` is in: the machine's, not the repository's. */
+/**
+ * PATH's absolute entries outside the checkout `root` is in: the machine's, not the repository's.
+ * Compared as spelled and with every link followed, so neither a symlinked alias of the checkout
+ * on PATH nor a session opened through one lets the checkout's file through.
+ */
 function machineDirs(root) {
   const checkout = root && (checkoutRoot(root) ?? root);
-  return (process.env.PATH || '').split(delimiter).filter((d) => d && isAbsolute(d) && !inside(checkout, d));
+  const resolved = checkout && real(checkout);
+  return (process.env.PATH || '').split(delimiter)
+    .filter((d) => d && isAbsolute(d) && !inside(checkout, d) && !inside(resolved, real(d)));
+}
+
+/** `p` with every link followed, or as given when it does not resolve. */
+function real(p) {
+  try { return realpathSync.native(p); } catch { return p; }
 }
 
 /**
@@ -227,12 +236,8 @@ function run(root, args) {
   return r.status === 0 ? r.stdout.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '') : '';
 }
 
-// The directory the binary reads: `.zerograph` whenever anything stands at that name, else a
-// `.repograph` no write has moved yet. A manifest under the other name is no index it answers from.
 function built(root) {
-  const standing = (p) => { try { lstatSync(p); return true; } catch { return false; } };
-  const dir = standing(join(root, '.zerograph')) ? '.zerograph' : '.repograph';
-  return existsSync(join(root, dir, 'manifest.json'));
+  return existsSync(join(root, '.zerograph', 'manifest.json'));
 }
 
 /**
@@ -456,8 +461,8 @@ function intercept(payload, root, sessionKey) {
   if (env('HOOK_INTERCEPT') === '0') return null;
   const input = payload.tool_input || {};
   // A search the agent runs *with* zerograph is not one to answer beside.
-  if (payload.tool_name === 'Bash' && /\b(?:zerograph|repograph)\b/.test(String(input.command || ''))) return null;
-  if (/\.(?:zerograph|repograph)\//.test(JSON.stringify(input))) return null;
+  if (payload.tool_name === 'Bash' && /\bzerograph\b/.test(String(input.command || ''))) return null;
+  if (/\.zerograph\//.test(JSON.stringify(input))) return null;
   const words = queryWords(searchPattern(payload.tool_name, input));
   if (!words) return null;
   if (!once(sessionKey, 'ask', words.join(' ').toLowerCase())) return null;

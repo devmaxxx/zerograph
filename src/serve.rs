@@ -493,7 +493,7 @@ pub fn detach(repo: &Path, no_dense: bool, args: &[String]) -> Result<()> {
     if sys::present(&path) && sys::connect(&path).is_ok() { anyhow::bail!("another serve answers at {}", path.display()); }
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     let alive = crate::refresh::spawn_detached_logging(repo, no_dense, false, &args, "serve.log")?;
-    let log = format!("{}/serve.log", crate::store::dir_name_of(repo));
+    let log = format!("{}/serve.log", crate::store::DIR);
     let start = Instant::now();
     loop {
         if sys::present(&path) && sys::connect(&path).is_ok() {
@@ -600,7 +600,7 @@ pub fn run(repo: &Path, cfg: &config::Config, every: u64, batch: usize, idle: u6
             // for as long as it ran. Leaving is the whole of the fix — the next `ask` answers
             // in its own process under the new file, and the next `serve` starts under it too.
             if config_stamp(repo) != cfg_stamp {
-                eprintln!("serve: {} changed, exiting — start serve again to answer under it", config::project_file_name(repo));
+                eprintln!("serve: {} changed, exiting — start serve again to answer under it", config::PROJECT_FILE);
                 return Ok(());
             }
             if legacy.gone() { adopt_if_moved(&mut watcher, &mut ctx, batch)?; }

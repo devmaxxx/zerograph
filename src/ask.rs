@@ -205,6 +205,10 @@ pub(crate) fn graph_for_ask(repo: &Path, cfg: &config::Config, store: &store::St
     Ok(Read { graph, refreshed: Some(r), behind: None, writer, note: None })
 }
 
+/// The most cache shards a reader's lookup reads, each whole: near a megabyte apiece at the default
+/// cap, so an edit's few rows are read and a pull's worth is left to the refresh it starts.
+const READER_CACHE_SHARDS: usize = 32;
+
 /// A reader's sync in small steps that grow, so the first one measures the machine's rate before
 /// much of the budget is spent: 16 rows, then 32, up to 256.
 const READER_CHUNK: index::dense::ChunkBudget = index::dense::ChunkBudget { chars: 40_000, max_rows: 256, ramp: 16 };
@@ -351,7 +355,7 @@ impl Context {
             // next `update`; a reader that only asks would otherwise keep the old one forever.
             // This answer still comes from the stored vectors — the rewrite is a whole re-embed.
             if !req.stale && index::embed::switch_owed(config::names_embed_model(repo), idx.model_of_rows().as_deref(), &cfg.embed_model) {
-                let what = format!("dense: {} names {}, the vectors are {}'s", config::project_file_name(repo), cfg.embed_model, idx.model_of_rows().unwrap_or_default());
+                let what = format!("dense: {} names {}, the vectors are {}'s", config::PROJECT_FILE, cfg.embed_model, idx.model_of_rows().unwrap_or_default());
                 let busy = match writer { Writer::Barred => true, Writer::PerAnswer => matches!(store.try_lock_writer(), Ok(None)), _ => false };
                 say_once(notices, refresh::left_behind_as(repo, no_dense, &what, busy, "switching"));
             }
@@ -416,12 +420,15 @@ impl Context {
                         // the width this very query just measured.
                         let width = qvec.as_ref().map_or(idx.dim, |v| v.len());
                         idx.written_by(emb.name(), width);
-                        idx.use_cache(index::cache::VectorCache::machine(cfg.vector_cache_max));
+                        idx.use_cache(index::cache::VectorCache::machine(cfg.vector_cache_max), emb.snapshot());
+                        idx.bound_cache(READER_CACHE_SHARDS);
                         let budget = budget.get();
                         // Taken from the cache first, so the budget weighs only the rows that must
-                        // be embedded. The deadline was set when the request began, so the lookup's
-                        // time is already spent from it; `started` times the embeds alone, whose
-                        // rate is projected.
+                        // be embedded. The lookup is bounded, since it runs before the budget is
+                        // weighed: rows past the bound are owed like any other, embedded here
+                        // when they fit the budget and left to the refresh when not. The
+                        // deadline was set when the request began, so the lookup's time is already
+                        // spent from it; `started` times the embeds alone, whose rate is projected.
                         let lent = idx.take_cached(graph, &skip);
                         let owed = idx.owed(graph, &skip);
                         let started = std::time::Instant::now();

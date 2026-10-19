@@ -9,7 +9,7 @@ in full, not an empty config:
 | `doc_globs`          | `["**/*.md"]`                                                                               |
 | `code_globs`         | `["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.kt", "**/*.java", "**/*.cs", "**/*.rs", "**/*.py", "**/*.dart", "**/*.swift", "**/*.gql", "**/*.graphql", "**/*.sql", "**/*.bicep", "**/*.tf", "**/*.hcl", "**/*.sh", "**/*.bash", "**/*.vue", "**/*.lua", "**/*.go", "**/*.c", "**/*.h", "**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.c++", "**/*.ino", "**/*.hh", "**/*.hpp", "**/*.hxx", "**/*.h++", "**/*.php", "**/*.rb", "**/*.rbw", "**/*.gemspec", "**/*.rake", "**/*.ex", "**/*.exs", "**/*.scala", "**/*.sc", "**/*.ml", "**/*.mli"]` — every language in [Languages](languages.md) |
 | `text_globs`         | `[]` — files no doc or code glob claims, each read as one text node when its content is text  |
-| `skip`               | `["**/node_modules/**", "**/dist/**", "**/*.min.js", "**/.yarn/**", "**/.pnp.*", "**/target/**", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.terraform/**", "**/.dart_tool/**", "**/Pods/**", "**/vendor/**", "**/_build/**", "**/TRACKER.md", "graphify-out/**", ".zerograph/**", ".repograph/**"]` |
+| `skip`               | `["**/node_modules/**", "**/dist/**", "**/*.min.js", "**/.yarn/**", "**/.pnp.*", "**/target/**", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.terraform/**", "**/.dart_tool/**", "**/Pods/**", "**/vendor/**", "**/_build/**", "**/TRACKER.md", "graphify-out/**", ".zerograph/**"]` |
 | `include`            | `[]` — the whole repository; set, only these directories (`src`, `docs/specs`) or globs are read |
 | `registries`         | `["docs/constitution.yaml"]`                                                                |
 | `rerank_command`     | **machine file only** — headless `claude -p --model {model}` with thinking off, see [Spending tokens on purpose](rerank.md) |
@@ -18,7 +18,7 @@ in full, not an empty config:
 | `embed_model`        | `onnx-community/embeddinggemma-300m-ONNX:q4`; the model the vectors are written with — nine were measured and `zerograph model` switches it, see [Embeddings](embeddings.md) |
 | `embed_skip`         | `[]` — globs whose files get no vectors but keep their nodes, edges and lexical rows, see [Files without vectors](configuration.md#files-without-vectors) |
 | `mcp_reranks`        | `25` — rerank commands one MCP server process starts (one that fails or times out counts, an exact id that never asks the model does not) before it answers `rerank: true` from the fused order with a line saying so; `0` turns rerank over MCP off. Machine file only: the agent decides each call and the tokens are the reader's, see [MCP](mcp.md) |
-| `vector_cache_max`   | `"4G"` — bytes the machine's vector cache may hold before the least recently used rows go; a whole number of bytes or `K`/`M`/`G`/`T`; `0` turns the cache off. Machine file only: the cache is every checkout's, see [The vector cache](keeping-fresh.md#the-vector-cache) |
+| `vector_cache_max`   | `"4G"` — bytes the machine's vector cache may hold before the least recently used rows go; a whole number of bytes or `K`/`M`/`G`/`T`; `0` turns the cache off. Machine file only: the cache is every checkout's, see [The vector cache](keeping-fresh.md#the-vector-cache). `ZEROGRAPH_VECTOR_CACHE` moves the cache to another absolute directory |
 | `reader_budget`      | `10` — seconds a reader may spend refreshing before it answers from the store as it stands and leaves the rest to a detached `update`; `0` never refreshes inline. The machine file may set it; `ZEROGRAPH_READER_BUDGET` overrides, see [Keeping it fresh](keeping-fresh.md#keeping-it-fresh) |
 | `resources`          | `"balanced"` = 40% of the logical cores; `"low"` a sixth, `"full"` a half — how much of the machine a run may take, see [Resources](configuration.md#resources) |
 
@@ -106,10 +106,6 @@ beating the one below it:
 # ~/.config/zerograph/config.toml — every repository on this machine, unless it says otherwise
 rerank_model = "sonnet"
 ```
-
-Each layer still answers to its name from before the rename — `REPOGRAPH_*`, `repograph.toml`,
-`~/.config/repograph/` — until the new name is there; [coming from repograph](install.md#coming-from-repograph)
-has the exact rules.
 
 A key the repository names wins even when it names the built-in value — with one exception, and it
 runs the other way. **`rerank_command` is read from the machine file and never from a

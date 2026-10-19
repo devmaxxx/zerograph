@@ -154,10 +154,10 @@ pub fn walk_counted(repo: &Path, cfg: &Config, prev: &Manifest) -> Result<(Vec<E
     walk_inner(repo, cfg, prev, true)
 }
 
-/// The store at the repository root, under either name. Root only, as the default `skip` is: a
-/// `.repograph` deeper in the tree belongs to some other project and is content like the rest.
+/// The store at the repository root. Root only, as the default `skip` is: a `.zerograph` deeper
+/// in the tree belongs to some other project and is content like the rest.
 fn is_store(e: &ignore::DirEntry) -> bool {
-    e.depth() == 1 && (e.file_name() == crate::store::DIR || e.file_name() == crate::store::LEGACY_DIR)
+    e.depth() == 1 && e.file_name() == crate::store::DIR
 }
 
 /// A directory below the root that holds a `.git` of its own — a worktree, a clone, a submodule —
@@ -592,19 +592,18 @@ mod tests {
     fn text_cfg() -> Config { Config { text_globs: vec!["**/*".into()], ..Config::default() } }
 
     #[test]
-    fn the_store_is_not_walked_under_either_name_whatever_skip_says() {
+    fn the_store_is_not_walked_whatever_skip_says() {
         // No `.git` here: outside a checkout the store's own `.gitignore` is not read, so only the
         // walk itself keeps it out.
         let d = tempfile::tempdir().unwrap();
         let p = d.path();
         std::fs::write(p.join("ops.yaml"), "deploy: blue\n").unwrap();
-        for store in [crate::store::DIR, crate::store::LEGACY_DIR] {
-            std::fs::create_dir_all(p.join(store)).unwrap();
-            for (f, body) in [(".gitignore", "*\n"), ("manifest.json", "{}"), ("background.log", "changed 1\n")] {
-                std::fs::write(p.join(store).join(f), body).unwrap();
-            }
+        let store = p.join(crate::store::DIR);
+        std::fs::create_dir_all(&store).unwrap();
+        for (f, body) in [(".gitignore", "*\n"), ("manifest.json", "{}"), ("background.log", "changed 1\n")] {
+            std::fs::write(store.join(f), body).unwrap();
         }
-        for skip in [vec![".repograph/**".to_string()], Vec::new()] {
+        for skip in [vec!["dist/**".to_string()], Vec::new()] {
             let cfg = Config { skip, ..text_cfg() };
             let rels: Vec<String> = walk(p, &cfg, &Manifest::default()).unwrap().into_iter().map(|e| e.rel).collect();
             assert_eq!(rels, ["ops.yaml"]);

@@ -32,7 +32,7 @@ fn test_home() -> &'static std::path::Path {
 
 fn zerograph() -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph"));
-    c.env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS").env("HOME", test_home()).env("USERPROFILE", test_home());
+    c.env_remove("ZEROGRAPH_CODE_GLOBS").env("HOME", test_home()).env("USERPROFILE", test_home());
     c
 }
 

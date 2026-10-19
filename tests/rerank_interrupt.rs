@@ -25,7 +25,7 @@ fn an_interrupt_during_a_rerank_stops_the_model_command_too() {
     let zerograph = || {
         let mut c = Command::new(env!("CARGO_BIN_EXE_zerograph"));
         c.env("PATH", &path).env("ZEROGRAPH_CONFIG", dir.path().join("no-machine-config.toml"))
-            .env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS")
+            .env_remove("ZEROGRAPH_CODE_GLOBS")
             .arg("--no-dense").arg("--repo").arg(&repo);
         c
     };

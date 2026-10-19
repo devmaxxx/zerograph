@@ -32,22 +32,15 @@ use clap::{Parser, Subcommand};
 use model::Extractor;
 use std::path::PathBuf;
 
-/// `ZEROGRAPH_<suffix>`, else `REPOGRAPH_<suffix>`: a shell profile or CI file written before the
-/// rename keeps working, and the new name, once set at all, wins even when it is empty.
-pub fn env_os(suffix: &str) -> Option<std::ffi::OsString> {
-    ["ZEROGRAPH_", "REPOGRAPH_"].iter().find_map(|p| std::env::var_os(format!("{p}{suffix}")))
-}
+/// `ZEROGRAPH_<suffix>`. An empty value comes back as set; each caller decides what empty means.
+pub fn env_os(suffix: &str) -> Option<std::ffi::OsString> { std::env::var_os(env_name(suffix)) }
 
 /// [`env_os`] as text; a value that is not Unicode reads as unset, as `std::env::var` has it.
 pub fn env(suffix: &str) -> Option<String> { env_os(suffix).and_then(|v| v.into_string().ok()) }
 
 /// The variable [`env_os`] reads for `suffix`, for an error that tells the reader where a value
-/// came from: `REPOGRAPH_<suffix>` only when that is the one set.
-pub fn env_name(suffix: &str) -> String {
-    ["ZEROGRAPH_", "REPOGRAPH_"].iter().map(|p| format!("{p}{suffix}"))
-        .find(|name| std::env::var_os(name).is_some())
-        .unwrap_or_else(|| format!("ZEROGRAPH_{suffix}"))
-}
+/// came from.
+pub fn env_name(suffix: &str) -> String { format!("ZEROGRAPH_{suffix}") }
 
 #[derive(Parser)]
 #[command(name = "zerograph", version)]
@@ -242,7 +235,8 @@ enum CacheAction {
     /// Where the cache is, its cap, and the rows and bytes it holds per model.
     Status,
     /// Trims the cache to 80% of `vector_cache_max` (to nothing when it is 0), least recently
-    /// used first, and drops torn records.
+    /// used first. Every run also drops repeated and torn records and rows of an older format,
+    /// so a cache under its cap can still lose rows no reader would have returned.
     Prune,
 }
 
@@ -685,7 +679,7 @@ fn embed_all(repo: &std::path::Path, no_dense: bool, cfg: &config::Config) -> an
 fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Embedder, skip: &index::dense::EmbedSkip, cfg: &config::Config) -> anyhow::Result<()> {
     let t = std::time::Instant::now();
     let dim = emb.dim()?;
-    let cache = index::cache::VectorCache::machine(cfg.vector_cache_max);
+    let cache = index::cache::VectorCache::machine(cfg.vector_cache_max).map(|c| (c, emb.snapshot().to_string()));
     let n = pay_owed(repo, model, dim, skip, cache, &mut |texts, forwarded| emb.embed_with(texts, forwarded))?;
     println!("dense: embedded {n} rows in {:.1}s", t.elapsed().as_secs_f32());
     Ok(())
@@ -696,7 +690,7 @@ fn embed_opened(repo: &std::path::Path, model: &str, emb: &mut index::embed::Emb
 /// graph as stored, not against what this run changed, so a dense `update` over a tree nothing
 /// moved still pays them.
 #[allow(clippy::type_complexity)]
-fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, cache: Option<index::cache::VectorCache>, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
+fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense::EmbedSkip, cache: Option<(index::cache::VectorCache, String)>, embed: &mut dyn FnMut(&[String], &mut dyn FnMut(usize)) -> anyhow::Result<Vec<Vec<f32>>>) -> anyhow::Result<usize> {
     let store = store::Store::new(repo);
     // `embed` and a model switch write only vectors, but into a store this build may not write.
     if let Some(line) = store.newer_store_line() { anyhow::bail!("{line}"); }
@@ -704,7 +698,8 @@ fn pay_owed(repo: &std::path::Path, model: &str, dim: usize, skip: &index::dense
     let (graph, _) = store.load()?;
     let mut dense = index::dense::DenseIndex::load(&store)?;
     dense.written_by(model, dim);
-    dense.use_cache(cache);
+    let (cache, revision) = cache.unzip();
+    dense.use_cache(cache, revision.as_deref().unwrap_or_default());
     // Taken from the cache before the count, so the meter's total is the rows this run embeds.
     dense.take_cached(&graph, skip);
     let mut meter = Meter::new(dense.owed(&graph, skip));
@@ -746,17 +741,28 @@ fn cache_command(action: CacheAction) -> anyhow::Result<String> {
         CacheAction::Status => cache_status(&cache),
         CacheAction::Prune => {
             let p = cache.prune(cache.prune_target())?;
-            format!("cache: pruned {} rows, {} -> {}\n", p.rows, size(p.before), size(p.after))
+            let mut out = format!(
+                "cache: pruned {} rows, {} -> {}: {} least recently used, {} repeated or unreadable, {} of an older format\n",
+                p.rows(), size(p.before), size(p.after), p.evicted, p.repeated, p.older,
+            );
+            if p.failed > 0 { out.push_str(&format!("cache: {} shards could not be rewritten and were left as they were\n", p.failed)); }
+            out
         }
     })
 }
 
 fn cache_status(cache: &index::cache::VectorCache) -> String {
-    let usage = cache.status();
-    let total: u64 = usage.iter().map(|u| u.bytes).sum();
-    let mut out = format!("cache: {} — {} of {}\n", cache.root().display(), size(total), size(cache.max()));
-    for u in usage {
-        out.push_str(&format!("  {}@{}: {} rows, {}\n", terminal_safe(&u.model), u.dims, u.rows, size(u.bytes)));
+    let status = cache.status();
+    let mut out = format!("cache: {} — {} of {}\n", cache.root().display(), size(status.bytes()), size(cache.max()));
+    for u in status.models {
+        let at = match u.current {
+            true => format!("revision {}", terminal_safe(&u.revision)),
+            false => "an older format, dropped by the next prune".to_string(),
+        };
+        out.push_str(&format!("  {}@{} ({at}): {} rows, {}\n", terminal_safe(&u.model), u.dims, u.rows, size(u.bytes)));
+    }
+    if status.other > 0 {
+        out.push_str(&format!("  other formats (a later release's, or unreadable): {}\n", size(status.other)));
     }
     out
 }
@@ -788,7 +794,7 @@ fn model_report(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<
         None => say("store", "no vectors yet — `zerograph build` writes them".to_string()),
     }
     let from = match config::names_embed_model(repo) {
-        true => config::project_file_name(repo),
+        true => config::PROJECT_FILE,
         false if cfg.embed_model == index::embed::GEMMA => "the built-in default's fp32 export, which the store already holds",
         false => "the built-in default",
     };
@@ -802,7 +808,7 @@ fn model_report(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<
         out.push_str(&format!("\nThe two disagree. The store keeps answering with the model that wrote it; the\n\
             configured one takes effect at the next `build`, `update` or `embed`\n\
             (an `ask` starts one when {} names the model), which drops\n\
-            every row the other model wrote and rewrites the index whole.\n", config::project_file_name(repo)));
+            every row the other model wrote and rewrites the index whole.\n", config::PROJECT_FILE));
     }
     out.push('\n');
     out.push_str(&index::embed::catalogue(Some(opened)));
@@ -820,7 +826,7 @@ fn model_json(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<St
     Ok(serde_json::json!({
         "store": recorded,
         "configured": cfg.embed_model,
-        "configured_from": match config::names_embed_model(repo) { true => config::project_file_name(repo), false => "default" },
+        "configured_from": match config::names_embed_model(repo) { true => config::PROJECT_FILE, false => "default" },
         "this_run": crate::env("EMBED_MODEL").filter(|v| !v.trim().is_empty()),
         "agrees": agrees,
         "recommended": index::embed::RECOMMENDED,
@@ -994,7 +1000,7 @@ fn json_out(text: String, stale: &Option<refresh::Stale>) -> String {
 fn repo_root(cwd: &std::path::Path) -> PathBuf {
     let cwd = &plain(cwd.to_path_buf());
     plain(git_toplevel(cwd)
-        .or_else(|| cwd.ancestors().find(|d| [store::DIR, store::LEGACY_DIR].iter().any(|n| d.join(n).is_dir())).map(PathBuf::from))
+        .or_else(|| cwd.ancestors().find(|d| d.join(store::DIR).is_dir()).map(PathBuf::from))
         .unwrap_or_else(|| cwd.to_path_buf()))
 }
 
@@ -1088,6 +1094,12 @@ pub fn main() -> std::process::ExitCode {
 fn run(cli: Cli) -> anyhow::Result<()> {
     // First of all, before anything here starts a thread that would keep the old priority.
     if cli.background { priority::background_process(); }
+    // The cache is the machine's: it reads no repository, and a detached prune may start in a
+    // directory that has since been removed.
+    if let Cmd::Cache { action } = cli.cmd {
+        print!("{}", cache_command(action)?);
+        return Ok(());
+    }
     let repo = match &cli.repo {
         Some(repo) => plain(repo.canonicalize()?),
         None => repo_root(&std::env::current_dir()?.canonicalize()?),
@@ -1100,7 +1112,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Update { detach: true } => {
             refresh::spawn_update(&repo, cli.no_dense)?;
-            eprintln!("update: started in the background; {}/background.log has its output", store::dir_name_of(&repo));
+            eprintln!("update: started in the background; {}/background.log has its output", store::DIR);
             Ok(())
         }
         Cmd::Build | Cmd::Update { detach: false } => {
@@ -1113,7 +1125,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let r = run_update(&repo, &cfg, wipe)?;
             println!("changed {} removed {} nodes {} edges {}", r.changed, r.removed, r.nodes, r.edges);
             if r.orphan_questions {
-                eprintln!("zerograph: {}/questions.json and questions.bin are no longer read (enrich was removed in 0.6.0); delete them", store::dir_name_of(&repo));
+                eprintln!("zerograph: {}/questions.json and questions.bin are no longer read (enrich was removed in 0.6.0); delete them", store::DIR);
             }
             embed_all(&repo, cli.no_dense, &cfg).map(|()| eprintln!("{}", refresh::RUN_FINISHED))
         }
@@ -1140,10 +1152,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
                 embed_all(&repo, cli.no_dense, &cfg)
             }
         }
-        Cmd::Cache { action } => {
-            print!("{}", cache_command(action)?);
-            Ok(())
-        }
+        Cmd::Cache { .. } => unreachable!("dispatched before the repository is resolved"),
         Cmd::Model { hub_id, no_embed, json } => {
             let cfg = load_cfg()?;
             cap_pools(index::embed::threads(cfg.resources));
@@ -1204,7 +1213,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let report = status::report(&repo, false)?;
             match json {
                 true => println!("{}", serde_json::to_string(&report)?),
-                false => print!("{}", status::render(&report, &repo, "`zerograph build`")),
+                false => print!("{}", status::render(&report, "`zerograph build`")),
             }
             if follow { status::follow(&repo, &report.refresh)?; }
             Ok(())
@@ -1831,7 +1840,7 @@ mod tests {
             assert!(read.graph.nodes.is_empty() && read.refreshed.is_none());
             assert!(read.note.is_some_and(|n| n.contains("`zerograph build` builds it")), "stale={stale}");
         }
-        assert!(!repo.join(".zerograph").exists() && !repo.join(".repograph").exists());
+        assert!(!repo.join(".zerograph").exists());
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

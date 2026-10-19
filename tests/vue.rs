@@ -6,8 +6,8 @@ use std::process::Command;
 /// The binary as `tests/common` spawns it, with the globs set through the environment.
 fn zerograph(repo: &Path, globs: &str, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_zerograph"))
-        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO")
-        .env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL")
+        .env_remove("ZEROGRAPH_BENCH_REPO")
+        .env_remove("ZEROGRAPH_EMBED_MODEL")
         .env("ZEROGRAPH_CODE_GLOBS", globs)
         .arg("--no-dense")
         .arg("--repo")

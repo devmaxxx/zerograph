@@ -27,7 +27,7 @@ for suite in rec dev; do
     # Above the arm's own transcript, which `track.py` reads past: `bench` prints `model=small` for
     # the floors it graded against, and this says the hub id those floors were keyed from.
     embedder_line > "$out"
-    REPOGRAPH_NO_SERVE=1 "$B" --repo "$R" $nd bench $cases >> "$out" 2>&1
+    ZEROGRAPH_NO_SERVE=1 REPOGRAPH_NO_SERVE=1 "$B" --repo "$R" $nd bench $cases >> "$out" 2>&1
     rc=$?
     tail -3 "$out"
     # Recorded whatever the status: `bench` exits non-zero when a floor fails, and a failed floor
