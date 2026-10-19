@@ -230,7 +230,8 @@ enum Cmd {
     },
     /// A stdio MCP server: `ask`, `explain`, `impact`, `trace` and `changes` as tools, plus
     /// `status` (what the index is behind by and how far a background refresh has got), `reindex`,
-    /// `cache_status` and `switch_model`. Protocol on stdout, diagnostics on stderr; `install-agent` registers it.
+    /// `cache_status` and `switch_model`. Protocol on stdout, diagnostics on stderr. The Claude Code and
+    /// Codex plugins start it; `install-agent` registers it for the other editors.
     Mcp,
 }
 
@@ -264,6 +265,7 @@ pub(crate) struct Extractors {
     pub code: Box<dyn Extractor>,
     pub registry: Box<dyn Extractor>,
     pub text: Box<dyn Extractor>,
+    pub redact_secrets: bool,
 }
 
 /// What `enrich` wrote before 0.6.0 removed it; named so the update that finds one can say so.
@@ -280,8 +282,6 @@ pub(crate) struct UpdateReport {
     pub graph_at: Option<walk::Stamp>,
 }
 
-/// How much file text is held before it is scanned for secrets and extracted.
-const REDACT_BATCH_BYTES: usize = 64 << 20;
 
 /// Re-extracts what the diff names, drops what is gone, and writes the store back. Nothing else
 /// is read: every citation a file holds was extracted when the file was read, whatever prefix it
@@ -360,7 +360,10 @@ pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &m
     let mut batch_bytes = 0;
     let mut extract_batch = |batch: &mut Vec<(&walk::Entry, String)>| {
         if batch.is_empty() { return; }
-        let redactor = secrets::Redactor::for_texts(batch.iter().map(|(_, text)| text.as_str()));
+        let redactor = match ex.redact_secrets {
+            true => secrets::Redactor::for_texts(batch.iter().map(|(_, text)| text.as_str())),
+            false => secrets::Redactor::off(),
+        };
         for (e, text) in batch.drain(..) {
             let (text, redacted) = redactor.redact(&e.rel, &text);
             if redacted > 0 { eprintln!("{}", log_line(&format!("{}: {redacted} secret(s) redacted", e.rel))); }
@@ -386,7 +389,7 @@ pub(crate) fn apply_diff(repo: &std::path::Path, store: &store::Store, graph: &m
         };
         batch_bytes += text.len();
         batch.push((e, text));
-        if batch_bytes >= REDACT_BATCH_BYTES {
+        if batch_bytes >= secrets::BATCH_BYTES {
             extract_batch(&mut batch);
             batch_bytes = 0;
         }
@@ -661,6 +664,7 @@ pub(crate) fn extractors(repo: &std::path::Path, cfg: &config::Config) -> anyhow
         code: Box::new(code::CodeExtractor::new(resolver)),
         registry: Box::new(doc::registry::RegistryExtractor),
         text: Box::new(text::TextExtractor),
+        redact_secrets: cfg.redact_secrets,
     })
 }
 

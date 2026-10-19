@@ -1,12 +1,22 @@
 //! Credentials written inside a file that is read. `walk` refuses the files that exist to hold
 //! them (`.env`, `*.pem`); this catches the key pasted into a source file, a README or a shell
 //! script, before its text reaches `graph.json`, the lexical and dense indexes, or a rerank prompt.
+//!
+//! Coverage is by provider pattern: a token whose own shape names who issued it, a private key
+//! block, a JWT, a database URL with a password in it. The catch-all rules that guess from the
+//! word written beside a value are left out, so `password = "hunter2"` is not caught — on a real
+//! repository they flagged 53 spans and none was a secret, while one of them cost a requirement
+//! its citation.
 
 use aho_corasick::AhoCorasick;
 use secrets_scanner::{RedactionMode, ScanConfig, Scanner};
 use std::sync::OnceLock;
 
 pub const MARKER: &str = "[REDACTED_SECRET]";
+
+/// How much file text is held before it is scanned for secrets: one scanner is compiled per batch,
+/// and every text of a tree at once would be the largest allocation of a build.
+pub const BATCH_BYTES: usize = 64 << 20;
 
 /// The bundled rules, split so a scanner can be built from any subset of them. Compiling all of
 /// them costs 1.8 s, and the scanner already skips a rule whose keywords a text does not hold —
@@ -26,7 +36,8 @@ fn catalog() -> &'static Catalog {
         // The bundled rules only: `Scanner::new` would also read `$SECRETS_SCANNER_RULES` and a
         // cache in the user's data directory, so what is redacted would vary by machine.
         let mut base: toml::Table = toml::from_str(secrets_scanner::rules::BUNDLED_RULES).expect("the bundled rules parse");
-        let rules = match base.remove("rules") { Some(toml::Value::Array(r)) => r, _ => Vec::new() };
+        let rules: Vec<toml::Value> = match base.remove("rules") { Some(toml::Value::Array(r)) => r, _ => Vec::new() };
+        let rules: Vec<toml::Value> = rules.into_iter().filter(|r| r.get("id").and_then(|i| i.as_str()).is_some_and(|id| !is_catch_all(id))).collect();
         let (mut words, mut rule_of_keyword, mut unkeyworded) = (Vec::new(), Vec::new(), Vec::new());
         for (i, rule) in rules.iter().enumerate() {
             let listed: Vec<&str> = rule.get("keywords").and_then(|k| k.as_array()).into_iter().flatten().filter_map(|k| k.as_str()).collect();
@@ -36,6 +47,23 @@ fn catalog() -> &'static Catalog {
         let keywords = AhoCorasick::builder().ascii_case_insensitive(true).build(&words).expect("the rule keywords build an automaton");
         Catalog { base, rules, keywords, rule_of_keyword, unkeyworded }
     })
+}
+
+/// Rules that match a value by the word beside it — `key`, `password`, `Authorization`, a URL's
+/// `user:pass@` on any host — rather than by a shape a provider issues. On the bench fixture
+/// they read `key: 'visit.cancel'` and a type parameter as keys, and one ran across lines into
+/// the code below it.
+fn is_catch_all(id: &str) -> bool {
+    const RULES: &[&str] = &[
+        "generic-api-key",
+        "hashicorp-tf-password",
+        "curl-auth-header",
+        "curl-auth-user",
+        "kingfisher.credentials.1",
+        "kingfisher.uri.1",
+    ];
+    const FAMILIES: &[&str] = &["kingfisher.generic.", "kingfisher.http.", "kingfisher.auth.", "kingfisher.curl."];
+    RULES.contains(&id) || FAMILIES.iter().any(|f| id.starts_with(f))
 }
 
 /// A scanner for one pass's texts, holding only the rules their keywords name.
@@ -73,14 +101,28 @@ impl Redactor {
         let Some(scanner) = &self.0 else { return (text.to_string(), 0) };
         redact_found(text, &scanner.scan_content_detailed(rel, text).findings)
     }
+
+    /// A redactor that changes nothing, for a project whose `zerograph.toml` says
+    /// `redact_secrets = false`.
+    pub fn off() -> Redactor { Redactor(None) }
 }
 
 fn redact_found(text: &str, found: &[secrets_scanner::Finding]) -> (String, usize) {
-    let mut spans: Vec<(usize, usize)> = found.iter()
-        .map(|f| (f.secret_start_offset, f.secret_end_offset))
+    redact_spans(text, found.iter().map(|f| (f.secret_start_offset, f.secret_end_offset)).collect())
+}
+
+fn redact_spans(text: &str, found: Vec<(usize, usize)>) -> (String, usize) {
+    let mut spans: Vec<(usize, usize)> = found.into_iter()
         .filter(|(s, e)| s < e && *e <= text.len())
         .map(|(s, e)| (floor_boundary(text, s), ceil_boundary(text, e)))
         .collect();
+    if spans.is_empty() {
+        return (text.to_string(), 0);
+    }
+    // An id is what the graph is made of: a span holding one would take the node or the edge
+    // with it, and no provider issues a token shaped like `FR-CAL-155`.
+    let ids: Vec<(usize, usize)> = crate::ids::generic().find_all(text).into_iter().map(|h| (h.start, h.start + h.id.len())).collect();
+    spans.retain(|&(s, e)| !ids.iter().any(|&(a, b)| a < e && s < b) && !local_or_placeholder(text, s, e));
     if spans.is_empty() {
         return (text.to_string(), 0);
     }
@@ -104,6 +146,26 @@ fn redact_found(text: &str, found: &[secrets_scanner::Finding]) -> (String, usiz
     }
     out.push_str(&text[cursor..]);
     (out, count)
+}
+
+/// Whether the span sits in a connection URL that opens nothing outside the reader's machine: a
+/// loopback host, or a password that is an interpolation or a mask. CI files, compose files and
+/// `.env.example` write these by the dozen, and every one of them is meant to be read.
+fn local_or_placeholder(text: &str, start: usize, end: usize) -> bool {
+    let line_start = text[..start].rfind('\n').map_or(0, |i| i + 1);
+    let Some(scheme_end) = text[line_start..end].rfind("://").map(|i| line_start + i + 3) else { return false };
+    let authority_len = text[scheme_end..].find(|c: char| c.is_whitespace() || matches!(c, '/' | '"' | '\'' | '`' | '?' | '#')).unwrap_or(text.len() - scheme_end);
+    let authority = &text[scheme_end..scheme_end + authority_len];
+    if start >= scheme_end + authority_len { return false; }
+    let Some((userinfo, host)) = authority.rsplit_once('@') else { return false };
+    let Some((_, password)) = userinfo.split_once(':') else { return false };
+    let host = match host.strip_prefix('[') {
+        Some(v6) => v6.split(']').next().unwrap_or(""),
+        None => host.split(':').next().unwrap_or(""),
+    };
+    let loopback = host.eq_ignore_ascii_case("localhost") || host.starts_with("127.") || host == "::1" || host == "0.0.0.0";
+    let placeholder = password.starts_with(['$', '{', '<']) || password.chars().all(|c| c == '*' || c == '.');
+    loopback || placeholder
 }
 
 fn floor_boundary(text: &str, mut i: usize) -> usize {
@@ -170,11 +232,58 @@ mod tests {
         assert_eq!(redact("src/main.rs", text), (text.to_string(), 0));
     }
 
+    /// What the catch-all rules read as keys on the bench fixture, verbatim: none is a secret, and
+    /// the first cost `FR-CAL-155` its citation.
+    #[test]
+    fn the_catch_all_false_positives_of_the_fixture_come_back_unchanged() {
+        for (rel, text) in [
+            ("AvailabilityRules.kt", " * Against `when.now`, which is the whole reason that key exists: `FR-CAL-155` makes this a pure\n"),
+            ("past-time.yaml", "# The comparison is against `when.now`, which is the whole reason that key exists: FR-CAL-155\n"),
+            ("rbac.repository.ts", "  const scoped = await tx.query<{ key: PermissionKey }>(\n    `SELECT key FROM permissions`,\n  );\n"),
+            ("permissions.ts", "  {\n    key: 'visit.cancel',\n    description: 'отменить визит',\n  },\n"),
+            ("connection.spec.ts", concat!(
+                "    const { username, password } = new URL(DEV_MIGRATOR_CONNECTION_STRING);\n",
+                "    expect({ username, password }).toEqual({ username, password: roles.get(username) });\n",
+                "    const { username, password } = new URL(DEV_SYSTEM_CONNECTION_STRING);\n",
+            )),
+            ("config.md", "  password: process.env.DB_PASSWORD,\n        password: config.get('database.password'),\n"),
+        ] {
+            assert_eq!(redact(rel, text), (text.to_string(), 0), "{rel}");
+        }
+    }
+
+    #[test]
+    fn a_span_holding_an_id_is_never_redacted() {
+        let text = format!("token {} FR-CAL-155\n", github_token());
+        assert_eq!(super::redact_spans(&text, vec![(6, text.len() - 1)]), (text.clone(), 0));
+        assert_eq!(super::redact_spans(&text, vec![(6, 6 + github_token().len())]).1, 1, "the same token without the id beside it goes");
+    }
+
+    #[test]
+    fn a_database_url_is_redacted_unless_it_opens_only_the_readers_own_machine() {
+        let password = "Xk29vLq7Rm4t";
+        let remote = format!("DATABASE_URL=postgres://app:{password}@db.prod.example.net:5432/crm\n");
+        let (out, n) = redact("deploy.sh", &remote);
+        assert_eq!(n, 1, "{out}");
+        assert!(!out.contains(password), "{out}");
+        for local in [
+            "DATABASE_URL_SALON=postgres://salon_ctx:salon_ctx@localhost:5432/beauty_crm\n",
+            "url: 'postgres://app_system:app_system@127.0.0.1:5432/beauty_crm',\n",
+            "      DATABASE_URL_SALON: postgres://salon_ctx:${SALON_CTX_PASSWORD:-salon_ctx}@postgres:5432/beauty_crm\n",
+            "db:migrate: chain applied on postgres://app_migrator:***@db.prod.example.net:55440/beauty_crm\n",
+        ] {
+            assert_eq!(redact("ci.yml", local), (local.to_string(), 0), "{local}");
+        }
+    }
+
     /// The subset is only an optimisation if it finds what the whole ruleset finds, on real text
     /// that names many providers' keywords: this repository's own sources and documents.
     #[test]
     fn a_scanner_of_the_rules_a_text_names_finds_what_the_whole_ruleset_finds() {
-        let full = secrets_scanner::Scanner::from_toml(secrets_scanner::rules::BUNDLED_RULES).expect("the whole ruleset passes the strict gate");
+        let c = super::catalog();
+        let mut whole = c.base.clone();
+        whole.insert("rules".into(), toml::Value::Array(c.rules.clone()));
+        let full = secrets_scanner::Scanner::from_toml(&toml::to_string(&whole).unwrap()).expect("the provider ruleset passes the strict gate");
         let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
         let spans = |f: Vec<secrets_scanner::Finding>| { let mut s: Vec<_> = f.into_iter().map(|f| (f.rule_id, f.secret_start_offset, f.secret_end_offset)).collect(); s.sort(); s };
         let mut paths: Vec<_> = ignore::Walk::new(root).flatten().map(|e| e.into_path())

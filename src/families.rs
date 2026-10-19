@@ -235,8 +235,26 @@ impl Scan {
 
 /// The id-like prefixes the walked tree writes, with where each was first written. The only pass
 /// over the tree this module still makes, and `zerograph families` is its one caller.
-pub fn survey(repo: &Path, entries: &[Entry]) -> Result<Vec<Mention>> {
+pub fn survey(repo: &Path, entries: &[Entry], redact_secrets: bool) -> Result<Vec<Mention>> {
     let mut scan = Scan::default();
+    // Each prefix prints the line it was first written on, so the text is redacted as the
+    // extractor redacts it: a key on the line that cites an id would otherwise reach the terminal.
+    let mut batch: Vec<(&Entry, String)> = Vec::new();
+    let mut batch_bytes = 0;
+    let tally = |scan: &mut Scan, batch: &mut Vec<(&Entry, String)>| {
+        if batch.is_empty() { return; }
+        let redactor = match redact_secrets {
+            true => crate::secrets::Redactor::for_texts(batch.iter().map(|(_, t)| t.as_str())),
+            false => crate::secrets::Redactor::off(),
+        };
+        for (e, text) in batch.drain(..) {
+            let (text, _) = redactor.redact(&e.rel, &text);
+            match e.kind {
+                FileKind::Doc => scan.doc(&e.rel, &text),
+                FileKind::Code | FileKind::Registry | FileKind::Text => scan.tally_lines(&e.rel, &text),
+            }
+        }
+    };
     for e in entries {
         // A text node has no edge out of it, so what it says cites nothing a reader can follow,
         // and reading every one would make `families` pay for the whole tree.
@@ -257,11 +275,14 @@ pub fn survey(repo: &Path, entries: &[Entry]) -> Result<Vec<Mention>> {
             eprintln!("families: skipping {:?}: not UTF-8", e.rel);
             continue;
         };
-        match e.kind {
-            FileKind::Doc => scan.doc(&e.rel, &text),
-            FileKind::Code | FileKind::Registry | FileKind::Text => scan.tally_lines(&e.rel, &text),
+        batch_bytes += text.len();
+        batch.push((e, text));
+        if batch_bytes >= crate::secrets::BATCH_BYTES {
+            tally(&mut scan, &mut batch);
+            batch_bytes = 0;
         }
     }
+    tally(&mut scan, &mut batch);
     Ok(scan.finish())
 }
 
@@ -362,7 +383,7 @@ pub fn run(repo: &Path, cfg: &crate::config::Config, json: bool) -> Result<()> {
         eprintln!("families: the store is {behind} file{} behind the tree — run `zerograph update`",
             if behind == 1 { "" } else { "s" });
     }
-    let r = report(&graph, survey(repo, &entries)?);
+    let r = report(&graph, survey(repo, &entries, cfg.redact_secrets)?);
     match json {
         true => println!("{}", serde_json::to_string_pretty(&r)?),
         false => print!("{}", render(&r)),

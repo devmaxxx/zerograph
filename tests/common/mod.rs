@@ -26,6 +26,7 @@ pub fn run(repo: &Path, args: &[&str]) -> Output {
         .env_remove("ZEROGRAPH_CODE_GLOBS")
         .env_remove("ZEROGRAPH_TEXT_GLOBS")
         .env_remove("ZEROGRAPH_READER_BUDGET")
+        .env_remove("ZEROGRAPH_REDACT_SECRETS")
         .arg("--no-dense")
         .arg("--repo")
         .arg(repo)

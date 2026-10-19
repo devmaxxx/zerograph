@@ -49,10 +49,12 @@ add() {
 
 # The npm page shows the README packed with the version, so it is the repository's own, cut at
 # pack time: a hand-kept copy drifted from it. npm resolves no relative path, so each one is
-# pinned to this version's tag — images to the raw file, links to the GitHub page.
+# pinned to this version's tag — images to the raw file, links to the GitHub page. An HTML
+# `src="…"`, as the logo is written, is an image like any other.
 repo=https://github.com/devmaxxx/zerograph
 sed -E \
   -e "s#!\[([^]]*)\]\(([^):\#][^):]*)\)#![\1](https://raw.githubusercontent.com/devmaxxx/zerograph/v$version/\2)#g" \
+  -e "s#src=\"([^\":\#/][^\":]*)\"#src=\"https://raw.githubusercontent.com/devmaxxx/zerograph/v$version/\1\"#g" \
   -e "s#\]\(([^):\#][^):]*)\)#]($repo/blob/v$version/\1)#g" \
   README.md >npm/zerograph/README.md
 

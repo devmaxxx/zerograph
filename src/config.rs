@@ -82,6 +82,11 @@ pub struct Config {
     /// must not be able to empty it or grow it past what the reader chose.
     #[serde(deserialize_with = "byte_size")]
     pub vector_cache_max: u64,
+    /// Whether provider credentials written inside a read file are replaced by `[REDACTED_SECRET]`
+    /// before the text reaches the store, an index or a rerank prompt. On by default; a project
+    /// that indexes fixtures of fake keys on purpose turns it off. `ZEROGRAPH_REDACT_SECRETS`
+    /// overrides it for one run.
+    pub redact_secrets: bool,
 }
 
 /// A size as a whole number of bytes or a string of digits with a binary unit — `K`, `M`, `G` or
@@ -207,6 +212,7 @@ impl Default for Config {
             reader_budget: READER_BUDGET,
             mcp_reranks: MCP_RERANKS,
             vector_cache_max: crate::index::cache::DEFAULT_MAX,
+            redact_secrets: true,
         }
     }
 }
@@ -368,6 +374,13 @@ impl Config {
         cfg.resources = crate::index::embed::resources_from_env(cfg.resources, crate::env("RESOURCES").as_deref(), &crate::env_name("RESOURCES"))?;
         if let Some(v) = crate::env("READER_BUDGET").filter(|v| !v.trim().is_empty()) {
             cfg.reader_budget = v.trim().parse().with_context(|| format!("{}={v:?} is not a whole number of seconds", crate::env_name("READER_BUDGET")))?;
+        }
+        if let Some(v) = crate::env("REDACT_SECRETS").filter(|v| !v.trim().is_empty()) {
+            cfg.redact_secrets = match v.trim().to_ascii_lowercase().as_str() {
+                "1" | "true" | "on" | "yes" => true,
+                "0" | "false" | "off" | "no" => false,
+                _ => anyhow::bail!("{}={v:?} is neither true nor false", crate::env_name("REDACT_SECRETS")),
+            };
         }
         cfg.rerank_command = rerank_template.replace(MODEL_SLOT, &cfg.rerank_model);
         if names_model {
@@ -1027,7 +1040,7 @@ mod tests {
         }
         // Safety: the lock above makes this the only thread touching the environment.
         unsafe {
-            for k in ["CONFIG", "RERANK_MODEL", "RESOURCES", "READER_BUDGET", "CODE_GLOBS", "TEXT_GLOBS"] {
+            for k in ["CONFIG", "RERANK_MODEL", "RESOURCES", "READER_BUDGET", "CODE_GLOBS", "TEXT_GLOBS", "REDACT_SECRETS"] {
                 std::env::remove_var(format!("ZEROGRAPH_{k}"));
             }
             std::env::set_var("ZEROGRAPH_CONFIG", &path);

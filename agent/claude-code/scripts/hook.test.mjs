@@ -3,7 +3,7 @@
 // Run: `node --test agent/claude-code/scripts/hook.test.mjs`, on every platform the hook is installed on.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, symlinkSync, statSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, chmodSync, copyFileSync, symlinkSync, statSync, realpathSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, delimiter } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -58,12 +58,21 @@ function world({ store = true, answer = '', status = 0 } = {}) {
   return { root, bin, launcher, argvLog, budgetLog, cwdLog, pathLog };
 }
 
+/**
+ * The environment less what says which harness runs the hook and where its project is: a suite run
+ * from inside a Claude Code or Codex session would otherwise read that session's settings.
+ */
+function harnessless(env) {
+  const { CLAUDE_PROJECT_DIR, CLAUDE_PLUGIN_ROOT, PLUGIN_ROOT, CODEX_HOME, ...rest } = env;
+  return rest;
+}
+
 function fire(w, payload, env = {}, hook = HOOK) {
   const r = spawnSync(process.execPath, [hook], {
     input: JSON.stringify({ cwd: w.root, session_id: 'sess', ...payload }),
     encoding: 'utf8',
     env: {
-      ...process.env,
+      ...harnessless(process.env),
       PATH: `${w.bin}${delimiter}${process.env.PATH}`,
       // Windows resolves a bare name through `PATHEXT` only inside a shell, so `PATH` alone would
       // never find `zerograph.cmd`; the variable the hook already honours names it instead.
@@ -533,6 +542,50 @@ test('every call the hook waits on refreshes in process for less than its timeou
     fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: undefined });
     assert.deepEqual(budgets(w), [want], line);
   }
+});
+
+/** A checkout carrying what a 0.6.x `install-agent` committed: the script and its entries for `events`. */
+function legacyClaude(w, events) {
+  mkdirSync(join(w.root, '.claude', 'hooks'), { recursive: true });
+  writeFileSync(join(w.root, '.claude', 'hooks', 'zerograph-hook.mjs'), '// 0.6.x\n');
+  const entry = { hooks: [{ type: 'command', command: 'node "$CLAUDE_PROJECT_DIR/.claude/hooks/zerograph-hook.mjs"', timeout: 10 }] };
+  const hooks = Object.fromEntries(events.map((e) => [e, [{ matcher: '.*', ...entry }]]));
+  writeFileSync(join(w.root, '.claude', 'settings.json'), JSON.stringify({ hooks }));
+}
+
+test('a committed 0.6.x hook answers alone: the plugin is silent on the events it registers', () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  legacyClaude(w, ['SessionStart', 'PreToolUse', 'PostToolUse']);
+  const env = { CLAUDE_PROJECT_DIR: w.root, ZEROGRAPH_HOOK_SERVE: '0' };
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null);
+  assert.equal(fire(w, { hook_event_name: 'PreToolUse', tool_name: 'Bash', tool_input: { command: 'rg -n cancellation' } }, env), null);
+  assert.deepEqual(argv(w), [], 'a silent hook asks the binary nothing either');
+  assert.equal(context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }, env)), RULE,
+    'an event the old entries never registered is still the plugin\'s');
+});
+
+test('entries whose script is gone leave the plugin answering', () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  legacyClaude(w, ['SessionStart']);
+  const env = { CLAUDE_PROJECT_DIR: w.root, ZEROGRAPH_HOOK_SERVE: '0' };
+  rmSync(join(w.root, '.claude', 'hooks', 'zerograph-hook.mjs'));
+  assert.ok(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env))?.startsWith('zerograph:'));
+});
+
+test('under Codex the machine hooks file decides, and a repository\'s .claude settings do not', () => {
+  const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
+  legacyClaude(w, ['SessionStart']);
+  const home = mkdtempSync(join(tmpdir(), 'zerograph-codex-home-'));
+  const env = { PLUGIN_ROOT: join(home, 'plugin'), CODEX_HOME: home, ZEROGRAPH_HOOK_SERVE: '0' };
+  assert.ok(context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env))?.startsWith('zerograph:'),
+    'Codex never runs .claude/settings.json');
+
+  const script = join(w.root, '.codex', 'hooks', 'zerograph-hook.mjs');
+  mkdirSync(dirname(script), { recursive: true });
+  writeFileSync(script, '// 0.6.x\n');
+  writeFileSync(join(home, 'hooks.json'), JSON.stringify({ hooks: { SessionStart: [{ matcher: 'startup', hooks: [{ type: 'command', command: `node '${script}'` }] }] } }));
+  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, env), null);
+  assert.equal(context(fire(w, { hook_event_name: 'SubagentStart', agent_id: 'a1' }, env)), RULE);
 });
 
 test('SubagentStart carries the rule', () => {

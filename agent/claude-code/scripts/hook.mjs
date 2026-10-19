@@ -21,7 +21,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstat
 import { spawn, spawnSync } from 'node:child_process';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 
 import { binaryOf, checkoutOf as repositoryOf, childEnv as cutEnv, commandOf, pathKey } from './launcher.mjs';
@@ -547,6 +547,40 @@ const handlers = {
   PostToolUse: (p, root, key) => (built(root) ? riskLine(p, root, key) : null),
 };
 
+const LEGACY_HOOK = 'zerograph-hook.mjs';
+
+/** The commands a harness hooks file runs for `event`, or none when the file is absent or unreadable. */
+function hookCommands(file, event) {
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(file, 'utf8')); } catch { return []; }
+  const groups = parsed?.hooks?.[event];
+  if (!Array.isArray(groups)) return [];
+  return groups.flatMap((g) => (Array.isArray(g?.hooks) ? g.hooks : []))
+    .map((h) => [h?.command, ...(Array.isArray(h?.args) ? h.args : [])].filter((w) => typeof w === 'string').join(' '));
+}
+
+/**
+ * Whether a hook an earlier `install-agent` wired answers `event` already, so this one stays
+ * silent rather than put the brief, the seeds and the risk line in context twice. In Claude Code
+ * that is a repository's committed `.claude/settings.json`, which `install-agent` leaves for the
+ * team to retire; in Codex it is the machine's `$CODEX_HOME/hooks.json`, which nothing a
+ * repository ships can touch. Either way the old script has to be there too: an entry whose
+ * script is gone answers nothing.
+ */
+function legacyAnswers(event, root) {
+  if (!process.env.CLAUDE_PLUGIN_ROOT && process.env.PLUGIN_ROOT) {
+    const home = process.env.CODEX_HOME || join(homedir(), '.codex');
+    return hookCommands(join(home, 'hooks.json'), event).some((cmd) => {
+      const script = cmd.match(/(?:"([^"]*zerograph-hook\.mjs)"|'([^']*zerograph-hook\.mjs)'|(\S*zerograph-hook\.mjs))/);
+      const path = script && (script[1] ?? script[2] ?? script[3]);
+      return Boolean(path) && isAbsolute(path) && existsSync(path);
+    });
+  }
+  const project = process.env.CLAUDE_PROJECT_DIR || root;
+  return existsSync(join(project, '.claude', 'hooks', LEGACY_HOOK))
+    && hookCommands(join(project, '.claude', 'settings.json'), event).some((cmd) => cmd.includes(LEGACY_HOOK));
+}
+
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
@@ -561,6 +595,7 @@ async function main() {
   if (!handler) return;
   // The harness's cwd follows a `cd` into a subdirectory, which has no `.zerograph/` of its own.
   const root = (payload.cwd && indexRoot(payload.cwd)) || payload.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  if (legacyAnswers(event, root)) { debug('legacy hook answers', event); return; }
   // The subagent's own id is in the key: a subagent shares its parent's session_id, so a counter
   // keyed by session alone finds the count already past zero on a subagent's first call and says
   // nothing — which is a second reason 140 unprimed subagents went on grepping.
