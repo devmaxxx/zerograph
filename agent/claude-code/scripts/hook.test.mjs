@@ -522,6 +522,13 @@ test('an opted-in checkout with no binary says so to the person, claims no build
   }
 });
 
+test('a checkout opted in by nothing but its own index hears that the binary is missing', () => {
+  const w = world();
+  mkdirSync(join(w.root, '.git'));
+  const out = fire(w, { hook_event_name: 'SessionStart', source: 'startup' }, { PATH: join(w.root, 'nothing-here'), ZEROGRAPH_BIN: '' });
+  assert.equal(out?.systemMessage, MISSING_MESSAGE);
+});
+
 test('the missing binary is only the context line under Codex', () => {
   const w = world({ store: false });
   mkdirSync(join(w.root, '.git'));
@@ -616,23 +623,32 @@ test('a legacy entry silences the plugin only where its matcher matches', () => 
   assert.ok(argv(w2).some((a) => a.includes('ask')), 'Bash is not in Grep|Glob|Agent, so the plugin asks');
 });
 
-test('a linked worktree stands down on its main worktree\'s 0.6.x hook, and on its own from a subdirectory', () => {
-  const w = world({ store: false, answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
+test('only the project Claude Code runs can stand the plugin down: not a main worktree, not a clone the session cd\'d into', () => {
+  const grep = { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } };
+  // The old entries run `$CLAUDE_PROJECT_DIR/.claude/hooks/zerograph-hook.mjs`, so a worktree whose
+  // branch retired the script runs nothing of its main's.
+  const w = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
   const main = mkdtempSync(join(tmpdir(), 'zerograph-main-'));
   const linked = join(main, '.git', 'worktrees', 'wt');
   mkdirSync(linked, { recursive: true });
   writeFileSync(join(linked, 'commondir'), '../..\n');
   writeFileSync(join(w.root, '.git'), `gitdir: ${linked}\n`);
   legacyClaude({ root: main }, ['PreToolUse']);
-  const grep = { hook_event_name: 'PreToolUse', tool_name: 'Grep', tool_input: { pattern: 'cancellation window' } };
-  assert.equal(fire(w, grep), null, 'without CLAUDE_PROJECT_DIR the main worktree\'s entries still answer');
-  assert.deepEqual(argv(w), []);
+  fire(w, grep, { CLAUDE_PROJECT_DIR: w.root });
+  assert.ok(argv(w).some((a) => a.includes('ask')), 'the plugin answers the worktree');
+
+  const a = world({ store: false });
+  mkdirSync(join(a.root, '.git'));
+  const b = join(a.root, 'vendor', 'b');
+  mkdirSync(join(b, '.git'), { recursive: true });
+  legacyClaude({ root: b }, ['PreToolUse']);
+  assert.notEqual(fire(a, { ...grep, cwd: b }, { CLAUDE_PROJECT_DIR: a.root }), null, 'B\'s settings are not the session\'s');
 
   const own = world({ answer: 'FR-PAY-22  docs/a.md:1  cancellation' });
   mkdirSync(join(own.root, '.git'));
   mkdirSync(join(own.root, 'apps', 'web'), { recursive: true });
   legacyClaude(own, ['PreToolUse']);
-  assert.equal(fire(own, { ...grep, cwd: join(own.root, 'apps', 'web') }), null, 'a cd below the checkout still finds its settings');
+  assert.equal(fire(own, { ...grep, cwd: join(own.root, 'apps', 'web') }, { CLAUDE_PROJECT_DIR: own.root }), null, 'a cd below the project changes nothing');
 });
 
 test('standing down at SessionStart keeps the notices the 0.6.x hook never shows, and nothing else', () => {

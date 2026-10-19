@@ -200,8 +200,8 @@ function checkoutRoot(start) {
 }
 
 /**
- * Whether a checkout asked for an index: it carries a `zerograph.toml`, its main worktree has a
- * built index, or either holds the hook an older `install-agent` wrote. The plugin runs this hook
+ * Whether a checkout asked for an index: it carries a `zerograph.toml`, it or its main worktree has
+ * a built index, or either holds the hook an older `install-agent` wrote. The plugin runs this hook
  * in every repository a session opens, and a build started in each of them would be the cost a git
  * hook used to pay on every worktree add.
  */
@@ -209,7 +209,7 @@ function optedIn(checkout) {
   const asked = (dir) => ['zerograph.toml', '.claude/hooks/zerograph-hook.mjs', '.codex/hooks/zerograph-hook.mjs']
     .some((p) => existsSync(join(dir, ...p.split('/'))));
   const main = mainCheckout(checkout);
-  return asked(checkout) || (main !== null && (asked(main) || built(main)));
+  return asked(checkout) || built(checkout) || (main !== null && (asked(main) || built(main)));
 }
 
 /** The main worktree of a linked one, read off its `.git` file and the `commondir` beside it, or null. */
@@ -662,12 +662,12 @@ function legacyAnswers(event, payload, root, harness) {
       return Boolean(path) && isAbsolute(path) && existsSync(path);
     });
   }
-  // A linked worktree may run the main worktree's settings, and the hook may be started without
-  // CLAUDE_PROJECT_DIR; the script and the entries that run it count only when they sit together.
-  const checkout = checkoutRoot(root);
-  const dirs = new Set([process.env.CLAUDE_PROJECT_DIR || root, checkout, checkout && mainCheckout(checkout)].filter(Boolean));
-  return [...dirs].some((dir) => existsSync(join(dir, '.claude', 'hooks', LEGACY_HOOK))
-    && hookCommands(join(dir, '.claude', 'settings.json'), event, payload).some((cmd) => cmd.includes(LEGACY_HOOK)));
+  // Only the project Claude Code read its settings from: the old entries run the script under
+  // `$CLAUDE_PROJECT_DIR`, so a main worktree's copy, or a nested clone's the session cd'd into,
+  // answers nothing here.
+  const project = process.env.CLAUDE_PROJECT_DIR || root;
+  return existsSync(join(project, '.claude', 'hooks', LEGACY_HOOK))
+    && hookCommands(join(project, '.claude', 'settings.json'), event, payload).some((cmd) => cmd.includes(LEGACY_HOOK));
 }
 
 async function readStdin() {

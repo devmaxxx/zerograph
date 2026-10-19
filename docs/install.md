@@ -68,8 +68,8 @@ somebody edited, a link, or a directory with files of its own is left and named.
 is left too, and listed in one line: it is the team's, and serves every teammate who has no plugin
 yet. Once all of them have it, `zerograph install-agent --claude --retire-repo` (or `--codex
 --retire-repo`) takes those out as well, for a commit of their own. Until then the plugin's hook
-stays silent on every event the committed entries in `.claude/settings.json` still answer — in
-the checkout or, from a linked worktree, in its main worktree; in Codex, the entries left in
+stays silent on every event the committed entries in the session project's
+`.claude/settings.json` still answer, with the script beside them; in Codex, the entries left in
 `$CODEX_HOME/hooks.json` — so a session hears one brief, not two. At session start it still shows
 the two notices the old hook has no word for: that zerograph is not installed, and that a newer
 release is out. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
