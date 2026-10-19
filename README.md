@@ -38,6 +38,19 @@ zerograph install-agent --claude           # optional: MCP server + session hook
 `install-agent` also takes `--codex`, `--cursor`, `--copilot`, `--gemini` and `--opencode`. On
 Windows, see the [Windows notes](docs/install.md#windows-notes).
 
+## Claude Code plugin
+
+A status mod for Claude Code puts the index's state under the prompt: `◇ zerograph · in sync`, a
+progress bar while a refresh runs, the files behind and whether `serve` answers. `/zerograph`
+prints the full `zerograph status` report.
+
+```
+/plugin install zerograph --marketplace devmaxxx/zerograph
+```
+
+It is pinned to the latest release, so `claude plugin update zerograph` moves it with zerograph.
+See [the status mod](docs/install.md#claude-code-status-mod).
+
 ## In action
 
 ```
@@ -84,7 +97,6 @@ holds and `zerograph cache prune` trims it. See [the vector cache](docs/keeping-
   [configuration](docs/configuration.md)
 - **Understand it:** [how it works](docs/how-it-works.md), [the graph model](docs/graph-model.md),
   [languages](docs/languages.md), [embeddings](docs/embeddings.md), [rerank](docs/rerank.md)
-- **Measure it:** [benchmarks](docs/benchmarks.md), [history](docs/history.md)
 
 ## Contributing
 
