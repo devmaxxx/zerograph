@@ -21,7 +21,7 @@ import { existsSync, readFileSync, writeFileSync, mkdirSync, realpathSync, lstat
 import { spawn, spawnSync } from 'node:child_process';
 import { join, dirname, relative, isAbsolute } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { tmpdir, homedir } from 'node:os';
 import { createHash } from 'node:crypto';
 
 import { binaryOf, checkoutOf as repositoryOf, childEnv as cutEnv, commandOf, pathKey } from './launcher.mjs';
@@ -547,13 +547,72 @@ const handlers = {
   PostToolUse: (p, root, key) => (built(root) ? riskLine(p, root, key) : null),
 };
 
+const LEGACY_HOOK = 'zerograph-hook.mjs';
+
+/**
+ * What a group's `matcher` is tested against for `event`, as both harnesses do: the tool for the
+ * tool events, how the session began for `SessionStart`, the subagent's type for `SubagentStart`.
+ */
+function matchSubject(event, payload) {
+  if (event === 'PreToolUse' || event === 'PostToolUse') return payload.tool_name ?? '';
+  if (event === 'SessionStart') return payload.source ?? '';
+  if (event === 'SubagentStart') return payload.agent_type ?? '';
+  return null;
+}
+
+/** A matcher absent, empty or `*` matches everything; any other is a regex over the whole subject. */
+function matches(matcher, subject) {
+  if (subject === null || matcher === undefined || matcher === null || matcher === '' || matcher === '*') return true;
+  try { return new RegExp(`^(?:${matcher})$`).test(subject); } catch { return matcher === subject; }
+}
+
+/** The commands a harness hooks file runs for this payload's event, or none when the file is absent or unreadable. */
+function hookCommands(file, event, payload) {
+  let parsed;
+  try { parsed = JSON.parse(readFileSync(file, 'utf8')); } catch { return []; }
+  const groups = parsed?.hooks?.[event];
+  if (!Array.isArray(groups)) return [];
+  const subject = matchSubject(event, payload);
+  return groups.filter((g) => matches(g?.matcher, subject))
+    .flatMap((g) => (Array.isArray(g?.hooks) ? g.hooks : []))
+    .map((h) => [h?.command, ...(Array.isArray(h?.args) ? h.args : [])].filter((w) => typeof w === 'string').join(' '));
+}
+
+/** `~`, `$HOME` and `${HOME}` as the shell running a hook command would expand them. */
+function expandHome(path) {
+  return path.replace(/^(?:~|\$\{HOME\}|\$HOME)(?=\/|\\|$)/, homedir());
+}
+
+/**
+ * Whether a hook an earlier `install-agent` wired answers this event already, so this one stays
+ * silent rather than put the brief, the seeds and the risk line in context twice. In Claude Code
+ * that is a repository's committed `.claude/settings.json`, which `install-agent` leaves for the
+ * team to retire; in Codex it is the machine's `$CODEX_HOME/hooks.json`, which nothing a
+ * repository ships can touch. Either way the old script has to be there too: an entry whose
+ * script is gone answers nothing. The harness is named by the plugin's own hook command, since
+ * Codex sets `CLAUDE_PLUGIN_ROOT` as well and no variable tells the two apart.
+ */
+function legacyAnswers(event, payload, root, harness) {
+  if (harness === 'codex') {
+    const home = process.env.CODEX_HOME || join(homedir(), '.codex');
+    return hookCommands(join(home, 'hooks.json'), event, payload).some((cmd) => {
+      const script = cmd.match(/(?:"([^"]*zerograph-hook\.mjs)"|'([^']*zerograph-hook\.mjs)'|(\S*zerograph-hook\.mjs))/);
+      const path = script && expandHome(script[1] ?? script[2] ?? script[3]);
+      return Boolean(path) && isAbsolute(path) && existsSync(path);
+    });
+  }
+  const project = process.env.CLAUDE_PROJECT_DIR || root;
+  return existsSync(join(project, '.claude', 'hooks', LEGACY_HOOK))
+    && hookCommands(join(project, '.claude', 'settings.json'), event, payload).some((cmd) => cmd.includes(LEGACY_HOOK));
+}
+
 async function readStdin() {
   const chunks = [];
   for await (const chunk of process.stdin) chunks.push(chunk);
   return Buffer.concat(chunks).toString('utf8');
 }
 
-async function main() {
+async function main({ harness = process.argv.includes('--codex') ? 'codex' : 'claude' } = {}) {
   let payload;
   try { payload = JSON.parse(await readStdin()); } catch { return; }
   const event = payload.hook_event_name;
@@ -561,6 +620,7 @@ async function main() {
   if (!handler) return;
   // The harness's cwd follows a `cd` into a subdirectory, which has no `.zerograph/` of its own.
   const root = (payload.cwd && indexRoot(payload.cwd)) || payload.cwd || process.env.CLAUDE_PROJECT_DIR || process.cwd();
+  if (legacyAnswers(event, payload, root, harness)) { debug('legacy hook answers', event); return; }
   // The subagent's own id is in the key: a subagent shares its parent's session_id, so a counter
   // keyed by session alone finds the count already past zero on a subagent's first call and says
   // nothing — which is a second reason 140 unprimed subagents went on grepping.

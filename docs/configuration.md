@@ -21,6 +21,7 @@ in full, not an empty config:
 | `vector_cache_max`   | `"4G"` — bytes the machine's vector cache may hold before the least recently used rows go; a whole number of bytes or `K`/`M`/`G`/`T`; `0` turns the cache off. Machine file only: the cache is every checkout's, see [The vector cache](keeping-fresh.md#the-vector-cache). `ZEROGRAPH_VECTOR_CACHE` moves the cache to another absolute directory |
 | `reader_budget`      | `10` — seconds a reader may spend refreshing before it answers from the store as it stands and leaves the rest to a detached `update`; `0` never refreshes inline. The machine file may set it; `ZEROGRAPH_READER_BUDGET` overrides, see [Keeping it fresh](keeping-fresh.md#keeping-it-fresh) |
 | `resources`          | `"balanced"` = 40% of the logical cores; `"low"` a sixth, `"full"` a half — how much of the machine a run may take, see [Resources](configuration.md#resources) |
+| `redact_secrets`     | `true` — provider credentials inside a read file become `[REDACTED_SECRET]` before extraction; `false` keeps the text as written. `ZEROGRAPH_REDACT_SECRETS` (`true`/`false`, `1`/`0`) overrides it for one run, see [Credentials inside files](configuration.md#credentials-inside-files) |
 
 `ZEROGRAPH_CODE_GLOBS`, whitespace-separated, replaces `code_globs` for one run. It is a measurement's
 switch, as `ZEROGRAPH_EMBED_MODEL` is, so a reading can name other globs without writing a
@@ -34,15 +35,39 @@ keys and keystores, `.npmrc`, `.pypirc`, `.netrc`, `.git-credentials`, cloud cre
 `*.tfvars`, `*.tfstate` and `secrets.{yaml,json,toml,…}` — their content would otherwise reach the store, a
 `--rerank` prompt sent to a model, and the answers.
 
+### Credentials inside files
+
 A credential written inside a file that is read — a token in a source file, a key exported in a
 shell script, a private key pasted into a README — is replaced with `[REDACTED_SECRET]` before the
 file is extracted, by the bundled rules of
 [secrets_scanner](https://crates.io/crates/secrets_scanner) (gitleaks-compatible). The rest of the
-file is still read and keeps its line numbers; `update` logs how many were redacted in which file.
+file is still read and keeps its line numbers; `update` logs how many were redacted in which file,
+and `zerograph families` prints its example lines through the same redaction.
+
+Coverage is by provider pattern: a token whose own shape says who issued it (GitHub, GitLab, AWS,
+Slack, Stripe, OpenAI, Anthropic, Google, npm, PyPI, SendGrid, Twilio, Hugging Face, Discord and
+several hundred more), a JWT, a private key block, and a database connection URL with a password
+in it. The catch-all rules that judge a value by the word written beside it are left out, so
+`password = "hunter2"`, `api_key: "…"`, an `Authorization: Bearer …` header or a `user:pass@` in
+an `https://` URL are **not** caught: on a real repository they flagged dozens of spans, none of them
+a secret, among them a type parameter, a permission name and a comment whose requirement id lost
+its citation with it. Nothing that reads as an id (`FR-CAL-155`, `ADR-024`) is redacted, whatever
+rule matched it. A database URL whose host is `localhost` or a loopback address, or whose password
+is wholly an interpolation (`${DB_PASSWORD:-dev}`, `$DB_PASSWORD`, `%DB_PASSWORD%`), a
+placeholder (`<password>`) or a mask (`***`, `xxx`), is left as written: it opens nothing outside
+the reader's own machine, and CI files and compose files write them by the dozen. That holds for
+the database URL rules only: a provider token used as the password, or in any other URL on
+`localhost`, is still redacted by the provider's own rule.
+
 An inline `gitleaks:allow` does not exempt one; the rules' own path allowlist does — images, fonts,
 lockfiles, `vendor/` and `node_modules/` trees are not scanned. A run compiles only the rules whose keywords the
-files it re-reads contain — a few dozen for a one-file update, tens of milliseconds, where all ~1,000
-would cost 1.8 s.
+files it re-reads contain — a few dozen for a one-file update, tens of milliseconds, where all of them
+would cost over a second.
+
+`redact_secrets = false` turns redaction off for a project that indexes fake keys on purpose — a
+scanner's own fixtures, say. It applies to files read from then on: `zerograph build` re-reads the
+whole tree under the new setting. `ZEROGRAPH_REDACT_SECRETS=false` (or `true`) overrides the file
+for one run.
 
 The store writes its own `.gitignore` holding `*`, so `.zerograph/` stays out of a commit in a
 repository that never listed it.

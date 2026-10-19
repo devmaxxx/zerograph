@@ -67,7 +67,9 @@ A hook script goes only after the entries that run it are gone. A hook script, s
 somebody edited, a link, or a directory with files of its own is left and named. A file git tracks
 is left too, and listed in one line: it is the team's, and serves every teammate who has no plugin
 yet. Once all of them have it, `zerograph install-agent --claude --retire-repo` (or `--codex
---retire-repo`) takes those out as well, for a commit of their own. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
+--retire-repo`) takes those out as well, for a commit of their own. Until then the plugin's hook
+stays silent on every event the committed entries in `.claude/settings.json` still answer — in
+Codex, the entries left in `$CODEX_HOME/hooks.json` — so a session hears one brief, not two. Both take the `post-merge`/`post-checkout` block an earlier release wrote out of the git
 hooks, deleting a hook that held nothing else. The install runs only once the plugin installed: when
 the `claude` or `codex` CLI is missing or a step fails, it prints the commands to run by hand and
 leaves the older install in place.
