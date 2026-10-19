@@ -740,7 +740,11 @@ impl Meter {
 
 fn cache_command(action: CacheAction) -> anyhow::Result<String> {
     let max = config::Config::machine_cache_max()?;
-    let cache = index::cache::VectorCache::at(index::cache::default_root()?, max)?;
+    let root = index::cache::default_root()?;
+    let cache = match action {
+        CacheAction::Status => index::cache::VectorCache::for_status(root, max)?,
+        CacheAction::Prune => index::cache::VectorCache::at(root, max)?,
+    };
     Ok(match action {
         CacheAction::Status if max == 0 => format!("{}cache: off (vector_cache_max = 0): not read or written; `zerograph cache prune` empties it\n", cache_status(&cache)),
         CacheAction::Status => cache_status(&cache),

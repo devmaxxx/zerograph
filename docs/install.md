@@ -131,8 +131,11 @@ is an exact id, who calls a symbol, or what a change would break.
 
 The server is `zerograph --repo <checkout> mcp`, started by `scripts/mcp.mjs` under `node`: the
 `node` that `npm i -g zerograph` needed, which an install from a release archive or `cargo` has to
-put on `PATH` itself. The checkout is the one around `CLAUDE_PROJECT_DIR`, so a session opened in a
-package of a monorepo indexes the whole repository.
+put on `PATH` itself. The repository is the checkout around `CLAUDE_PROJECT_DIR`, so a session
+opened in a package of a monorepo indexes the whole repository; outside git it is the nearest
+directory above holding a `.zerograph/`, else the project directory. Claude Code starts that `node`
+by name from its own `PATH`, which the plugin cannot pin; a checkout whose directory is on that
+`PATH`, or on Windows the directory the server starts in, could put its own `node` there.
 
 **With `install-agent --claude`.** The plugin's server replaces the one `install-agent --claude`
 registers. Claude Code connects a plugin's server beside a local-scope one of the same name when
@@ -151,7 +154,9 @@ before npm's `zerograph.cmd` shim, which the mod runs through `cmd`. A zerograph
 shows nothing on the line, and `/zerograph` falls back to the tail of `background.log`. The MCP
 server's binary is found by the same rules, and a binary option that is not an absolute path, or no
 zerograph on `PATH` outside the checkout, fails its start with the reason in the server's log
-(`/mcp` shows it).
+(`/mcp` shows it). So does a `zerograph.cmd` shim when its path or the checkout's holds a character
+`cmd` would act on (`& | < > ^ " % !`): name the `zerograph.exe` the npm package ships in the
+`binary` option instead. The server runs with `PATH` cut to the entries outside the checkout.
 
 `zerograph status --json` walks the whole tree to count the files behind, so the mod runs it at
 session start, every five minutes, once after a refresh ends and after `/zerograph`. Between those

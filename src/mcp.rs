@@ -398,7 +398,7 @@ fn tools() -> Vec<Value> {
         }), &[]),
         tool("status", "The index's state: size, files behind the tree, the model that wrote the vectors against the configured one, and whether a background refresh is running and how far it has got.", json!({}), &[]),
         tool("reindex", "Starts a background refresh of the index and returns at once: a first build where there is no index, else an update. Says so when one is already running. Follow it with `status`.", json!({}), &[]),
-        tool("cache_status", "The machine's vector cache, which every checkout reads before it embeds: where it is, its cap, and the rows and bytes it holds per model. Reads only.", json!({}), &[]),
+        tool("cache_status", "The machine's vector cache, which every checkout reads before it embeds: where it is, its cap, and the rows and bytes it holds per model. Writes nothing; a cache not made yet reads as empty.", json!({}), &[]),
         tool("switch_model", "Re-embeds the index under another embedding model, in the background. Only catalogued models and ones the user has trusted with `zerograph model <id>`; any other id is refused.", json!({
             "model": { "type": "string", "description": "A hub id." },
         }), &["model"]),

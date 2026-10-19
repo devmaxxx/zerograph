@@ -3,13 +3,13 @@
 // answers one MCP request. Run: `node --test agent/claude-code/scripts/mcp.test.mjs`.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, realpathSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 
-import { binaryOf, argvOf, checkoutOf } from './mcp.mjs';
+import { binaryOf, argvOf, checkoutOf, childEnv } from './mcp.mjs';
 
 const LAUNCHER = join(dirname(fileURLToPath(import.meta.url)), 'mcp.mjs');
 const WIN = process.platform === 'win32';
@@ -24,7 +24,9 @@ function world() {
   const machine = join(base, 'machine');
   for (const dir of [local, machine]) {
     mkdirSync(dir, { recursive: true });
-    writeFileSync(join(dir, WIN ? 'zerograph.exe' : 'zerograph'), '');
+    const file = join(dir, WIN ? 'zerograph.exe' : 'zerograph');
+    writeFileSync(file, '');
+    chmodSync(file, 0o755);
   }
   return { base, checkout, local, machine };
 }
@@ -43,6 +45,29 @@ test('a PATH entry inside the checkout is passed over, relative or absolute', ()
   const w = world();
   const path = ['node_modules/.bin', w.local, w.machine].join(sep);
   assert.strictEqual(binaryOf('', { path, checkout: w.checkout, win: WIN }).bin, join(w.machine, WIN ? 'zerograph.exe' : 'zerograph'));
+});
+
+test('a symlinked alias of the checkout on PATH is the checkout', { skip: WIN && 'symlinks need a privilege' }, () => {
+  const w = world();
+  const alias = join(w.base, 'alias');
+  symlinkSync(w.checkout, alias);
+  const path = [join(alias, 'node_modules', '.bin'), w.machine].join(sep);
+  assert.strictEqual(binaryOf('', { path, checkout: w.checkout, win: WIN }).bin, join(w.machine, 'zerograph'));
+  assert.strictEqual(binaryOf('', { path, checkout: alias, win: WIN }).bin, join(w.machine, 'zerograph'), 'a session opened through the alias');
+});
+
+test('a file on PATH that is not executable is not a zerograph', { skip: WIN && 'no exec bit' }, () => {
+  const w = world();
+  const plain = join(w.base, 'plain');
+  mkdirSync(plain);
+  writeFileSync(join(plain, 'zerograph'), '');
+  assert.strictEqual(binaryOf('', { path: [plain, w.machine].join(sep), checkout: w.checkout, win: WIN }).bin, join(w.machine, 'zerograph'));
+});
+
+test('the server PATH is cut to the machine entries', () => {
+  const w = world();
+  const env = { [WIN ? 'Path' : 'PATH']: ['node_modules/.bin', w.local, w.machine].join(sep), HOME: '/h' };
+  assert.deepStrictEqual(childEnv(env, w.checkout, WIN), { [WIN ? 'Path' : 'PATH']: w.machine, HOME: '/h' });
 });
 
 test('an absolute option is the one started, even inside the checkout', () => {
@@ -66,12 +91,30 @@ test('nothing on PATH outside the checkout is an error that says how to fix it',
 test('the server is told the checkout around the project, not a package inside it', () => {
   const w = world();
   assert.strictEqual(checkoutOf(join(w.checkout, 'packages', 'app')), w.checkout);
-  assert.deepStrictEqual(argvOf('/usr/local/bin/zerograph', w.checkout), ['/usr/local/bin/zerograph', '--repo', w.checkout, 'mcp']);
+  assert.deepStrictEqual(argvOf('/usr/local/bin/zerograph', w.checkout).argv, ['/usr/local/bin/zerograph', '--repo', w.checkout, 'mcp']);
+});
+
+test('outside git the repository is the nearest directory above holding a store, else the project', () => {
+  const base = realpathSync(mkdtempSync(join(tmpdir(), 'zerograph-mcp-test-')));
+  const project = join(base, 'repo', 'packages', 'app');
+  mkdirSync(project, { recursive: true });
+  assert.strictEqual(checkoutOf(project), project);
+  mkdirSync(join(base, 'repo', '.zerograph'));
+  assert.strictEqual(checkoutOf(project), join(base, 'repo'));
 });
 
 test('an npm .cmd shim is started through cmd, an .exe directly', () => {
-  assert.deepStrictEqual(argvOf('C:\\npm\\zerograph.cmd', 'C:\\work', 'C:\\Windows\\cmd.exe'), ['C:\\Windows\\cmd.exe', '/d', '/c', 'call', 'C:\\npm\\zerograph.cmd', '--repo', 'C:\\work', 'mcp']);
-  assert.deepStrictEqual(argvOf('C:\\bin\\zerograph.exe', 'C:\\work'), ['C:\\bin\\zerograph.exe', '--repo', 'C:\\work', 'mcp']);
+  assert.deepStrictEqual(argvOf('C:\\npm\\zerograph.cmd', 'C:\\work', 'C:\\Windows\\cmd.exe').argv, ['C:\\Windows\\cmd.exe', '/d', '/c', 'call', 'C:\\npm\\zerograph.cmd', '--repo', 'C:\\work', 'mcp']);
+  assert.deepStrictEqual(argvOf('C:\\bin\\zerograph.exe', 'C:\\work').argv, ['C:\\bin\\zerograph.exe', '--repo', 'C:\\work', 'mcp']);
+});
+
+test('a .cmd shim is refused when cmd would act on a character in its path or the checkout', () => {
+  for (const [bin, checkout] of [['C:\\npm\\zerograph.cmd', 'C:\\src\\R&D'], ['C:\\npm\\zerograph.cmd', 'C:\\x&calc'], ['C:\\100%\\zerograph.cmd', 'C:\\work'], ['C:\\npm\\zerograph.cmd', 'C:\\a^b|c<d>e"f!g']]) {
+    const launch = argvOf(bin, checkout, 'cmd.exe');
+    assert.strictEqual(launch.argv, undefined, checkout);
+    assert.match(launch.error, /character cmd would act on/);
+  }
+  assert.ok(argvOf('C:\\bin\\zerograph.exe', 'C:\\src\\R&D').argv, 'an .exe takes no cmd, so nothing is refused');
 });
 
 // The fake is a Node script so the protocol round trip reads the same on every platform.
