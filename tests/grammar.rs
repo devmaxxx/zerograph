@@ -6,7 +6,7 @@ use std::process::Command;
 
 fn zerograph(repo: &std::path::Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_zerograph"))
-        .env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS")
+        .env_remove("ZEROGRAPH_CODE_GLOBS")
         .arg("--no-dense").arg("--repo").arg(repo).args(args).output().unwrap();
     (out.status.success(), String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned())
 }

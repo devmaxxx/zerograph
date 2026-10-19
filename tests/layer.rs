@@ -37,7 +37,7 @@ fn the_environment_names_the_globs_for_one_run_over_the_repository_s_own() {
         write(repo, "web/a.ts", "export function boot() {}\n");
         write(repo, "mobile/Pet.kt", "class Pet\n");
         let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_zerograph"));
-        cmd.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS");
+        cmd.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS");
         if let Some(g) = globs {
             cmd.env("ZEROGRAPH_CODE_GLOBS", g);
         }
@@ -88,7 +88,7 @@ fn a_build_names_the_text_files_it_left_out_for_size() {
     write(repo, "ops/deploy.yaml", "strategy: blue-green\n");
     write(repo, "data/dump.csv", &"a,b\n".repeat(300_000));
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_zerograph"))
-        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS")
+        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS")
         .env("ZEROGRAPH_TEXT_GLOBS", "**/*")
         .args(["--no-dense", "--repo"]).arg(repo).arg("build").output().unwrap();
     let err = String::from_utf8_lossy(&out.stderr);
@@ -109,7 +109,7 @@ fn git(repo: &Path, args: &[&str]) {
 
 fn with_text(repo: &Path, args: &[&str]) -> (String, String) {
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_zerograph"))
-        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS")
+        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS")
         .env("ZEROGRAPH_TEXT_GLOBS", "**/*")
         .args(["--no-dense", "--repo"]).arg(repo).args(args).output().unwrap();
     let (o, e) = (String::from_utf8_lossy(&out.stdout).into_owned(), String::from_utf8_lossy(&out.stderr).into_owned());

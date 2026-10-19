@@ -77,10 +77,8 @@ function rule() {
   try { return existsSync(beside) ? readFileSync(beside, 'utf8') : RULE_FALLBACK; } catch { return RULE_FALLBACK; }
 }
 
-// The name a setting had before the rename is read while the new one is unset, so a shell profile
-// written then keeps working.
 function env(suffix) {
-  return process.env[`ZEROGRAPH_${suffix}`] ?? process.env[`REPOGRAPH_${suffix}`];
+  return process.env[`ZEROGRAPH_${suffix}`];
 }
 
 function debug(...args) {
@@ -238,12 +236,8 @@ function run(root, args) {
   return r.status === 0 ? r.stdout.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, '') : '';
 }
 
-// The directory the binary reads: `.zerograph` whenever anything stands at that name, else a
-// `.repograph` no write has moved yet. A manifest under the other name is no index it answers from.
 function built(root) {
-  const standing = (p) => { try { lstatSync(p); return true; } catch { return false; } };
-  const dir = standing(join(root, '.zerograph')) ? '.zerograph' : '.repograph';
-  return existsSync(join(root, dir, 'manifest.json'));
+  return existsSync(join(root, '.zerograph', 'manifest.json'));
 }
 
 /**
@@ -467,8 +461,8 @@ function intercept(payload, root, sessionKey) {
   if (env('HOOK_INTERCEPT') === '0') return null;
   const input = payload.tool_input || {};
   // A search the agent runs *with* zerograph is not one to answer beside.
-  if (payload.tool_name === 'Bash' && /\b(?:zerograph|repograph)\b/.test(String(input.command || ''))) return null;
-  if (/\.(?:zerograph|repograph)\//.test(JSON.stringify(input))) return null;
+  if (payload.tool_name === 'Bash' && /\bzerograph\b/.test(String(input.command || ''))) return null;
+  if (/\.zerograph\//.test(JSON.stringify(input))) return null;
   const words = queryWords(searchPattern(payload.tool_name, input));
   if (!words) return null;
   if (!once(sessionKey, 'ask', words.join(' ').toLowerCase())) return null;

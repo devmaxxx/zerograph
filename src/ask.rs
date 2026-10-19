@@ -355,7 +355,7 @@ impl Context {
             // next `update`; a reader that only asks would otherwise keep the old one forever.
             // This answer still comes from the stored vectors — the rewrite is a whole re-embed.
             if !req.stale && index::embed::switch_owed(config::names_embed_model(repo), idx.model_of_rows().as_deref(), &cfg.embed_model) {
-                let what = format!("dense: {} names {}, the vectors are {}'s", config::project_file_name(repo), cfg.embed_model, idx.model_of_rows().unwrap_or_default());
+                let what = format!("dense: {} names {}, the vectors are {}'s", config::PROJECT_FILE, cfg.embed_model, idx.model_of_rows().unwrap_or_default());
                 let busy = match writer { Writer::Barred => true, Writer::PerAnswer => matches!(store.try_lock_writer(), Ok(None)), _ => false };
                 say_once(notices, refresh::left_behind_as(repo, no_dense, &what, busy, "switching"));
             }

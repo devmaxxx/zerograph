@@ -228,7 +228,7 @@ pub(crate) fn log_tail(repo: &Path, name: &str) -> Vec<String> {
 
 /// The report as lines. `build` is how the reader builds an empty index: a person runs a
 /// command, an agent calls a tool.
-pub(crate) fn render(r: &Report, repo: &Path, build: &str) -> String {
+pub(crate) fn render(r: &Report, build: &str) -> String {
     let mut out = String::new();
     let mut say = |line: String| { out.push_str(&line); out.push('\n'); };
     say(match &r.index {
@@ -270,7 +270,7 @@ pub(crate) fn render(r: &Report, repo: &Path, build: &str) -> String {
         (false, _) => format!("serve: not running (nothing answers at {})", r.serve.socket),
     });
     if !r.serve.log.is_empty() {
-        let log = format!("{}/serve.log", store::dir_name_of(repo));
+        let log = format!("{}/serve.log", store::DIR);
         match r.serve.running {
             true => say(format!("  last lines of {log}:")),
             false => say(format!("  last lines of {log}, from the server that ran last:")),
@@ -368,7 +368,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let r = report(dir.path(), false).unwrap();
         assert!(matches!(r.index, Index::Empty) && matches!(r.refresh, Refresh::None) && !r.serve.running);
-        let text = render(&r, dir.path(), "`zerograph build`");
+        let text = render(&r, "`zerograph build`");
         assert!(text.starts_with("index: empty; `zerograph build` builds it\n"), "{text}");
         assert!(text.contains(&format!("serve: not running (nothing answers at {})\n", serve::socket_path(dir.path()).display())),
                 "the report names the socket it checked: {text}");
@@ -388,7 +388,7 @@ mod tests {
         std::fs::write(dir.path().join("docs/b.md"), "# B\n").unwrap();
         let r = report(dir.path(), false).unwrap();
         assert!(matches!(&r.tree, Tree::NewerGrammar { grammar, release } if *grammar == walk::GRAMMAR + 1 && release == "9.9.9"));
-        let text = render(&r, dir.path(), "`build`");
+        let text = render(&r, "`build`");
         assert!(text.contains(&format!("grammar {} (zerograph 9.9.9), newer than this build's {}", walk::GRAMMAR + 1, walk::GRAMMAR)), "{text}");
         assert_eq!(serde_json::to_value(&r).unwrap()["tree"]["state"], "newer_grammar");
     }
@@ -400,7 +400,7 @@ mod tests {
         std::fs::write(store::dir_of(dir.path()).join("graph.json"), "{ not json").unwrap();
         std::fs::write(store::dir_of(dir.path()).join("background.log"), "refresh: started\nchanged 1 removed 0 nodes 2 edges 3\n").unwrap();
         let r = report(dir.path(), false).unwrap();
-        assert!(matches!(r.index, Index::Unreadable { .. }), "{}", render(&r, dir.path(), "`build`"));
+        assert!(matches!(r.index, Index::Unreadable { .. }), "{}", render(&r, "`build`"));
         assert_eq!(r.last_run, ["changed 1 removed 0 nodes 2 edges 3"]);
     }
 

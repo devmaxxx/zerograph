@@ -108,13 +108,9 @@ async function runStatus($: Api, configured: string, json: boolean): Promise<str
   return ran?.exitCode === 0 && ran.stdout.trim() ? ran.stdout : undefined
 }
 
-// A store built before the rename still sits under `.repograph` until a write moves it.
 async function storeDir($: Api): Promise<string | undefined> {
-  const root = await $.session.root()
-  for (const name of ['.zerograph', '.repograph']) {
-    if (await $.fs.exists(`${root}/${name}`)) return `${root}/${name}`
-  }
-  return undefined
+  const dir = `${await $.session.root()}/.zerograph`
+  return (await $.fs.exists(dir)) ? dir : undefined
 }
 
 // A log untouched since `since` is not read: the overlay keeps the full report's reading of it.

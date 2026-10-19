@@ -40,12 +40,6 @@ pub struct Config {
     /// its own transport asked for, so the commands that spend refuse rather than fall through.
     #[serde(skip)]
     pub refused_commands: Vec<&'static str>,
-    /// The project file this was read from, by name: `zerograph.toml`, or the `repograph.toml` of
-    /// an earlier install while that is the only one there. A notice that tells the reader which
-    /// file to open says this one, and a reader who followed a wrong name would start a second
-    /// file that outranks the first.
-    #[serde(skip)]
-    pub file: &'static str,
     /// Directory holding `model.onnx` and `tokenizer.json` for `ask --rerank-local`; empty
     /// means `~/.cache/zerograph/reranker`.
     pub reranker_dir: String,
@@ -196,7 +190,6 @@ impl Default for Config {
                 "**/TRACKER.md",
                 "graphify-out/**",
                 ".zerograph/**",
-                ".repograph/**",
             ]),
             id_families: None,
             milestone_families: None,
@@ -207,7 +200,6 @@ impl Default for Config {
             rerank_command: RERANK_COMMAND.replace(MODEL_SLOT, RERANK_MODEL),
             rerank_model: RERANK_MODEL.into(),
             refused_commands: Vec::new(),
-            file: PROJECT_FILE,
             reranker_dir: String::new(),
             embed_model: crate::index::embed::DEFAULT_MODEL.into(),
             embed_skip: Vec::new(),
@@ -265,30 +257,8 @@ fn config_home() -> Option<std::path::PathBuf> {
     }
 }
 
-/// The machine file from before the rename, `zerograph`'s directory spelled `repograph`. `None`
-/// when the environment names the file, which names it under either name.
-fn legacy_machine_path() -> Option<std::path::PathBuf> {
-    if crate::env("CONFIG").is_some_and(|v| !v.is_empty()) { return None; }
-    Some(config_home()?.join("repograph").join("config.toml"))
-}
-
-/// The machine file this process reads, and the one a notice names: the new file, else one from
-/// before the rename, else the new name for a file not written yet. Never both, so a reader who
-/// starts a new file has moved, not merged, and nothing is read from two places at once.
-fn machine_read_path() -> Option<std::path::PathBuf> {
-    let new = machine_path()?;
-    match legacy_machine_path() {
-        Some(old) if !new.exists() && old.exists() => Some(old),
-        _ => Some(new),
-    }
-}
-
-fn legacy_machine_file_beside(read: &Path) -> Option<std::path::PathBuf> {
-    legacy_machine_path().filter(|old| old != read && old.exists())
-}
-
 fn machine_display() -> String {
-    machine_read_path().map_or_else(|| "~/.config/zerograph/config.toml".to_string(), |p| p.display().to_string())
+    machine_path().map_or_else(|| "~/.config/zerograph/config.toml".to_string(), |p| p.display().to_string())
 }
 
 /// The model name is substituted into a shell command, so it is a token: a vendor's name, a tag, a
@@ -318,10 +288,7 @@ impl Config {
     /// what the repository asked for.
     pub fn load(repo: &Path) -> Result<Config> {
         let path = project_file(repo);
-        let file = name_of(&path);
-        if file == PROJECT_FILE && legacy_file_is_shadowed(repo) {
-            let _ = writeln!(std::io::stderr(), "{LEGACY_PROJECT_FILE} is not read beside {PROJECT_FILE} — move what it still says into {PROJECT_FILE} and remove it");
-        }
+        let file = PROJECT_FILE;
         let text = match path.exists() {
             true => Some(std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?),
             false => None,
@@ -330,7 +297,6 @@ impl Config {
             Some(t) => toml::from_str::<Config>(t).with_context(|| format!("parse {}", path.display()))?,
             None => Config::default(),
         };
-        cfg.file = file;
         // Which keys the project actually wrote, as opposed to the ones serde filled from
         // `Default`: without this the machine layer could never win, every key always being set.
         let named: toml::Table = match &text {
@@ -426,7 +392,7 @@ impl Config {
         self.refused_commands.contains(&key).then(|| format!(
             "{file} names {key}, which is not read from a repository, and the default in its place is a paid model — \
              set {key} in {} or remove it from {file}",
-            machine_display(), file = self.file))
+            machine_display(), file = PROJECT_FILE))
     }
 
     /// One line per key a project file still names. Families are the prefixes the documents
@@ -437,12 +403,12 @@ impl Config {
     fn say_the_retired_keys_are_no_longer_read(&self, w: &mut impl std::io::Write) {
         for key in [("id_families", self.id_families.is_some()), ("milestone_families", self.milestone_families.is_some())] {
             if key.1 {
-                let _ = writeln!(w, "{}: {} is no longer read — families are derived from the documents' definitions", self.file, key.0);
+                let _ = writeln!(w, "{}: {} is no longer read — families are derived from the documents' definitions", PROJECT_FILE, key.0);
             }
         }
         for key in [("enrich_command", self.enrich_command.is_some()), ("enrich_model", self.enrich_model.is_some()), ("enrich_languages", self.enrich_languages.is_some())] {
             if key.1 {
-                let _ = writeln!(w, "{}: {} is no longer read — enrich was removed in 0.6.0", self.file, key.0);
+                let _ = writeln!(w, "{}: {} is no longer read — enrich was removed in 0.6.0", PROJECT_FILE, key.0);
             }
         }
     }
@@ -456,15 +422,9 @@ impl Config {
     /// file is an error naming the file: a setting silently ignored on every repository at once is
     /// worse than a refusal.
     fn machine() -> Result<Machine> {
-        let Some(path) = machine_read_path() else { return Ok(Machine::default()) };
+        let Some(path) = machine_path() else { return Ok(Machine::default()) };
         if !path.exists() {
             return Ok(Machine::default());
-        }
-        // What the old file set, a rerank command or a budget, stops applying the day a new file
-        // appears, and nothing else would say so.
-        if let Some(old) = legacy_machine_file_beside(&path) {
-            let _ = writeln!(std::io::stderr(), "{} is not read beside {} — move what it still says into {} and remove it",
-                old.display(), path.display(), path.display());
         }
         let text = std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
         toml::from_str(&text).with_context(|| format!("parse {}", path.display()))
@@ -501,31 +461,7 @@ fn comma_outside_braces(glob: &str) -> bool {
 /// The one file outside `.zerograph/` this tool writes, and the only key it writes into it.
 pub const PROJECT_FILE: &str = "zerograph.toml";
 
-pub const LEGACY_PROJECT_FILE: &str = "repograph.toml";
-
-/// The project file to read and to write: `zerograph.toml`, else a `repograph.toml` from before
-/// the rename, else `zerograph.toml` for a file not written yet. A model switch rewrites the old
-/// file where it stands rather than starting a new one, which would leave the old one unread.
-pub fn project_file(repo: &Path) -> std::path::PathBuf {
-    let new = repo.join(PROJECT_FILE);
-    let old = repo.join(LEGACY_PROJECT_FILE);
-    if !new.exists() && old.exists() { old } else { new }
-}
-
-/// [`project_file`]'s name, for a line that tells the reader which file to open.
-pub fn project_file_name(repo: &Path) -> &'static str { name_of(&project_file(repo)) }
-
-fn name_of(path: &Path) -> &'static str {
-    if path.ends_with(LEGACY_PROJECT_FILE) { LEGACY_PROJECT_FILE } else { PROJECT_FILE }
-}
-
-/// Whether a `repograph.toml` stands beside the `zerograph.toml` that is read, as a file of its
-/// own. A link from the new name to the old one keeps both binaries reading one file, and a notice
-/// telling its owner to remove the old name would break it.
-fn legacy_file_is_shadowed(repo: &Path) -> bool {
-    let old = repo.join(LEGACY_PROJECT_FILE);
-    old.exists() && old.canonicalize().ok() != repo.join(PROJECT_FILE).canonicalize().ok()
-}
+pub fn project_file(repo: &Path) -> std::path::PathBuf { repo.join(PROJECT_FILE) }
 
 /// Beside the machine file: the hub ids this machine's reader agreed to download and load, one per
 /// line, written by `zerograph model`. Not a key of the machine file, which is the reader's prose
@@ -537,8 +473,7 @@ fn trust_path() -> Option<std::path::PathBuf> {
 /// Whether `embed_model` may be read from a repository's file. A model is code this machine
 /// downloads and hands to a parser, and a cloned repository is untrusted input: the catalogue's
 /// models are the ones `bench` measured, and any other is one the reader named with
-/// `zerograph model` on this machine — under either name, since a trust given before the rename
-/// is still the reader's.
+/// `zerograph model` on this machine.
 pub fn model_is_trusted(model: &str) -> bool { trusted_spelling(model).is_some() }
 
 /// The spelling `model_is_trusted` accepted it under: the catalogue's, else the line the reader
@@ -554,7 +489,6 @@ pub fn trusted_spelling(model: &str) -> Option<String> {
     model.eq_ignore_ascii_case(default).then(|| default.to_string())
         .or_else(|| crate::index::embed::measured(model).map(|m| m.model.to_string()))
         .or_else(|| trust_path().and_then(listed))
-        .or_else(|| legacy_machine_path().map(|p| p.with_file_name("trusted-models")).and_then(listed))
 }
 
 /// Whether the store holds rows gemma's fp32 export wrote, the default before its q4 export. The
@@ -606,7 +540,7 @@ pub fn set_embed_model(repo: &Path, model: &str) -> Result<std::path::PathBuf> {
         true => Some(std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?),
         false => None,
     };
-    let after = with_embed_model(before.as_deref(), model, name_of(&path))?;
+    let after = with_embed_model(before.as_deref(), model)?;
     // The pid is in the name because two `zerograph model` runs in the same repository would
     // otherwise write the same temporary file, and the second write can land between the first
     // write and its rename — a file that is half one run's text and half the other's.
@@ -626,8 +560,8 @@ pub fn set_embed_model(repo: &Path, model: &str) -> Result<std::path::PathBuf> {
 }
 
 /// The file's text with `embed_model` set to `model`; `None` for a file that is not there yet.
-/// `file` is the name an error gives it, which is `repograph.toml` while that is the one read.
-fn with_embed_model(before: Option<&str>, model: &str, file: &str) -> Result<String> {
+fn with_embed_model(before: Option<&str>, model: &str) -> Result<String> {
+    let file = PROJECT_FILE;
     // The value is about to be written as a basic TOML string. Anything that could close that
     // string writes a file the next `Config::load` refuses, which is a repository left broken by
     // a command whose whole promise is that it leaves a working state.
@@ -954,7 +888,7 @@ mod tests {
     /// file has is checked here, because there is no rollback for a clobbered one.
     #[test]
     fn setting_the_model_replaces_the_value_and_nothing_else() {
-        let same = |before: &str, after: &str| assert_eq!(with_embed_model(Some(before), "BAAI/bge-m3", PROJECT_FILE).unwrap(), after);
+        let same = |before: &str, after: &str| assert_eq!(with_embed_model(Some(before), "BAAI/bge-m3").unwrap(), after);
         same(
             "# why this repository indexes what it does\nskip = [\"dist/**\"]\nembed_model = \"intfloat/multilingual-e5-small\"\nrerank_model = \"sonnet\"\n",
             "# why this repository indexes what it does\nskip = [\"dist/**\"]\nembed_model = \"BAAI/bge-m3\"\nrerank_model = \"sonnet\"\n",
@@ -964,17 +898,17 @@ mod tests {
         same("  \"embed_model\"   =    'a/b'\n", "  \"embed_model\"   =    \"BAAI/bge-m3\"\n");
         same("'embed_model' = \"a/b\"", "'embed_model' = \"BAAI/bge-m3\"");
         // A key whose name merely starts with it is a different key.
-        assert!(with_embed_model(Some("embed_model_old = \"a/b\"\n"), "x/y", PROJECT_FILE).unwrap().contains("embed_model_old = \"a/b\""));
+        assert!(with_embed_model(Some("embed_model_old = \"a/b\"\n"), "x/y").unwrap().contains("embed_model_old = \"a/b\""));
     }
 
     #[test]
     fn a_file_that_never_named_the_key_gains_it_with_a_line_saying_what_it_is() {
-        let written = with_embed_model(Some("skip = [\"dist/**\"]\n"), "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let written = with_embed_model(Some("skip = [\"dist/**\"]\n"), "BAAI/bge-m3").unwrap();
         assert!(written.starts_with("skip = [\"dist/**\"]\n"), "{written}");
         assert!(written.contains("embed_model = \"BAAI/bge-m3\"\n"), "{written}");
         assert!(written.contains("# The model"), "{written}");
         // A file that is not there yet holds the key and nothing else.
-        let fresh = with_embed_model(None, "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let fresh = with_embed_model(None, "BAAI/bge-m3").unwrap();
         assert_eq!(fresh.lines().filter(|l| !l.starts_with('#')).collect::<Vec<_>>(), vec!["embed_model = \"BAAI/bge-m3\""]);
     }
 
@@ -983,13 +917,13 @@ mod tests {
     /// reads. The one place it can go is above the first header.
     #[test]
     fn a_file_that_opens_a_table_gets_the_key_above_the_header() {
-        let written = with_embed_model(Some("[profile]\nx = 1\n"), "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let written = with_embed_model(Some("[profile]\nx = 1\n"), "BAAI/bge-m3").unwrap();
         assert!(written.starts_with("# "), "{written}");
         assert!(written.trim_end().ends_with("[profile]\nx = 1"), "{written}");
         assert_eq!(toml::from_str::<toml::Table>(&written).unwrap()["embed_model"].as_str(), Some("BAAI/bge-m3"));
         // And a key under a header is that table's, not this one: it is left alone and the
         // top-level key is written above.
-        let nested = with_embed_model(Some("[profile]\nembed_model = \"theirs\"\n"), "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let nested = with_embed_model(Some("[profile]\nembed_model = \"theirs\"\n"), "BAAI/bge-m3").unwrap();
         assert!(nested.contains("embed_model = \"theirs\""), "{nested}");
         let parsed: toml::Table = toml::from_str(&nested).unwrap();
         assert_eq!(parsed["embed_model"].as_str(), Some("BAAI/bge-m3"));
@@ -998,34 +932,34 @@ mod tests {
 
     #[test]
     fn a_file_that_does_not_parse_is_refused_rather_than_overwritten() {
-        let err = with_embed_model(Some("skip = [\n"), "BAAI/bge-m3", PROJECT_FILE).unwrap_err().to_string();
+        let err = with_embed_model(Some("skip = [\n"), "BAAI/bge-m3").unwrap_err().to_string();
         assert!(err.contains(PROJECT_FILE), "{err}");
         // And a value that could close its own string never reaches the file.
-        assert!(with_embed_model(Some(""), "a/b\"\nrerank_command = \"rm -rf /", PROJECT_FILE).is_err());
-        assert!(with_embed_model(Some(""), "", PROJECT_FILE).is_err());
+        assert!(with_embed_model(Some(""), "a/b\"\nrerank_command = \"rm -rf /").is_err());
+        assert!(with_embed_model(Some(""), "").is_err());
     }
 
     /// The value is replaced where it stands, so a file naming the key twice — which TOML itself
     /// refuses — must not be "repaired" into one this tool can write and `load` cannot read.
     #[test]
     fn a_file_naming_the_key_twice_is_refused_by_the_parse_it_already_fails() {
-        assert!(with_embed_model(Some("embed_model = \"a/b\"\nembed_model = \"c/d\"\n"), "x/y", PROJECT_FILE).is_err());
+        assert!(with_embed_model(Some("embed_model = \"a/b\"\nembed_model = \"c/d\"\n"), "x/y").is_err());
     }
 
     /// The three shapes a line-at-a-time scan reads wrongly: a byte-order mark before the first
     /// key, a header or a key written inside a multi-line string, and a file whose lines end CRLF.
     #[test]
     fn the_scan_reads_a_file_as_toml_sees_it() {
-        let bom = with_embed_model(Some("\u{feff}embed_model = \"a/b\"\n"), "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let bom = with_embed_model(Some("\u{feff}embed_model = \"a/b\"\n"), "BAAI/bge-m3").unwrap();
         assert_eq!(bom, "\u{feff}embed_model = \"BAAI/bge-m3\"\n");
 
         // Here `[dist]` is prose inside a value, not the header that ends the top-level keys.
         let prose = "enrich_prompt = \"\"\"\n[dist] embed_model = \"not a key\"\n\"\"\"\nembed_model = \"a/b\"\n";
-        let written = with_embed_model(Some(prose), "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let written = with_embed_model(Some(prose), "BAAI/bge-m3").unwrap();
         assert!(written.contains("[dist] embed_model = \"not a key\""), "{written}");
         assert_eq!(toml::from_str::<toml::Table>(&written).unwrap()["embed_model"].as_str(), Some("BAAI/bge-m3"));
 
-        let crlf = with_embed_model(Some("skip = [\"dist/**\"]\r\n"), "BAAI/bge-m3", PROJECT_FILE).unwrap();
+        let crlf = with_embed_model(Some("skip = [\"dist/**\"]\r\n"), "BAAI/bge-m3").unwrap();
         assert!(!crlf.replace("\r\n", "").contains('\n'), "{crlf:?}");
         assert_eq!(toml::from_str::<toml::Table>(&crlf).unwrap()["embed_model"].as_str(), Some("BAAI/bge-m3"));
     }
@@ -1093,12 +1027,8 @@ mod tests {
         }
         // Safety: the lock above makes this the only thread touching the environment.
         unsafe {
-            // The old names too: a developer's shell may still export them, and they are read
-            // whenever the new name is unset.
-            for prefix in ["ZEROGRAPH_", "REPOGRAPH_"] {
-                for k in ["CONFIG", "RERANK_MODEL", "RESOURCES", "READER_BUDGET", "CODE_GLOBS", "TEXT_GLOBS"] {
-                    std::env::remove_var(format!("{prefix}{k}"));
-                }
+            for k in ["CONFIG", "RERANK_MODEL", "RESOURCES", "READER_BUDGET", "CODE_GLOBS", "TEXT_GLOBS"] {
+                std::env::remove_var(format!("ZEROGRAPH_{k}"));
             }
             std::env::set_var("ZEROGRAPH_CONFIG", &path);
         }
@@ -1162,66 +1092,6 @@ mod tests {
     }
 
     #[test]
-    fn a_project_file_from_before_the_rename_is_read_and_rewritten_in_place() {
-        with_machine(None, || {
-            let dir = tempfile::tempdir().unwrap();
-            let old = dir.path().join(LEGACY_PROJECT_FILE);
-            std::fs::write(&old, "# kept\nrerank_model = \"from-old-file\"\n").unwrap();
-            assert_eq!(Config::load(dir.path()).unwrap().rerank_model, "from-old-file");
-            assert_eq!(project_file_name(dir.path()), LEGACY_PROJECT_FILE);
-
-            let wrote = set_embed_model(dir.path(), crate::index::embed::RECOMMENDED).unwrap();
-            assert_eq!(wrote, old, "the switch goes where the reader's settings are");
-            assert!(!dir.path().join(PROJECT_FILE).exists(), "and starts no second file");
-            assert!(std::fs::read_to_string(&old).unwrap().starts_with("# kept\n"));
-            assert!(names_embed_model(dir.path()));
-
-            std::fs::write(dir.path().join(PROJECT_FILE), "rerank_model = \"from-new-file\"\n").unwrap();
-            assert_eq!(Config::load(dir.path()).unwrap().rerank_model, "from-new-file", "both: the new one, alone");
-            assert!(!names_embed_model(dir.path()), "nothing of the old one is merged in");
-        });
-    }
-
-    /// A reader sent to `zerograph.toml` while `repograph.toml` is the file in force starts a second
-    /// one, which outranks the first and ends every key the old one held.
-    #[test]
-    fn what_is_said_about_a_project_file_from_before_the_rename_names_that_file() {
-        with_machine(None, || {
-            let dir = tempfile::tempdir().unwrap();
-            let old = dir.path().join(LEGACY_PROJECT_FILE);
-            std::fs::write(&old, "id_families = [\"REQ\"]\nrerank_command = \"true\"\n").unwrap();
-            let cfg = Config::load(dir.path()).unwrap();
-            assert_eq!(cfg.file, LEGACY_PROJECT_FILE);
-            let mut out = Vec::new();
-            cfg.say_the_retired_keys_are_no_longer_read(&mut out);
-            let said = String::from_utf8(out).unwrap();
-            assert!(said.starts_with("repograph.toml: id_families is no longer read"), "{said}");
-            let why = cfg.refusal("rerank_command").unwrap();
-            assert!(why.starts_with("repograph.toml names") && why.ends_with("remove it from repograph.toml"), "{why}");
-
-            std::fs::write(&old, "skip = [\n").unwrap();
-            let err = set_embed_model(dir.path(), crate::index::embed::RECOMMENDED).unwrap_err().to_string();
-            assert!(err.starts_with("repograph.toml does not parse"), "{err}");
-
-            std::fs::write(dir.path().join(PROJECT_FILE), "skip = []\n").unwrap();
-            assert_eq!(Config::load(dir.path()).unwrap().file, PROJECT_FILE);
-        });
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_link_from_the_new_name_to_the_old_file_is_one_file_and_is_not_told_to_move() {
-        let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join(LEGACY_PROJECT_FILE), "skip = []\n").unwrap();
-        std::fs::write(dir.path().join(PROJECT_FILE), "skip = []\n").unwrap();
-        assert!(legacy_file_is_shadowed(dir.path()), "two files of their own");
-        std::fs::remove_file(dir.path().join(PROJECT_FILE)).unwrap();
-        std::os::unix::fs::symlink(LEGACY_PROJECT_FILE, dir.path().join(PROJECT_FILE)).unwrap();
-        assert!(!legacy_file_is_shadowed(dir.path()), "one file under two names");
-        assert_eq!(project_file_name(dir.path()), PROJECT_FILE);
-    }
-
-    #[test]
     fn a_store_the_fp32_default_wrote_stays_on_fp32_until_the_file_names_another() {
         with_machine(None, || {
             let dir = tempfile::tempdir().unwrap();
@@ -1244,65 +1114,6 @@ mod tests {
     }
 
     #[test]
-    fn a_machine_file_and_trust_list_from_before_the_rename_are_read_until_new_ones_exist() {
-        with_machine(None, || {
-            let home = tempfile::tempdir().unwrap();
-            let xdg = std::env::var_os("XDG_CONFIG_HOME");
-            unsafe {
-                std::env::remove_var("ZEROGRAPH_CONFIG");
-                std::env::set_var("XDG_CONFIG_HOME", home.path());
-            }
-            let old = home.path().join("repograph");
-            std::fs::create_dir_all(&old).unwrap();
-            std::fs::write(old.join("config.toml"), "rerank_model = \"from-old-machine\"\n").unwrap();
-            std::fs::write(old.join("trusted-models"), "acme/old-trust\n").unwrap();
-            let read_old = Config::load(home.path()).map(|c| c.rerank_model);
-            let trusted_old = model_is_trusted("acme/old-trust");
-            let spelled_old = trusted_spelling("ACME/Old-Trust");
-            let wrote = trust_model("acme/new-trust");
-            let new = home.path().join("zerograph/config.toml");
-            let beside_old = legacy_machine_file_beside(&old.join("config.toml"));
-            std::fs::write(&new, "rerank_model = \"from-new-machine\"\n").unwrap();
-            let read_new = Config::load(home.path()).map(|c| c.rerank_model);
-            let beside_new = legacy_machine_file_beside(&new);
-            unsafe {
-                match xdg { Some(v) => std::env::set_var("XDG_CONFIG_HOME", v), None => std::env::remove_var("XDG_CONFIG_HOME") }
-            }
-            assert_eq!(beside_old, None, "the old file is the one read, so nothing sits beside it");
-            assert_eq!(beside_new, Some(old.join("config.toml")), "a new file beside the old one is the notice's cue");
-            assert_eq!(read_old.unwrap(), "from-old-machine");
-            assert!(trusted_old, "a trust given before the rename still stands");
-            assert_eq!(spelled_old.as_deref(), Some("acme/old-trust"), "opened under the spelling the reader trusted");
-            assert_eq!(wrote.unwrap(), Some(home.path().join("zerograph/trusted-models")), "a new trust goes to the new directory");
-            assert_eq!(std::fs::read_to_string(old.join("trusted-models")).unwrap(), "acme/old-trust\n", "the old list is not written");
-            assert_eq!(read_new.unwrap(), "from-new-machine");
-        });
-    }
-
-    #[test]
-    fn a_variable_under_the_old_name_is_read_until_the_new_name_is_set() {
-        with_machine(None, || {
-            let dir = tempfile::tempdir().unwrap();
-            unsafe { std::env::set_var("REPOGRAPH_RERANK_MODEL", "from-old-name") };
-            let old = Config::load(dir.path()).unwrap().rerank_model;
-            unsafe { std::env::set_var("ZEROGRAPH_RERANK_MODEL", "from-new-name") };
-            let both = Config::load(dir.path()).unwrap().rerank_model;
-            unsafe { std::env::set_var("ZEROGRAPH_CODE_GLOBS", "") };
-            unsafe { std::env::set_var("REPOGRAPH_CODE_GLOBS", "**/*.kt") };
-            let empty_new = Config::load(dir.path()).unwrap().code_globs;
-            unsafe {
-                for k in ["ZEROGRAPH_RERANK_MODEL", "REPOGRAPH_RERANK_MODEL", "ZEROGRAPH_CODE_GLOBS", "REPOGRAPH_CODE_GLOBS"] {
-                    std::env::remove_var(k);
-                }
-            }
-            assert_eq!(old, "from-old-name");
-            assert_eq!(both, "from-new-name");
-            // Set at all, the new name wins; an empty value there is not a reason to read the old.
-            assert_eq!(empty_new, Config::default().code_globs);
-        });
-    }
-
-    #[test]
     fn an_error_names_the_variable_the_value_was_read_from() {
         with_machine(None, || {
             let dir = tempfile::tempdir().unwrap();
@@ -1312,12 +1123,10 @@ mod tests {
                 unsafe { std::env::remove_var(var) };
                 err
             };
-            let old = refused("REPOGRAPH_READER_BUDGET", "soon");
-            assert!(old.contains("REPOGRAPH_READER_BUDGET=") && !old.contains("ZEROGRAPH"), "{old}");
-            let new = refused("ZEROGRAPH_READER_BUDGET", "soon");
-            assert!(new.contains("ZEROGRAPH_READER_BUDGET="), "{new}");
-            let globs = refused("REPOGRAPH_CODE_GLOBS", "**/*.ts,**/*.kt");
-            assert!(globs.contains("REPOGRAPH_CODE_GLOBS") && !globs.contains("ZEROGRAPH"), "{globs}");
+            let budget = refused("ZEROGRAPH_READER_BUDGET", "soon");
+            assert!(budget.contains("ZEROGRAPH_READER_BUDGET="), "{budget}");
+            let globs = refused("ZEROGRAPH_CODE_GLOBS", "**/*.ts,**/*.kt");
+            assert!(globs.contains("ZEROGRAPH_CODE_GLOBS"), "{globs}");
         });
     }
 

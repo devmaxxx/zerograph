@@ -49,7 +49,7 @@ fn test_home() -> &'static std::path::Path {
 fn child(path: &std::path::Path) -> Command {
     let mut c = Command::new(path);
     c.env("HOME", test_home()).env("USERPROFILE", test_home());
-    c.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS").env_remove("REPOGRAPH_CODE_GLOBS");
+    c.env_remove("ZEROGRAPH_BENCH_REPO").env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("ZEROGRAPH_CODE_GLOBS");
     c
 }
 

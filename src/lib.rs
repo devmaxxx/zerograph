@@ -32,22 +32,15 @@ use clap::{Parser, Subcommand};
 use model::Extractor;
 use std::path::PathBuf;
 
-/// `ZEROGRAPH_<suffix>`, else `REPOGRAPH_<suffix>`: a shell profile or CI file written before the
-/// rename keeps working, and the new name, once set at all, wins even when it is empty.
-pub fn env_os(suffix: &str) -> Option<std::ffi::OsString> {
-    ["ZEROGRAPH_", "REPOGRAPH_"].iter().find_map(|p| std::env::var_os(format!("{p}{suffix}")))
-}
+/// `ZEROGRAPH_<suffix>`, which once set at all wins even when it is empty.
+pub fn env_os(suffix: &str) -> Option<std::ffi::OsString> { std::env::var_os(env_name(suffix)) }
 
 /// [`env_os`] as text; a value that is not Unicode reads as unset, as `std::env::var` has it.
 pub fn env(suffix: &str) -> Option<String> { env_os(suffix).and_then(|v| v.into_string().ok()) }
 
 /// The variable [`env_os`] reads for `suffix`, for an error that tells the reader where a value
-/// came from: `REPOGRAPH_<suffix>` only when that is the one set.
-pub fn env_name(suffix: &str) -> String {
-    ["ZEROGRAPH_", "REPOGRAPH_"].iter().map(|p| format!("{p}{suffix}"))
-        .find(|name| std::env::var_os(name).is_some())
-        .unwrap_or_else(|| format!("ZEROGRAPH_{suffix}"))
-}
+/// came from.
+pub fn env_name(suffix: &str) -> String { format!("ZEROGRAPH_{suffix}") }
 
 #[derive(Parser)]
 #[command(name = "zerograph", version)]
@@ -801,7 +794,7 @@ fn model_report(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<
         None => say("store", "no vectors yet — `zerograph build` writes them".to_string()),
     }
     let from = match config::names_embed_model(repo) {
-        true => config::project_file_name(repo),
+        true => config::PROJECT_FILE,
         false if cfg.embed_model == index::embed::GEMMA => "the built-in default's fp32 export, which the store already holds",
         false => "the built-in default",
     };
@@ -815,7 +808,7 @@ fn model_report(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<
         out.push_str(&format!("\nThe two disagree. The store keeps answering with the model that wrote it; the\n\
             configured one takes effect at the next `build`, `update` or `embed`\n\
             (an `ask` starts one when {} names the model), which drops\n\
-            every row the other model wrote and rewrites the index whole.\n", config::project_file_name(repo)));
+            every row the other model wrote and rewrites the index whole.\n", config::PROJECT_FILE));
     }
     out.push('\n');
     out.push_str(&index::embed::catalogue(Some(opened)));
@@ -833,7 +826,7 @@ fn model_json(repo: &std::path::Path, cfg: &config::Config) -> anyhow::Result<St
     Ok(serde_json::json!({
         "store": recorded,
         "configured": cfg.embed_model,
-        "configured_from": match config::names_embed_model(repo) { true => config::project_file_name(repo), false => "default" },
+        "configured_from": match config::names_embed_model(repo) { true => config::PROJECT_FILE, false => "default" },
         "this_run": crate::env("EMBED_MODEL").filter(|v| !v.trim().is_empty()),
         "agrees": agrees,
         "recommended": index::embed::RECOMMENDED,
@@ -1007,7 +1000,7 @@ fn json_out(text: String, stale: &Option<refresh::Stale>) -> String {
 fn repo_root(cwd: &std::path::Path) -> PathBuf {
     let cwd = &plain(cwd.to_path_buf());
     plain(git_toplevel(cwd)
-        .or_else(|| cwd.ancestors().find(|d| [store::DIR, store::LEGACY_DIR].iter().any(|n| d.join(n).is_dir())).map(PathBuf::from))
+        .or_else(|| cwd.ancestors().find(|d| d.join(store::DIR).is_dir()).map(PathBuf::from))
         .unwrap_or_else(|| cwd.to_path_buf()))
 }
 
@@ -1119,7 +1112,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Update { detach: true } => {
             refresh::spawn_update(&repo, cli.no_dense)?;
-            eprintln!("update: started in the background; {}/background.log has its output", store::dir_name_of(&repo));
+            eprintln!("update: started in the background; {}/background.log has its output", store::DIR);
             Ok(())
         }
         Cmd::Build | Cmd::Update { detach: false } => {
@@ -1132,7 +1125,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let r = run_update(&repo, &cfg, wipe)?;
             println!("changed {} removed {} nodes {} edges {}", r.changed, r.removed, r.nodes, r.edges);
             if r.orphan_questions {
-                eprintln!("zerograph: {}/questions.json and questions.bin are no longer read (enrich was removed in 0.6.0); delete them", store::dir_name_of(&repo));
+                eprintln!("zerograph: {}/questions.json and questions.bin are no longer read (enrich was removed in 0.6.0); delete them", store::DIR);
             }
             embed_all(&repo, cli.no_dense, &cfg).map(|()| eprintln!("{}", refresh::RUN_FINISHED))
         }
@@ -1220,7 +1213,7 @@ fn run(cli: Cli) -> anyhow::Result<()> {
             let report = status::report(&repo, false)?;
             match json {
                 true => println!("{}", serde_json::to_string(&report)?),
-                false => print!("{}", status::render(&report, &repo, "`zerograph build`")),
+                false => print!("{}", status::render(&report, "`zerograph build`")),
             }
             if follow { status::follow(&repo, &report.refresh)?; }
             Ok(())
@@ -1847,7 +1840,7 @@ mod tests {
             assert!(read.graph.nodes.is_empty() && read.refreshed.is_none());
             assert!(read.note.is_some_and(|n| n.contains("`zerograph build` builds it")), "stale={stale}");
         }
-        assert!(!repo.join(".zerograph").exists() && !repo.join(".repograph").exists());
+        assert!(!repo.join(".zerograph").exists());
     }
 
     fn git(dir: &std::path::Path, args: &[&str]) {

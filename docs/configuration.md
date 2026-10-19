@@ -9,7 +9,7 @@ in full, not an empty config:
 | `doc_globs`          | `["**/*.md"]`                                                                               |
 | `code_globs`         | `["**/*.ts", "**/*.tsx", "**/*.js", "**/*.jsx", "**/*.mjs", "**/*.cjs", "**/*.kt", "**/*.java", "**/*.cs", "**/*.rs", "**/*.py", "**/*.dart", "**/*.swift", "**/*.gql", "**/*.graphql", "**/*.sql", "**/*.bicep", "**/*.tf", "**/*.hcl", "**/*.sh", "**/*.bash", "**/*.vue", "**/*.lua", "**/*.go", "**/*.c", "**/*.h", "**/*.cc", "**/*.cpp", "**/*.cxx", "**/*.c++", "**/*.ino", "**/*.hh", "**/*.hpp", "**/*.hxx", "**/*.h++", "**/*.php", "**/*.rb", "**/*.rbw", "**/*.gemspec", "**/*.rake", "**/*.ex", "**/*.exs", "**/*.scala", "**/*.sc", "**/*.ml", "**/*.mli"]` — every language in [Languages](languages.md) |
 | `text_globs`         | `[]` — files no doc or code glob claims, each read as one text node when its content is text  |
-| `skip`               | `["**/node_modules/**", "**/dist/**", "**/*.min.js", "**/.yarn/**", "**/.pnp.*", "**/target/**", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.terraform/**", "**/.dart_tool/**", "**/Pods/**", "**/vendor/**", "**/_build/**", "**/TRACKER.md", "graphify-out/**", ".zerograph/**", ".repograph/**"]` |
+| `skip`               | `["**/node_modules/**", "**/dist/**", "**/*.min.js", "**/.yarn/**", "**/.pnp.*", "**/target/**", "**/.venv/**", "**/venv/**", "**/__pycache__/**", "**/.terraform/**", "**/.dart_tool/**", "**/Pods/**", "**/vendor/**", "**/_build/**", "**/TRACKER.md", "graphify-out/**", ".zerograph/**"]` |
 | `include`            | `[]` — the whole repository; set, only these directories (`src`, `docs/specs`) or globs are read |
 | `registries`         | `["docs/constitution.yaml"]`                                                                |
 | `rerank_command`     | **machine file only** — headless `claude -p --model {model}` with thinking off, see [Spending tokens on purpose](rerank.md) |
@@ -106,10 +106,6 @@ beating the one below it:
 # ~/.config/zerograph/config.toml — every repository on this machine, unless it says otherwise
 rerank_model = "sonnet"
 ```
-
-Each layer still answers to its name from before the rename — `REPOGRAPH_*`, `repograph.toml`,
-`~/.config/repograph/` — until the new name is there; [coming from repograph](install.md#coming-from-repograph)
-has the exact rules.
 
 A key the repository names wins even when it names the built-in value — with one exception, and it
 runs the other way. **`rerank_command` is read from the machine file and never from a

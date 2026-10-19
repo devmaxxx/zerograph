@@ -8,8 +8,8 @@ use std::process::Command;
 /// and Dart globbed through the environment so the repository needs no `zerograph.toml`.
 fn zerograph(repo: &Path, args: &[&str]) -> (bool, String, String) {
     let out = Command::new(env!("CARGO_BIN_EXE_zerograph"))
-        .env_remove("ZEROGRAPH_BENCH_REPO").env_remove("REPOGRAPH_BENCH_REPO")
-        .env_remove("ZEROGRAPH_EMBED_MODEL").env_remove("REPOGRAPH_EMBED_MODEL")
+        .env_remove("ZEROGRAPH_BENCH_REPO")
+        .env_remove("ZEROGRAPH_EMBED_MODEL")
         .env("ZEROGRAPH_CODE_GLOBS", "**/*.dart")
         .arg("--no-dense")
         .arg("--repo")

@@ -450,7 +450,7 @@ pub enum Resources {
 
 /// The configured level unless `ZEROGRAPH_RESOURCES` names another, in the shape the other run
 /// variables use: unset or empty keeps what the files said. `name` is the variable `var` was read
-/// from, which is `REPOGRAPH_RESOURCES` for a profile written before the rename.
+/// from, for the error.
 pub fn resources_from_env(configured: Resources, var: Option<&str>, name: &str) -> Result<Resources> {
     let Some(raw) = var else { return Ok(configured) };
     let word = raw.trim();
@@ -1022,8 +1022,6 @@ mod tests {
         assert_eq!(resources_from_env(Resources::Balanced, Some(" LOW "), name).unwrap(), Resources::Low);
         let err = resources_from_env(Resources::Balanced, Some("half"), name).unwrap_err().to_string();
         assert!(err.contains(name), "{err}");
-        let err = resources_from_env(Resources::Balanced, Some("half"), "REPOGRAPH_RESOURCES").unwrap_err().to_string();
-        assert!(err.contains("REPOGRAPH_RESOURCES"), "the variable the value was read from: {err}");
     }
 
     #[test]

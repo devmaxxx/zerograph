@@ -259,7 +259,7 @@ impl Server {
 
     fn status(&self) -> Result<String> {
         let report = status::report(&self.repo, self.spawn_in_flight())?;
-        Ok(status::render(&report, &self.repo, "`reindex`"))
+        Ok(status::render(&report, "`reindex`"))
     }
 
     fn reindex(&self) -> Result<String> {
@@ -305,7 +305,7 @@ impl Server {
         self.remember(refresh::spawn_detached(&self.repo, false, &["model", id])?);
         Ok(format!("switching to {id} in the background: the model is fetched and opened, then `{}` is written and the vectors rewritten. \
                     `status` follows it; `{}/background.log` has the reason if it fails.",
-                   config::project_file_name(&self.repo), store::dir_name_of(&self.repo)))
+                   config::PROJECT_FILE, store::DIR))
     }
 }
 

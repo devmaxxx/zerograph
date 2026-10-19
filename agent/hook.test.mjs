@@ -224,7 +224,7 @@ test('a milestone or task id goes whole, and neither an escape nor a leading das
   assert.ok(!argv(w)[0].includes('--rerank'), `ask would read it as its paid flag: ${argv(w)[0]}`);
 });
 
-test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH_BIN (or the old REPOGRAPH_BIN) and PATH', () => {
+test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH_BIN and PATH', () => {
   const w = world();
   // Everything a cloned repository could ship where a local install or a build would put one.
   const shipped = [['node_modules', '.bin'], ['target', 'release'], ['target', 'debug']];
@@ -233,10 +233,8 @@ test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH
     for (const name of ['zerograph', 'zerograph.cmd', 'zerograph.exe']) writeFileSync(join(w.root, ...dir, name), '#!/bin/sh\n');
   }
   const named = process.env.ZEROGRAPH_BIN;
-  const old = process.env.REPOGRAPH_BIN;
   const path = process.env.PATH;
   delete process.env.ZEROGRAPH_BIN;
-  delete process.env.REPOGRAPH_BIN;
   for (const dir of shipped) for (const name of ['zerograph']) chmodSync(join(w.root, ...dir, name), 0o755);
   const machine = mkdtempSync(join(tmpdir(), 'zerograph-machine-bin-'));
   mkdirSync(machine, { recursive: true });
@@ -262,14 +260,10 @@ test('the hook never takes a binary from the checkout it runs in, only ZEROGRAPH
     assert.equal(binary(alias), installed, 'and so is a session opened through the alias');
     process.env.ZEROGRAPH_BIN = join('node_modules', '.bin', 'zerograph');
     assert.equal(binary(w.root), null, 'a relative ZEROGRAPH_BIN names the checkout\'s file, so it names nothing');
-    delete process.env.ZEROGRAPH_BIN;
-    process.env.REPOGRAPH_BIN = '/opt/repograph';
-    assert.equal(binary(w.root), '/opt/repograph', 'a profile written before the rename still names the binary');
     process.env.ZEROGRAPH_BIN = '/opt/zerograph';
-    assert.equal(binary(w.root), '/opt/zerograph', 'and the new name wins once it is set');
+    assert.equal(binary(w.root), '/opt/zerograph', 'an absolute ZEROGRAPH_BIN is taken as it is');
   } finally {
     if (named === undefined) delete process.env.ZEROGRAPH_BIN; else process.env.ZEROGRAPH_BIN = named;
-    if (old === undefined) delete process.env.REPOGRAPH_BIN; else process.env.REPOGRAPH_BIN = old;
     process.env.PATH = path;
   }
 });
@@ -326,23 +320,6 @@ test('SessionStart prints the brief, and nothing where there is no store', () =>
   assert.equal(fire(bare, { hook_event_name: 'SessionStart', source: 'startup' }), null);
 });
 
-test('a store built before the rename, still under .repograph, counts as built', () => {
-  const w = world({ store: false, answer: 'zerograph: 3 doc nodes' });
-  mkdirSync(join(w.root, '.repograph'), { recursive: true });
-  writeFileSync(join(w.root, '.repograph', 'manifest.json'), '{}');
-  const c = context(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }));
-  assert.ok(c.startsWith('zerograph:'), c);
-});
-
-test('a .zerograph without a manifest outranks a built .repograph, as it does for the binary', () => {
-  const w = world({ store: false, answer: 'zerograph: 3 doc nodes' });
-  mkdirSync(join(w.root, '.repograph'), { recursive: true });
-  writeFileSync(join(w.root, '.repograph', 'manifest.json'), '{}');
-  mkdirSync(join(w.root, '.zerograph'), { recursive: true });
-  assert.equal(fire(w, { hook_event_name: 'SessionStart', source: 'startup' }), null);
-  assert.deepEqual(argv(w), [], 'the binary would read the empty .zerograph, so it is not asked');
-});
-
 test('a session started in a subdirectory finds the index above it, and a nested checkout does not borrow it', () => {
   const w = world({ answer: 'zerograph: 3076 doc nodes, 5240 code nodes' });
   const env = { ZEROGRAPH_HOOK_SERVE: '0' };
@@ -386,14 +363,13 @@ test('a PATH entry anywhere in the checkout is refused, even from a package with
   const name = WIN ? 'zerograph.exe' : 'zerograph';
   writeFileSync(join(shim, name), '');
   chmodSync(join(shim, name), 0o755);
-  const saved = { bin: process.env.ZEROGRAPH_BIN, old: process.env.REPOGRAPH_BIN, path: process.env.PATH };
+  const saved = { bin: process.env.ZEROGRAPH_BIN, path: process.env.PATH };
   delete process.env.ZEROGRAPH_BIN;
-  delete process.env.REPOGRAPH_BIN;
   process.env.PATH = shim;
   try {
     assert.equal(binary(pkg), null, 'the checkout\'s node_modules/.bin was taken for the machine\'s');
   } finally {
-    for (const [k, v] of [['ZEROGRAPH_BIN', saved.bin], ['REPOGRAPH_BIN', saved.old], ['PATH', saved.path]]) {
+    for (const [k, v] of [['ZEROGRAPH_BIN', saved.bin], ['PATH', saved.path]]) {
       if (v === undefined) delete process.env[k]; else process.env[k] = v;
     }
   }
@@ -540,13 +516,13 @@ test('every call the hook waits on refreshes in process for less than its timeou
   const edit = { hook_event_name: 'PostToolUse', tool_name: 'Edit', tool_input: { file_path: 'src/a.ts' } };
   for (const [set, want] of [[undefined, '2'], ['30', '2'], ['1', '1'], ['0', '0'], ['soon', '2']]) {
     const w = world({ answer: '{}' });
-    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: set, REPOGRAPH_READER_BUDGET: undefined });
+    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: set });
     assert.deepEqual(budgets(w), [want], `set ${set}`);
   }
   for (const [line, want] of [['reader_budget = 0', '0'], ['reader_budget = 5 # generous', '2']]) {
     const w = world({ answer: '{}' });
     writeFileSync(join(w.root, 'zerograph.toml'), `${line}\n`);
-    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: undefined, REPOGRAPH_READER_BUDGET: undefined });
+    fire(w, edit, { ...env, ZEROGRAPH_READER_BUDGET: undefined });
     assert.deepEqual(budgets(w), [want], line);
   }
 });

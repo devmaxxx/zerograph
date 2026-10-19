@@ -108,7 +108,6 @@ test('the socket checked is the one the full report named, the store one only fo
   expect(socketOf(full, '/repo/.zerograph')).toBe('/home/u/.cache/zerograph/sock/1a2b.sock')
   const older: Report = { ...full, serve: { running: false, up_secs: null, log: [] } }
   expect(socketOf(older, '/repo/.zerograph')).toBe('/repo/.zerograph/serve.sock')
-  expect(socketOf(null, '/repo/.repograph')).toBe('/repo/.repograph/serve.sock')
 })
 
 test('a full check is due with none taken yet and once five minutes have passed', () => {
