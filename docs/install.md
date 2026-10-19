@@ -201,7 +201,7 @@ to `agent/claude-code/scripts/` reaches the Codex plugin's copies through
 `agent/codex/` is the same integration as a Codex plugin, listed by `.agents/plugins/marketplace.json`:
 
 ```bash
-codex plugin marketplace add devmaxxx/zerograph --ref v0.7.1
+codex plugin marketplace add devmaxxx/zerograph --ref v0.7.2
 codex plugin add zerograph@zerograph
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "zerograph",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Knowledge graph of a repository's requirement docs and code in 24 languages, built and refreshed at zero model tokens, asked by id, keyword or paraphrase",
   "license": "MIT",
   "repository": {
