@@ -3,7 +3,7 @@
 // answers one MCP request. Run: `node --test agent/claude-code/scripts/mcp.test.mjs`.
 import { test } from 'node:test';
 import assert from 'node:assert';
-import { mkdtempSync, mkdirSync, writeFileSync, chmodSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, chmodSync, realpathSync, symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -146,4 +146,18 @@ test('no binary is a line in the server log and a failed start, never a word on 
   assert.strictEqual(r.status, 1);
   assert.strictEqual(r.stdout, '');
   assert.match(r.stderr, /relative\/zerograph\) is not an absolute path/);
+});
+
+test('ZEROGRAPH_BIN outranks the option, set or left unsubstituted, as it does in the hook', { skip: WIN && 'a POSIX launcher for the fake' }, () => {
+  const w = world();
+  const named = join(w.base, 'named');
+  mkdirSync(named);
+  const seen = join(w.base, 'seen.txt');
+  writeFileSync(join(named, 'zerograph'), `#!/bin/sh\necho named > '${seen}'\n`);
+  chmodSync(join(named, 'zerograph'), 0o755);
+  for (const option of ['${user_config.binary}', join(w.machine, 'zerograph')]) {
+    const r = spawnSync(process.execPath, [LAUNCHER, option], { cwd: w.base, input: '', env: { PATH: '/usr/bin:/bin', CLAUDE_PROJECT_DIR: w.checkout, ZEROGRAPH_BIN: join(named, 'zerograph') }, encoding: 'utf8' });
+    assert.strictEqual(r.status, 0, r.stderr);
+    assert.strictEqual(readFileSync(seen, 'utf8').trim(), 'named', option);
+  }
 });

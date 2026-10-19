@@ -59,7 +59,27 @@ pub struct Report { pub written: usize, pub paths: Vec<String>, pub notes: Vec<S
 pub type Run<'a> = &'a dyn Fn(&str, &Path, &[String]) -> Option<std::process::Output>;
 
 pub fn run_cli(program: &str, cwd: &Path, args: &[String]) -> Option<std::process::Output> {
-    std::process::Command::new(program).args(args).current_dir(cwd).stdin(std::process::Stdio::null()).output().ok()
+    command_for(program)?.args(args).current_dir(cwd).stdin(std::process::Stdio::null()).output().ok()
+}
+
+/// `program` as a command to start. On Windows `Command` finds only a `.exe` by a bare name, and
+/// npm installs `claude` and `codex` as `.cmd` shims, which only `cmd` starts; the arguments
+/// passed here are fixed words with nothing `cmd` would act on.
+fn command_for(program: &str) -> Option<std::process::Command> {
+    if !cfg!(windows) { return Some(std::process::Command::new(program)); }
+    let path = std::env::var_os("PATH")?;
+    for ext in ["exe", "cmd"] {
+        for dir in std::env::split_paths(&path).filter(|d| d.is_absolute()) {
+            let file = dir.join(format!("{program}.{ext}"));
+            if !file.is_file() { continue; }
+            if ext == "exe" { return Some(std::process::Command::new(file)); }
+            let comspec = std::env::var_os("ComSpec").unwrap_or_else(|| "cmd.exe".into());
+            let mut cmd = std::process::Command::new(comspec);
+            cmd.args(["/d", "/c", "call"]).arg(file);
+            return Some(cmd);
+        }
+    }
+    None
 }
 
 /// Installs the plugin through the harness's own CLI, and says whether it is in. A missing CLI or
@@ -172,6 +192,12 @@ fn write_if_changed(path: &Path, text: &str, report: &mut Report) -> Result<()> 
 
 /// Removes `path`, counted and named, or says why it stayed.
 fn remove(path: &Path, why: &str, report: &mut Report) {
+    // Unlinking would leave the file it points at, which another checkout or a dotfile manager
+    // shares, still holding what is being retired, and nothing would say so.
+    if is_symlink(path) {
+        report.notes.push(format!("{} is a symlink, so it was left; {why}, so remove it and what it points at by hand", path.display()));
+        return;
+    }
     match std::fs::remove_file(path) {
         Ok(()) => {
             report.written += 1;
@@ -228,11 +254,23 @@ pub fn without_hook_entries(existing: &str) -> Result<Option<String>> {
     let mut root: serde_json::Value = serde_json::from_str(existing).context("not JSON")?;
     let Some(hooks) = root.get_mut("hooks").and_then(|h| h.as_object_mut()) else { return Ok(None) };
     let mut found = false;
+    let ours = |v: &serde_json::Value| v.to_string().contains(LEGACY_HOOK);
     for list in hooks.values_mut() {
-        let Some(arr) = list.as_array_mut() else { continue };
-        let before = arr.len();
-        arr.retain(|e| !e.to_string().contains(LEGACY_HOOK));
-        found |= arr.len() < before;
+        let Some(groups) = list.as_array_mut() else { continue };
+        // By command, not by group: `/hooks` and a pasted block both add a command to an existing
+        // matcher's group, and the commands beside ours there are someone else's.
+        for group in groups.iter_mut() {
+            let Some(commands) = group.get_mut("hooks").and_then(|h| h.as_array_mut()) else { continue };
+            let before = commands.len();
+            commands.retain(|c| !ours(c));
+            found |= commands.len() < before;
+        }
+        let before = groups.len();
+        groups.retain(|g| match g.get("hooks").and_then(|h| h.as_array()) {
+            Some(commands) => !commands.is_empty(),
+            None => !ours(g),
+        });
+        found |= groups.len() < before;
     }
     if !found { return Ok(None); }
     hooks.retain(|_, list| list.as_array().is_none_or(|a| !a.is_empty()));
@@ -245,8 +283,8 @@ fn retire_hook_entries(path: &Path, report: &mut Report) {
     let Ok(existing) = std::fs::read_to_string(path) else { return };
     match without_hook_entries(&existing) {
         Ok(None) => {}
-        Ok(Some(rest)) if rest.trim() == "{}" => remove(path, "it held only the hook entries an earlier release wrote, and the plugin runs the hook now", report),
         Ok(Some(_)) if is_symlink(path) => report.notes.push(format!("{} is a symlink, so the hook entries an earlier release wrote were left in it; take out the ones that run {LEGACY_HOOK}", path.display())),
+        Ok(Some(rest)) if rest.trim() == "{}" => remove(path, "it held only the hook entries an earlier release wrote, and the plugin runs the hook now", report),
         Ok(Some(rest)) => match std::fs::write(path, rest) {
             Ok(()) => {
                 report.written += 1;
@@ -345,7 +383,9 @@ pub fn codex_home() -> Option<PathBuf> {
 /// paste in: with the plugin's hook beside them, the hook would answer every event twice.
 pub fn retire_codex_hooks(home: &Path) -> Report {
     let mut report = Report::default();
+    // Written through a link to where it points, so a dotfile manager's link stays one.
     let path = home.join("hooks.json");
+    let path = path.canonicalize().unwrap_or(path);
     let Ok(seen) = std::fs::metadata(&path) else { return report };
     let Ok(existing) = std::fs::read_to_string(&path) else { return report };
     match without_hook_entries(&existing) {
@@ -1110,6 +1150,36 @@ mod tests {
         assert_eq!(read_json(&path), serde_json::json!({ "hooks": { "SessionStart": [{ "hooks": [{ "type": "command", "command": "gitnexus" }] }] } }));
         assert_eq!(retire_codex_hooks(dir.path()).written, 0);
         assert_eq!(retire_codex_hooks(&dir.path().join("none")).written, 0);
+    }
+
+    #[test]
+    fn a_command_beside_ours_in_one_matcher_group_stays() {
+        let shared = r#"{"hooks":{"SessionStart":[{"matcher":"startup","hooks":[{"type":"command","command":"gitnexus"},{"type":"command","command":"node /r/.codex/hooks/zerograph-hook.mjs"}]}]}}"#;
+        let rest: serde_json::Value = serde_json::from_str(&without_hook_entries(shared).unwrap().unwrap()).unwrap();
+        assert_eq!(rest, serde_json::json!({ "hooks": { "SessionStart": [{ "matcher": "startup", "hooks": [{ "type": "command", "command": "gitnexus" }] }] } }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_hooks_file_is_rewritten_where_it_points_and_a_linked_settings_file_is_left() {
+        let dir = root();
+        let dotfiles = dir.path().join("dotfiles.json");
+        std::fs::write(&dotfiles, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node /r/.codex/hooks/zerograph-hook.mjs"}]}]},"x":1}"#).unwrap();
+        let home = dir.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        std::os::unix::fs::symlink(&dotfiles, home.join("hooks.json")).unwrap();
+        assert_eq!(retire_codex_hooks(&home).written, 1);
+        assert!(is_symlink(&home.join("hooks.json")), "the link stays a link");
+        assert_eq!(read_json(&dotfiles), serde_json::json!({ "x": 1 }));
+
+        let repo = dir.path().join("repo");
+        std::fs::create_dir_all(repo.join(".claude")).unwrap();
+        let shared = dir.path().join("shared.json");
+        std::fs::write(&shared, r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"node zerograph-hook.mjs"}]}]}}"#).unwrap();
+        std::os::unix::fs::symlink(&shared, repo.join(".claude").join("settings.json")).unwrap();
+        let r = retire_repo_install(&repo, Target::Claude);
+        assert!(is_symlink(&repo.join(".claude").join("settings.json")), "{r:?}");
+        assert!(r.notes.iter().any(|n| n.contains("is a symlink")), "{r:?}");
     }
 
     #[test]

@@ -42,7 +42,7 @@ zerograph install-agent --claude           # optional: the Claude Code plugin
 
 The plugin is how zerograph wires into Claude Code: it starts zerograph's MCP server for the
 session, briefs each session and subagent on the index, answers a concept grep from the graph
-before it runs, and keeps the graph fresh after edits. A status mod puts the index's state under
+before it runs, and names the callers an edit can break. A status mod puts the index's state under
 the prompt: `◇ zerograph · in sync`, a progress bar while a refresh runs, the files behind and
 whether `serve` answers. `/zerograph` prints the full `zerograph status` report.
 

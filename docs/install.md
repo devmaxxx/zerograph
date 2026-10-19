@@ -116,7 +116,8 @@ the server, hook, skill and stanza an older `install-agent --claude` wrote (see
 
 The plugin's hooks are the [session hook](keeping-fresh.md#the-session-hook): at session start the
 index brief, for each subagent the rule to ask the graph first, before a concept grep the graph's
-answer, and after an edit a background refresh. A checkout hears from them only once it has a
+answer, and after an edit to a TypeScript file the
+callers outside it that the edit can break. A checkout hears from them only once it has a
 `zerograph.toml` or an index of its own, or is a worktree of a main checkout that has one.
 
 It asks the `zerograph` on `PATH` by its absolute path, and never a binary inside the project: a
