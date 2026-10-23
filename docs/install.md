@@ -3,7 +3,8 @@
 ```bash
 pnpm add -D zerograph              # npm: prebuilt binary for macOS arm64, Linux x64 and Windows x64
 npm install -g zerograph           # or globally; pnpm add -g zerograph works the same
-cargo install --path .             # from source; Rust 1.98, pinned in rust-toolchain.toml
+cargo install --locked zerograph   # from crates.io, built on this machine; Rust 1.98 or later
+cargo install --path .             # from a checkout; Rust 1.98, pinned in rust-toolchain.toml
 ```
 
 The plugins `install-agent --claude` and `--codex` install run the `zerograph` on `PATH` and never
@@ -24,6 +25,13 @@ needs no `.npmrc`. Tagged releases (`v*`) build all three binaries as GitHub rel
 for the unix ones, a zip holding `zerograph.exe` for Windows) and cut the npm package from those
 same files (`.github/workflows/release.yml`, publishing through npm's trusted publishing, so each
 version carries a provenance attestation; `scripts/npm-pack.sh` packs the same tarball by hand).
+
+The crates.io crate is the source of the same tag, published by the same workflow through crates.io's
+trusted publishing. `--locked` builds against the `Cargo.lock` the release was tested with; without
+it cargo resolves fresh versions within the manifest's pins. The build downloads ONNX Runtime for the
+target, as a checkout build does, and needs a C compiler for the tree-sitter grammars (on Windows,
+the MSVC build tools). A `cargo install` binary carries no attestation: what it runs is what this
+machine compiled.
 
 ## Verifying a download
 

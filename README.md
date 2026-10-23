@@ -30,7 +30,7 @@ quoted in comments. It answers questions about that structure in a few lines of 
 ## Get started
 
 ```bash
-npm install -g zerograph                   # or: pnpm add -D zerograph
+npm install -g zerograph                   # or: pnpm add -D zerograph, or: cargo install --locked zerograph
 echo .zerograph/ >> .gitignore             # the graph is built per checkout
 zerograph build                            # first run downloads the embedding model
 zerograph ask cancellation policy          # stays fresh with your edits
